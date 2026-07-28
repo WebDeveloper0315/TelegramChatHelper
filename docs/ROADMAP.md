@@ -270,6 +270,69 @@ establishes it (Milestone 2). Enforcing it there is a check in `Contact.create`
 plus one migration-time backfill, and doing it now would mean inventing the
 value it compares against.
 
+### Milestone 1.4 -- Chat, the Communication Graph (complete, 2026-07-28)
+
+The edge joining an Account to a Contact. Account and Contact are the graph's
+nodes; until this slice there was no structure connecting them.
+
+| Deliverable | Status |
+|---|---|
+| `Chat` entity: identity, ownership, both-direction invariants, policy | Done |
+| Two constructors, so impossible combinations are unwritable | Done |
+| Migration `0005` -- composite FK, two unique indexes, ten check constraints | Done |
+| **Cross-account linkage impossible at the storage layer** | Done -- ADR-043 |
+| `ChatMapper` with round-trip and column-coverage tests | Done |
+| `ChatRepository`: six operations, scoped at construction | Done |
+| Use cases: open private, open group, get, list, set policy | Done |
+| First use case composing **two** scoped repositories in one transaction | Done |
+| CLI: `chat open | show | list | set` | Done |
+| Both implementations pass the shared contract suite and the graph suite | Done |
+| `Conversation`, `Message`, `SyncCursor` | **Excluded** -- ADR-044 |
+| `last_message_at`, `is_muted`, `is_archived`, `retention_days`, `deleted_at` | **Deferred** -- ADR-044 |
+| `list_by_activity`, `list_sync_enabled`, `set_ai_processing_mode`, `purge` | **Omitted** -- no consumer |
+| No Telegram, no AI, no ingestion | Confirmed |
+
+**Two documentation defects corrected.** `DATABASE.md` specified
+`chats.contact_id ON DELETE SET NULL` alongside a check requiring a private chat
+to name its contact -- the two cannot both hold, and `SET NULL` also contradicts
+the transactional contact purge in `PRIVACY.md` §7. Both are resolved by
+ADR-043. Separately, a `telegram_chat_id > 0` check would have been the natural
+choice and would have rejected every group and channel Telegram has, since it
+numbers them below zero.
+
+### Milestone 1.5 -- Message Ingestion (complete, 2026-07-28)
+
+The pipeline every future source feeds. The graph had structure but nothing
+flowing through it; this is the flow.
+
+| Deliverable | Status |
+|---|---|
+| `Message` entity: identity, ownership, content, both timestamps | Done |
+| **Source-agnostic pipeline** -- no Telegram vocabulary beyond one optional field | Done -- ADR-045 |
+| **Idempotent** -- a repeat is reported as skipped, not raised | Done -- ADR-045 |
+| Migration `0006` -- partial unique index, composite FK, eight check constraints | Done |
+| **Append-only** -- no update, no delete, no `updated_at`, asserted by test | Done -- ADR-046 |
+| `MessageMapper` with round-trip and column-coverage tests | Done |
+| `MessageRepository`: four operations, scoped at construction | Done |
+| Use cases: ingest (batch), read history, get | Done |
+| CLI: `message ingest | history | show` | Done |
+| Both implementations pass the shared contract suite and the ingestion suite | Done |
+| `Conversation`, `SyncCursor`, FTS, retention, purge | **Excluded** |
+| `conversation_id`, `reply_to_message_id`, `edited_at`, `deleted_at`, `is_outgoing` | **Deferred/dropped** -- ADR-046 |
+| `add_batch`, `update`, `list_by_conversation`, `list_for_metrics` | **Omitted** -- no consumer |
+| No Telegram, no AI | Confirmed |
+
+**Retention was assessed and found not to block.** It needs an age to measure,
+an index to find old rows by, and a per-chat override -- the first two exist
+because the history query needs them, and the third is one additive column. The
+*policy* changes a background job, not a schema. What did block the slice was
+identity, resolved as ADR-045.
+
+**A security gap was found and closed.** `Message.text` is the first real
+conversation content in the system, and the sensitivity policy did not redact a
+bare `text` key -- only `message_text`. It could not be added as a fragment
+either, because `context` contains it. Whole-key matching was added.
+
 ---
 
 ## M1 — Persistence Core

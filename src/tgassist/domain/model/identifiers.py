@@ -43,6 +43,33 @@ foreign key, and would hand a foreign system control of our identifiers
 ContactId = NewType("ContactId", int)
 """Local identifier for a :class:`~tgassist.domain.model.contact.Contact`."""
 
+ChatId = NewType("ChatId", int)
+"""Local identifier for a :class:`~tgassist.domain.model.chat.Chat`."""
+
+MessageId = NewType("MessageId", int)
+"""Local identifier for a :class:`~tgassist.domain.model.message.Message`."""
+
+TelegramMessageId = NewType("TelegramMessageId", int)
+"""Identifier assigned by Telegram to a message, unique only within its chat.
+
+Optional on a Message: ingestion is source-agnostic, and a message written at
+the keyboard or restored from an export never had one (ADR-045). Its presence is
+what makes a message re-ingestable without duplication; its absence means there
+is nothing to deduplicate against, which is correct rather than a gap.
+"""
+
+TelegramChatId = NewType("TelegramChatId", int)
+"""Identifier assigned by Telegram to a chat.
+
+Distinct from :data:`TelegramUserId` because the two are not interchangeable
+even though both are integers: for a private chat they happen to coincide, and
+for everything else they do not.
+
+**Negative values are legitimate.** Telegram numbers groups and channels below
+zero, so the range check that suits a user identifier -- must be positive -- is
+wrong here. The only structural rule is that it is not zero.
+"""
+
 MIN_IDENTIFIER: Final = 1
 """Identifiers are positive. Zero and negatives indicate an unset value."""
 

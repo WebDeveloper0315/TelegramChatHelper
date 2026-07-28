@@ -171,13 +171,12 @@ erDiagram
         int account_id FK
         int telegram_chat_id
         text chat_type
-        text title
         int contact_id FK
+        text title
         int sync_enabled
         text ai_processing_mode
-        int retention_days
-        timestamp last_message_at
-        timestamp deleted_at
+        timestamp created_at
+        timestamp updated_at
     }
 
     conversations {
@@ -565,12 +564,27 @@ Columns: `id`, `account_id`, `telegram_user_id`, `username`, `display_name`,
 
 ### `chats`
 
-- Unique: `(account_id, telegram_chat_id)`
-- Index: `(account_id, last_message_at DESC)`, `(account_id, sync_enabled)`
-- FK: `account_id → accounts(id) ON DELETE CASCADE`, `contact_id → contacts(id) ON DELETE SET NULL`
+The communication graph's edge: the container joining an account to a contact.
+Created by migration `0005`, which also adds the `contacts (account_id, id)`
+index its foreign key needs.
+
+Columns: `id`, `account_id`, `telegram_chat_id`, `chat_type`, `contact_id`,
+`title`, `sync_enabled`, `ai_processing_mode`, `created_at`, `updated_at`.
+
+- Primary key `id` is locally generated, not the Telegram identifier (ADR-041).
+- **Unique: `(account_id, telegram_chat_id)`.** Two accounts may record the same Telegram chat — both can be in one group — but one account may not record it twice.
+- **Partial unique: `(account_id, contact_id) WHERE contact_id IS NOT NULL`.** A contact has at most one private chat. Partial because `contact_id` is null for every other kind, and many nulls must remain permitted.
+- Index: `(account_id, created_at, id)` — the listing query and its keyset tiebreaker.
+- FK: `account_id → accounts(id) ON DELETE CASCADE`.
+- **FK: `(account_id, contact_id) → contacts(account_id, id) ON DELETE CASCADE`** — composite, and this is the point. A simple `contact_id → contacts(id)` would permit a chat in one account to name a contact in another; requiring the pair to exist together makes that unrepresentable (ADR-043). It cascades rather than setting null: `PRIVACY.md` §7 requires a contact purge to remove everything referencing them, and nulling the column would violate the private-chat invariant below.
+- Check: `telegram_chat_id <> 0` — **not** `> 0`. Telegram numbers groups and channels below zero.
 - Check: `chat_type IN ('private','group','supergroup','channel','saved')`
 - Check: `ai_processing_mode IN ('disabled','local_only','cloud_allowed')`, default `'local_only'`
-- Check: `contact_id IS NOT NULL OR chat_type <> 'private'`
+- Check: `(chat_type = 'private') = (contact_id IS NOT NULL)` and `(chat_type <> 'private') = (title IS NOT NULL)` — both directions, so neither a private chat with nobody in it nor a group chat claiming a single counterpart can be written.
+- Check: `id > 0`, `account_id > 0`, `contact_id IS NULL OR contact_id > 0`, `title IS NULL OR length(trim(title)) > 0`, `updated_at >= created_at`.
+- **No index on `(account_id, last_message_at)` or `(account_id, sync_enabled)`** yet: neither column exists, and both arrive with the query that needs them (Milestone 3).
+
+**Referencing this table.** Every later table in the graph — messages first — should reference `(account_id, chat_id)` compositely, and needs a `chats (account_id, id)` index added in the migration that creates it (ADR-043).
 
 ### `conversations`
 
@@ -581,16 +595,27 @@ Columns: `id`, `account_id`, `telegram_user_id`, `username`, `display_name`,
 
 ### `messages`
 
-The largest table; every index here is justified by an access pattern in §20.
+The immutable factual record, and the largest table. Created by migration
+`0006`, which also adds the `chats (account_id, id)` index its foreign key
+needs. Every index here is justified by an access pattern in §20.
 
-- **Unique: `(account_id, chat_id, telegram_message_id)`** — the idempotency guarantee for re-synchronisation
-- Index: `(chat_id, sent_at DESC)` — primary history query
-- Index: `(conversation_id, sent_at)` — context assembly
-- Index: `(chat_id, is_outgoing, sent_at DESC)` — response-time metrics
-- Index: `(account_id, sent_at DESC)` — cross-chat recency
-- FK: `chat_id → chats(id) ON DELETE CASCADE`, `conversation_id → conversations(id) ON DELETE SET NULL`, `reply_to_message_id → messages(id) ON DELETE SET NULL`
+Columns: `id`, `account_id`, `chat_id`, `telegram_message_id`, `sender_kind`,
+`message_type`, `text`, `sent_at`, `ingested_at`.
+
+- **No `updated_at` and no `deleted_at`.** The table is append-only; the absence of the columns is the statement (ADR-046).
+- **Partial unique: `(account_id, chat_id, telegram_message_id) WHERE telegram_message_id IS NOT NULL`** — the idempotency guarantee for re-synchronisation. Partial because ingestion is source-agnostic and only Telegram issues identifiers; a non-partial index would reject the second message from every other source (ADR-045).
+- Index: `(account_id, chat_id, sent_at, id)` — the history query, ordered by when a message was **sent** rather than ingested, because a backfill inserts old messages after new ones. `id` is the keyset tiebreaker.
+- **FK: `(account_id, chat_id) → chats(account_id, id) ON DELETE CASCADE`** — composite, so a message cannot be filed in another account's chat (ADR-043). Deleting a contact therefore reaches messages through two cascades, which is what `PRIVACY.md` §7 promises.
 - Check: `sender_kind IN ('operator','contact','system')`
 - Check: `message_type IN ('text','photo','voice','video','document','sticker','location','poll','service','other')`
+- Check: `message_type <> 'text' OR (text IS NOT NULL AND length(trim(text)) > 0)` — a text message has text; every other kind may have a caption or nothing.
+- Check: `id > 0`, `account_id > 0`, `chat_id > 0`, `telegram_message_id IS NULL OR telegram_message_id > 0`
+- **Not yet present:** the `(conversation_id, sent_at)`, `(chat_id, is_outgoing, sent_at DESC)` and `(account_id, sent_at DESC)` indexes. None of those columns or queries exists; each index arrives with the feature that reads it, measured rather than assumed.
+
+`text` is conversation content and is redacted from logs by the sensitivity
+policy (`SECURITY.md` §9). The bare key `text` is matched **exactly** rather than
+as a fragment, because `context` — a structural key on every application error —
+contains it.
 
 ### `messages_fts`
 
@@ -815,16 +840,18 @@ Initial migration sequence:
 | `0002` | `accounts` — the ownership root | **Applied** |
 | `0003` | `user_profiles` — the first account-scoped table | **Applied** |
 | `0004` | `contacts` — the first many-per-account table | **Applied** |
-| `0005` | `telegram_sessions`, `settings`, `audit_log` | Milestone 2 |
-| `0006` | `chats`, `conversations`, `messages`, `attachments`, `sync_cursors` | Milestone 3 |
-| `0007` | `messages_fts` and synchronisation triggers | Milestone 3 |
-| `0008` | `memories`, `memory_proposals`, `memory_revisions`, `goals` | Milestone 5 |
-| `0009` | `relationship_profiles`, `style_profiles` | Milestone 6 |
-| `0010` | `embedding_models`, `embeddings` | Milestone 7 |
-| `0011` | `analyses`, `conversation_summaries`, `conversation_plans`, `reply_suggestions`, `behavior_recommendations` | Milestone 8 |
-| `0012` | `ai_providers`, `ai_calls` | Milestone 8 |
-| `0013` | `notifications`, `retention_policies` | Milestone 10 |
-| `0014` | `plugins`, `plugin_data` | Milestone 12 |
+| `0005` | `chats` — the communication graph's edge | **Applied** |
+| `0006` | `messages` — the immutable factual record | **Applied** |
+| `0007` | `telegram_sessions`, `settings`, `audit_log` | Milestone 2 |
+| `0008` | `conversations`, `attachments`, `sync_cursors` | Milestone 3 |
+| `0009` | `messages_fts` and synchronisation triggers | Milestone 3 |
+| `0010` | `memories`, `memory_proposals`, `memory_revisions`, `goals` | Milestone 5 |
+| `0011` | `relationship_profiles`, `style_profiles` | Milestone 6 |
+| `0012` | `embedding_models`, `embeddings` | Milestone 7 |
+| `0013` | `analyses`, `conversation_summaries`, `conversation_plans`, `reply_suggestions`, `behavior_recommendations` | Milestone 8 |
+| `0014` | `ai_providers`, `ai_calls` | Milestone 8 |
+| `0015` | `notifications`, `retention_policies` | Milestone 10 |
+| `0016` | `plugins`, `plugin_data` | Milestone 12 |
 
 Numbers beyond `0004` are a plan, not a commitment: each is assigned when its
 migration is written, in the order the milestones actually land.

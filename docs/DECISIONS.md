@@ -39,7 +39,7 @@ Each decision must have one of the following statuses:
 - Rejected
 
 **ADR-001 through ADR-010 are Accepted.**
-**ADR-011 through ADR-039 and ADR-041 through ADR-042 are Proposed and require explicit approval.** ADR-011 through ADR-030 were approved for implementation at the close of the architecture stabilization session; ADR-031 through ADR-039 arose during implementation and await review.
+**ADR-011 through ADR-039 and ADR-041 through ADR-046 are Proposed and require explicit approval.** ADR-011 through ADR-030 were approved for implementation at the close of the architecture stabilization session; ADR-031 through ADR-039 arose during implementation and await review.
 
 **ADR-040 is Accepted and implemented.**
 
@@ -91,6 +91,10 @@ Each decision must have one of the following statuses:
 | 040 | The CLI Does Not Configure Logging, So Log Records Reach Standard Output | **Accepted** |
 | 041 | Contact Identity Is a Local Surrogate Key, Not the Telegram User Identifier | Proposed |
 | 042 | Contact Lifecycle: Archived and Deleted as Mutually Exclusive Timestamps | Proposed |
+| 043 | Cross-Table Account Ownership Is Enforced by Composite Foreign Keys | Proposed |
+| 044 | The Communication Graph Is Established by Chat Alone | Proposed |
+| 045 | Message Identity Is Local; the External Identifier Is Optional and Its Index Partial | Proposed |
+| 046 | Messages Are Append-Only, and Nothing Deletes Them Yet | Proposed |
 
 ---
 
@@ -3152,6 +3156,566 @@ milestones that give them meaning. None requires changing what is decided here.
 ADR-041 (Contact identity), ADR-037 (Account lifecycle -- the same argument, that
 an entity should own only the lifecycle it genuinely has), ADR-039 (account
 scoping). `DOMAIN_MODEL.md` section 5.4 is corrected accordingly.
+
+---
+
+# ADR-043
+
+## Title
+
+Cross-Table Account Ownership Is Enforced by Composite Foreign Keys
+
+Status
+
+Proposed
+
+Date
+
+2026-07-28
+
+---
+
+### Context
+
+Until now every account-owned table referenced only ``accounts``. Chat is the
+first to reference *another* account-owned table, and it exposed a gap that
+every later table in the graph would inherit.
+
+The obvious foreign key is ``chats.contact_id -> contacts.id``. It guarantees
+that the contact exists. It does **not** guarantee that the contact belongs to
+the same account as the chat, so this row satisfies every constraint:
+
+```
+chats:    id=1  account_id=1  contact_id=5
+contacts: id=5  account_id=2
+```
+
+Account 1 now has a chat pointing at account 2's contact. Nothing rejects it.
+Every later table -- messages, memories, goals, relationship profiles -- would
+have the same hole, and the failure mode is the worst this project has: one
+account's data linked to another's, silently, with no error and no obvious
+symptom.
+
+ADR-039 makes cross-account *reads* impossible by scoping repositories, and the
+use case does check. But the check lives in application code, and the guarantee
+this project keeps choosing is the structural one -- ``StaticPool`` rather than a
+pool that happens to hold one connection, a partial unique index rather than
+"remember to deactivate first".
+
+There is a second, separate problem in the same place. ``DATABASE.md`` version
+1.0 specified two things that cannot both hold:
+
+```
+FK:    contact_id -> contacts(id) ON DELETE SET NULL
+Check: contact_id IS NOT NULL OR chat_type <> 'private'
+```
+
+Purging a contact nulls ``contact_id`` on their private chat, which violates the
+check on the line below. ``PRIVACY.md`` section 7 also requires a contact purge
+to be "transactional removal across every table", which ``SET NULL`` is not: it
+leaves the chat, and later its messages, behind.
+
+---
+
+### Decision
+
+**A table referencing another account-owned table uses a composite foreign key
+on ``(account_id, <referenced_id>)``.**
+
+```sql
+FOREIGN KEY (account_id, contact_id)
+    REFERENCES contacts (account_id, id) ON DELETE CASCADE
+```
+
+The pair must exist together, so a chat in one account cannot name a contact in
+another. It requires a unique index on ``contacts (account_id, id)`` -- redundant
+with the primary key on its own, and that redundancy is exactly what makes the
+guarantee expressible.
+
+**And that key cascades rather than setting null.** ``DATABASE.md`` is corrected.
+Cascade is what ``PRIVACY.md`` section 7 already requires, and it is the only
+option consistent with the private-chat invariant: a private chat with nobody in
+it is a row the model forbids, so there is nothing sensible to leave behind.
+
+The application check stays. It is not redundant: it produces a message naming
+the problem ("that contact was not found") instead of a constraint violation
+naming a column. The constraint is there so that a route which skips the check
+cannot corrupt the graph.
+
+---
+
+### Alternatives Considered
+
+**A simple foreign key plus the application check.** One column, no extra index,
+and the scoped repository already makes the mistake hard. Rejected because
+"hard" is not "impossible", and this is the failure this project's whole design
+posture exists to prevent. A migration, a repair script, or one use case written
+in a hurry is all it takes.
+
+**A trigger asserting the accounts match.** Works, and needs no extra index.
+Rejected: triggers are dialect-specific, invisible to a reader of the table
+definition, and would have to be written again for PostgreSQL (ADR-016). A
+foreign key is declarative and portable.
+
+**Making ``account_id`` part of the contact's primary key.** Then the reference
+is composite by construction. Rejected in ADR-041 for the same reason it is
+rejected here: a composite *primary* key propagates into every table's keys and
+joins, whereas a composite *foreign* key is local to the tables that need the
+guarantee.
+
+**Deriving the chat's account from its contact rather than storing it.** Removes
+the possibility of disagreement entirely, and is genuinely elegant. Rejected
+because non-private chats have no contact, so ``account_id`` would be nullable
+for exactly the rows that need it most, and every scoped query would need a join
+to reach the account it is scoping by.
+
+---
+
+### Consequences
+
+Pros
+
+- Cross-account linkage is impossible at the storage layer, not merely unlikely
+- The rule is declarative, portable and visible in the table definition
+- A contact purge removes their private chat, as ``PRIVACY.md`` already promised
+- The pattern is uniform: every later table in the graph uses the same shape
+
+Cons
+
+- One redundant unique index per referenced table. On ``contacts`` that is one
+  extra index over two integers, maintained on write.
+- Referencing tables must carry ``account_id`` even where it could have been
+  derived. They all carry it already, for scoping.
+- The composite key propagates: ``messages`` will reference
+  ``(account_id, chat_id)``. That is the intended outcome -- the guarantee
+  travels with the graph -- but it is a cost paid per table.
+
+---
+
+### Future Considerations
+
+Messages, memories, goals, relationship profiles and style profiles all
+reference account-owned rows and should all use this shape. Each needs the
+corresponding ``(account_id, id)`` index on the table it references, added in
+the same migration that creates the referencing table.
+
+---
+
+### Related Decisions
+
+ADR-039 (account scoping -- the same guarantee at the repository layer; this is
+the storage layer's half), ADR-041 (Contact identity -- why the *primary* key is
+not composite), ADR-016 (PostgreSQL portability), ADR-044 (Chat scope).
+``DATABASE.md`` section 4.2 is corrected accordingly.
+
+---
+
+# ADR-044
+
+## Title
+
+The Communication Graph Is Established by Chat Alone
+
+Status
+
+Proposed
+
+Date
+
+2026-07-28
+
+---
+
+### Context
+
+The goal was to make the system capable of representing communication between an
+Account and its Contacts, independent of Telegram synchronisation, and to create
+the minimum architecture supporting future synchronisation, memory, goal
+tracking and message ingestion without implementing any of them.
+
+Three documented entities could plausibly carry that: ``Chat``, ``Conversation``
+and ``Message``.
+
+---
+
+### Decision
+
+**Chat, and nothing else.**
+
+Chat is the *edge*. Account and Contact are the graph's nodes, and until Chat
+exists there is no structure joining them. Everything the goal names attaches
+here or reaches a Contact through here:
+
+| Future system | Attachment point |
+|---|---|
+| Telegram synchronisation | ``telegram_chat_id`` resolves it, ``sync_enabled`` gates it |
+| Message ingestion | ``messages.chat_id``; messages have no other home |
+| AI memory | anchored on Contact, reached through the chat that reaches them |
+| Goal tracking | the same |
+| Per-chat privacy | ``ai_processing_mode``, the gate every AI feature reads (ADR-024) |
+
+**Conversation is excluded.** It is a segment of a chat bounded by message
+timestamps. With no messages there is nothing to segment and its ``started_at``
+would have no source, so it could only be a placeholder.
+
+**Message is excluded.** It is content, not structure. It is also the largest
+table in the system, needs full-text search, ingestion idempotency and
+conversation segmentation -- none of which the goal asks for.
+
+**SyncCursor is excluded.** Per-chat synchronisation bookmarks are sync state,
+and belong with the code that advances them.
+
+Chat carries ten fields: identity, ownership, the Telegram identifier, the kind,
+the contact or the title, the two policy flags, and timestamps. Seven documented
+attributes are deferred, each because nothing reads or writes it yet:
+``last_message_at`` (written by ingestion), ``is_muted`` (nothing notifies),
+``is_archived`` (a third way to hide something), ``retention_days`` (no global
+policy to inherit until Milestone 10), ``deleted_at`` (see below).
+
+**A Chat has no lifecycle of its own.** This is the one place where Chat
+deliberately differs from Contact, which has archive and soft delete. A chat
+exists because a conversation exists in Telegram; a user does not create or
+remove one. What they control is whether it is synchronised and what may be done
+with its content, and both are policy rather than lifecycle. Removal happens by
+cascade -- from the account, or from the contact purge.
+
+**Two constructors, not one.** ``Chat.private_with`` requires a contact and
+refuses a title; ``Chat.group_titled`` requires a title and refuses a contact.
+The impossible combinations are therefore unwritable rather than merely
+rejected, and the invariant
+
+```
+(chat_type = 'private') = (contact_id IS NOT NULL)
+(chat_type <> 'private') = (title IS NOT NULL)
+```
+
+is stated in both directions, in the entity and in the schema.
+
+**All five chat kinds are modelled** although Milestone 1 supports only private
+chats. Two reasons: ``PROJECT_SPEC.md`` section 12 says enabling group support
+should be additive, and -- more immediately -- the private-chat invariants are
+only meaningful if a non-private chat is representable.
+
+---
+
+### Alternatives Considered
+
+**Chat and Conversation together.** Would have delivered a more complete-looking
+graph. Rejected: a Conversation with no messages has no defined start, so its
+behaviour would be invented now and rewritten in Milestone 3.
+
+**Chat and Message together.** Tempting, since messages are what a communication
+graph ultimately carries. Rejected on scope: ingestion idempotency, FTS,
+attachment handling and segmentation are Milestone 3's work, and none of it is
+needed to *represent* communication.
+
+**A generic ``Relationship`` table instead of Chat.** Would model the
+Account-Contact edge directly, without Telegram's container concept. Rejected:
+it would have to be reconciled with real chats the moment synchronisation
+arrives, and a private chat *is* the relationship's container in Telegram's
+model. Inventing a parallel one would mean two representations of the same edge.
+
+**Giving Chat an archive and soft delete for symmetry with Contact.** Rejected:
+symmetry is not a requirement. Three overlapping ways to hide a conversation
+(archive the contact, archive the chat, disable its sync) would leave users and
+code guessing which one applies.
+
+---
+
+### Consequences
+
+Pros
+
+- The graph is complete enough for every named future system to attach to
+- Nothing implemented is a placeholder; every field has a reader or a writer
+- ``ai_processing_mode`` exists before any AI does, so the privacy gate is in
+  place before there is anything to gate
+- Group support is an application change, not a migration
+
+Cons
+
+- Until Milestone 3 a chat has no messages, so the listing sorts by
+  ``created_at`` rather than by recency. Adding ``last_message_at`` and its index
+  later is additive, but it changes the default order.
+- A private chat whose contact has been *soft* deleted still appears in the chat
+  listing. That follows from what soft deletion means -- the history remains --
+  but it is a presentation question worth revisiting when a UI exists.
+
+---
+
+### Future Considerations
+
+Milestone 3 adds ``Message``, ``Conversation``, ``SyncCursor`` and
+``last_message_at``. Each attaches to this table without changing it, which is
+the test of whether this decision was right.
+
+---
+
+### Related Decisions
+
+ADR-043 (composite foreign keys), ADR-041 (Contact identity), ADR-024 (AI
+processing modes), ADR-039 (account scoping). ``DOMAIN_MODEL.md`` section 5.5 is
+corrected accordingly.
+
+---
+
+# ADR-045
+
+## Title
+
+Message Identity Is Local; the External Identifier Is Optional and Its Index Partial
+
+Status
+
+Proposed
+
+Date
+
+2026-07-28
+
+---
+
+### Context
+
+The goal for this slice was a pipeline that accepts messages from **any** future
+source -- the CLI, Telegram synchronisation, import tools, tests. The documented
+invariant does not permit that:
+
+> ``(account_id, chat_id, telegram_message_id)`` is unique -- the idempotency
+> guarantee that makes re-synchronisation safe.
+
+A unique constraint over those three columns requires every message to have a
+``telegram_message_id``. Only one of the four named sources issues one. Taken
+literally the invariant makes the pipeline Telegram-specific, which is the
+opposite of the requirement.
+
+The invariant is nonetheless the right idea, and the reason given for it is
+correct: without it, a synchronisation retry or a backfill overlapping live
+updates would store the same message twice. The question is how to keep the
+guarantee for the source that has identifiers while accepting sources that do
+not.
+
+---
+
+### Decision
+
+**A locally generated ``MessageId`` is the primary key.
+``telegram_message_id`` is nullable, and its unique index is partial.**
+
+```sql
+CREATE UNIQUE INDEX uq_messages_account_id_chat_id_telegram_message_id
+    ON messages (account_id, chat_id, telegram_message_id)
+    WHERE telegram_message_id IS NOT NULL;
+```
+
+Three consequences follow, and all three are intended.
+
+**A message carrying an external identifier is ingested once.** The pipeline
+looks it up before writing and reports a repeat as *skipped* rather than raising
+a conflict. An error would force every caller to wrap the ordinary case in a
+try/except, and a backfill meeting live updates is the ordinary case.
+
+**A message with no external identifier is stored every time it is offered.**
+There is nothing to match it against. Two identical messages typed at a keyboard
+are two messages, and that is correct rather than a gap.
+
+**The index must be partial.** A non-partial unique index over a nullable column
+behaves differently across engines, and under any reading it would either permit
+one source-less message per chat or none. Every message the CLI ingests today
+has no identifier, so a non-partial index would reject the second one.
+
+The partiality is stated in both dialects, so PostgreSQL gets the same index
+(ADR-016).
+
+---
+
+### Alternatives Considered
+
+**Require ``telegram_message_id``, and have non-Telegram sources synthesise
+one.** Keeps the documented invariant exactly. Rejected: a synthesised
+identifier occupies Telegram's identifier space, so a later real message could
+collide with a fabricated one, and nothing would detect it. It also makes every
+source pretend to be Telegram, which is the coupling the goal asked to avoid.
+
+**A generic ``(source, external_id)`` pair, unique per chat.** More honest about
+multiple sources, and where this will probably end up. Rejected as speculative:
+there is one source, so the ``source`` column would hold a single value on every
+row, and the vocabulary of the enum would be invented rather than observed.
+Moving to it later is a migration that adds one column and widens one index --
+worth paying when there are two real sources to name.
+
+**Deduplicate source-less messages by content hash.** Would make every source
+idempotent. Rejected because it is wrong: a person who sends "ok" twice has sent
+two messages, and a pipeline silently discarding the second would lose real
+history. Idempotency is a property of an *identifier*, not of content.
+
+**Make ``(chat_id, telegram_message_id)`` the primary key.** Rejected for the
+reasons ADR-041 gives for Contact: a foreign system would own our identifiers,
+child tables would carry a composite key, and messages with no identifier could
+not exist at all.
+
+---
+
+### Consequences
+
+Pros
+
+- Any source can ingest, and the pipeline has no Telegram vocabulary beyond one
+  optional field
+- Re-synchronisation is safe for the source that needs it
+- The guarantee is enforced by the database, not by the caller remembering
+- ``Message.has_external_identity`` makes the distinction visible in the domain
+  rather than implicit in a null check
+
+Cons
+
+- Idempotency is available only to sources that issue identifiers. An import
+  tool run twice will duplicate its import. That is honest -- nothing else would
+  be correct -- but it should be documented where import tools are written.
+- Two messages can be indistinguishable in content and differ only by local
+  identifier. Any future deduplication feature has to decide what to do about
+  that; this decision deliberately does not.
+
+---
+
+### Future Considerations
+
+When a second identifier-issuing source exists, replace the nullable column with
+``(source, external_id)`` and widen the partial index. Nothing above changes.
+
+---
+
+### Related Decisions
+
+ADR-041 (Contact identity -- the same argument for a local key), ADR-043
+(composite ownership keys), ADR-046 (append-only messages), ADR-016 (PostgreSQL
+portability). ``DOMAIN_MODEL.md`` section 5.6 is corrected accordingly.
+
+---
+
+# ADR-046
+
+## Title
+
+Messages Are Append-Only, and Nothing Deletes Them Yet
+
+Status
+
+Proposed
+
+Date
+
+2026-07-28
+
+---
+
+### Context
+
+``DOMAIN_MODEL.md`` section 5.6 calls a Message "the immutable factual record
+from which everything else is derived", and then lists ``edited_at``,
+``is_deleted_remotely`` and ``deleted_at`` among its attributes, with the
+qualification that messages are "immutable after ingest **except** for" those
+fields.
+
+Implementing it raised the question of what to build now. Every one of those
+exceptions is written by code that does not exist: synchronisation detects
+edits and remote deletions (Milestone 3), retention removes old messages
+(Milestone 10), purge removes a contact's entirely (Milestone 11).
+
+The goal for this slice also asked the pipeline to "support future retention
+policies", which invites the reading that retention must be settled first.
+
+---
+
+### Decision
+
+**Messages are append-only in this slice, and the interface says so.**
+``MessageRepository`` has no ``update``, no ``delete`` and no ``soft_delete``;
+the table has no ``updated_at`` and no ``deleted_at``. A test asserts the
+absence on the port and on both implementations, so the guarantee cannot erode
+by someone adding a convenient method.
+
+``ingested_at`` is the creation time. There is no ``updated_at`` because there
+is nothing for it to record.
+
+**Retention is supported without being decided.** It needs three things from
+this table and has all three: an age to measure (``sent_at``), an index to find
+old rows by (``(account_id, chat_id, sent_at, id)``, which the history query
+needs anyway), and a per-chat override (``chats.retention_days``, one additive
+column). What retention does *not* need from this slice is a policy: how long to
+keep messages changes a background job, not a schema.
+
+**The soft-versus-hard deletion question is deliberately left open.** Adding
+``deleted_at`` now would settle it a milestone before the code that has to
+answer it, and would put a ``WHERE deleted_at IS NULL`` filter that nothing
+writes into every history query on the largest table in the system. Whichever
+way Milestone 10 decides, the change is additive.
+
+**How an edit is represented is likewise left open.** A mutation and a
+superseding row are both defensible, and the choice belongs with the
+synchronisation code that first observes one. Providing an ``update`` method now
+would choose mutation by default.
+
+---
+
+### Alternatives Considered
+
+**Implement ``deleted_at`` now, for symmetry with Contact.** Rejected: Contact's
+soft deletion preserves history until a purge, but a message *is* the history --
+there is nothing behind it to preserve. The two aggregates are not analogous,
+and symmetry is not a requirement.
+
+**Implement hard deletion now.** Smaller than soft deletion and arguably the
+right end state. Rejected because it has no caller, and because it interacts
+with derived data that does not exist: a Memory citing a deleted message needs
+its provenance handled, which is Milestone 5's decision.
+
+**Provide ``update`` for the four documented exceptions.** Rejected: all four
+are written by synchronisation, and a general update method is a general licence
+to change a record described as immutable.
+
+**Stop and decide retention before writing any code**, as the goal's conditional
+invited. Rejected after analysis: nothing in the retention policy space changes
+the message table, so stopping would have blocked the slice on a decision it
+does not depend on. The decision that *did* block it was identity (ADR-045),
+which is resolved there.
+
+---
+
+### Consequences
+
+Pros
+
+- "Immutable factual record" is a property of the code, not a sentence in a
+  document
+- No filter that nothing writes appears in the history query
+- Milestones 3, 10 and 11 each make their own decision with their own code in
+  front of them
+- The absence of an update path is asserted by test, so it cannot be eroded
+  quietly
+
+Cons
+
+- Milestone 3 cannot record an edit without either adding an update path or
+  choosing supersession. That decision is deferred, not avoided.
+- Messages accumulate with no way to remove them until Milestone 10. On a
+  personal-scale archive that is acceptable for now; it would not be indefinitely.
+
+---
+
+### Future Considerations
+
+Milestone 3 adds ``edited_at`` and ``is_deleted_remotely`` and decides the edit
+representation. Milestone 10 adds retention and decides soft versus hard.
+Milestone 11 adds purge. Each is additive to what is built here.
+
+---
+
+### Related Decisions
+
+ADR-045 (message identity), ADR-042 (Contact lifecycle -- the aggregate this one
+deliberately does *not* mirror), ADR-024 (AI processing modes -- what may be done
+with the content this table now holds).
 
 ---
 

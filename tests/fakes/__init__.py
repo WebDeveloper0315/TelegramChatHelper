@@ -7,6 +7,7 @@ every test using it into a false positive.
 """
 
 from tests.fakes.account_repository import InMemoryAccountRepository
+from tests.fakes.chat_repository import InMemoryChatRepository, InMemoryChatStore
 from tests.fakes.clock import EPOCH, AdvanceableClock, FixedClock
 from tests.fakes.contact_repository import (
     InMemoryContactRepository,
@@ -14,6 +15,10 @@ from tests.fakes.contact_repository import (
 )
 from tests.fakes.event_bus import RecordingEventBus
 from tests.fakes.id_generator import SequentialIdGenerator
+from tests.fakes.message_repository import (
+    InMemoryMessageRepository,
+    InMemoryMessageStore,
+)
 from tests.fakes.secret_store import InMemorySecretStore, UnavailableSecretStore
 from tests.fakes.unit_of_work import InMemoryUnitOfWork, InMemoryUnitOfWorkFactory
 from tests.fakes.user_profile_repository import (
@@ -26,8 +31,12 @@ __all__ = [
     "AdvanceableClock",
     "FixedClock",
     "InMemoryAccountRepository",
+    "InMemoryChatRepository",
+    "InMemoryChatStore",
     "InMemoryContactRepository",
     "InMemoryContactStore",
+    "InMemoryMessageRepository",
+    "InMemoryMessageStore",
     "InMemoryProfileStore",
     "InMemorySecretStore",
     "InMemoryUnitOfWork",

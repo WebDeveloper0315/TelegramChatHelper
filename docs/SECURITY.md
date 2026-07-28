@@ -164,6 +164,8 @@ Errors and warnings with typed error codes · component and event names · corre
 
 Redaction is a **central `structlog` processor**, applied before emission. It is not delegated to call sites, because a single forgetful call site would defeat it. The processor redacts by field name (a deny-list of known-sensitive keys) and by pattern (token-shaped strings).
 
+Field names are matched two ways, and the distinction matters. Most are matched as **fragments**, so `provider_api_key` and `api_key_v2` are both caught. A few must be matched as **whole keys**: `text` is the name of `Message.text`, the most sensitive field in the application, but `context` — a structural key carried by every application error — contains it, so a fragment rule would redact the diagnostic information errors exist to convey. Whole-key matching covers those cases without that cost.
+
 ## Diagnostic mode
 
 May log message content for troubleshooting. Requires explicit opt-in, is time-limited (default 1 hour), displays a persistent indicator while active, and writes an audit event on enable and disable.

@@ -36,6 +36,134 @@ Not every release requires every category.
 
 ## Added
 
+### Milestone 1.5 -- Message Ingestion
+
+The pipeline every future source feeds: the CLI today, Telegram synchronisation
+in Milestone 3, import tools and tests thereafter. The communication graph had
+structure but nothing moving through it.
+
+**The blocking decision, and the one that turned out not to block**
+
+The goal asked whether retention policy had to be settled first. It does not:
+retention needs an age to measure (`sent_at`), an index to find old rows by, and
+a per-chat override -- the first two exist because the history query needs them,
+and the third is one additive column. The policy changes a background job, not a
+schema.
+
+What *did* block the slice was identity. The documented invariant made
+`(account_id, chat_id, telegram_message_id)` unique, which requires every message
+to carry a Telegram identifier -- and only one of the four named sources issues
+one. Resolved as ADR-045.
+
+**Domain**
+
+- `Message` -- frozen, and the first aggregate with **no transitions at all**. There is nothing a message becomes.
+- **No `updated_at`, no update path, no delete path** (ADR-046). "Immutable factual record" is a property of the code: `MessageRepository` has no such methods, and a test asserts their absence on the port and both implementations.
+- `telegram_message_id` is **optional**; its unique index is **partial**. A non-partial index would reject the second message from every source except Telegram (ADR-045).
+- `sent_at` and `ingested_at` are both required and neither must precede the other -- clock skew is ordinary, and rejecting it would lose a real message over a fraction of a second.
+- `is_outgoing` is **derived**, not stored. It is exactly `sender_kind == operator`; version 1.0 stored it "because it is queried constantly", which is an argument for an index rather than for a second copy that can disagree.
+
+**Persistence**
+
+- Migration `0006`: `messages`, plus the `chats (account_id, id)` index its composite foreign key needs. Deleting a contact now reaches messages through two cascades, which is what `PRIVACY.md` §7 promises.
+- Index `(account_id, chat_id, sent_at, id)` — history ordered by when a message was **sent**, not ingested, because a backfill inserts old messages after new ones.
+
+**Application**
+
+- `IngestMessages` takes a **batch** and one transaction. `IncomingMessage` is deliberately not a `Message`: a source knows what arrived, not what identifier it will get or when we stored it.
+- **No `MessageSource` port.** There is one source; a protocol with one implementation is an interface designed against a guess. Synchronisation will build `IncomingMessage` values exactly as the CLI does.
+- The batch is validated **whole before anything is written**, so a batch containing one malformed message is refused entirely — a guarantee that holds regardless of whether the store rolls back.
+
+**CLI**
+
+- `message ingest`, `history`, `show`. Ingesting twice with `--telegram-id` stores one message; ingesting twice without one stores two.
+
+**Tests**
+
+- 1345 passing, from 1163. The shared contract suite over both implementations, plus suites for append-only-ness, idempotency, ownership, ordering and cascade.
+
+## Fixed
+
+- **Conversation content was not redacted from logs.** `Message.text` is the most sensitive field in the application, and `is_content_key` matched `message_text` but not a bare `text`. It could not simply be added to the fragment set: `context` — a structural key on every application error — contains `text`, so redacting by fragment would have hidden the diagnostic information errors exist to carry. Whole-key matching was added alongside fragment matching.
+- **`--sent-at` rejected real ISO 8601 timestamps.** Typer's `datetime` type accepts three fixed formats, none carrying a timezone offset, while the help text claimed ISO 8601. The option now parses with `fromisoformat` and reads a naive value as UTC rather than guessing a local zone.
+
+## Changed
+
+- `DOMAIN_MODEL.md` §5.6 corrected: optional external identity, the append-only property, `is_outgoing` as derived, and each deferred field with its reason.
+- `DATABASE.md`: `messages` documented as implemented, including why three planned indexes are absent; migration plan renumbered.
+- `API.md`: the implemented `MessageRepository` and the ingestion contract, and why `add_batch`, `update`, `list_by_conversation` and `list_for_metrics` are absent.
+- `SECURITY.md` §9: the whole-key content rule.
+
+## Architecture Decisions
+
+- **ADR-045 -- Message Identity Is Local; the External Identifier Is Optional and Its Index Partial** (Proposed). What makes the pipeline source-agnostic without giving up idempotency for the source that needs it.
+- **ADR-046 -- Messages Are Append-Only, and Nothing Deletes Them Yet** (Proposed). Why the update and delete paths are absent, and why the soft-versus-hard deletion question is deliberately left to the milestone that deletes.
+
+## Scope note
+
+Sixteen source and test files were created or modified, within the twenty-file limit.
+
+### Milestone 1.4 -- Chat: the Communication Graph
+
+The edge joining an Account to a Contact. Account and Contact were nodes with
+nothing between them; every system planned on top of this one -- synchronisation,
+ingestion, memory, goals -- attaches to a Chat or reaches a Contact through one.
+
+**Scope, and what was deliberately left out**
+
+`Conversation` and `Message` were the other candidates for "the communication
+graph". Neither is the edge: a Conversation is a *segment* of a chat bounded by
+message timestamps, so with no messages it would have no defined start; a Message
+is content rather than structure. `SyncCursor` is synchronisation state and
+belongs with the code that advances it. See ADR-044.
+
+**Domain**
+
+- `Chat` -- frozen, self-validating, with `with_sync_enabled`, `with_ai_processing_mode` and `retitled`, each returning `self` on a no-op.
+- **Two constructors**: `private_with` requires a contact and refuses a title; `group_titled` requires a title and refuses a contact. The impossible combinations are unwritable rather than merely rejected.
+- The invariant is stated in **both directions** -- `(chat_type = 'private') = (contact_id IS NOT NULL)` and the same for the title -- so neither a private chat with nobody in it nor a group chat claiming a single counterpart can exist.
+- `AiProcessingMode` (ADR-024) with `allows_ai` and `allows_cloud_ai` as separate questions, because "stop using AI on our chats" and "don't send our messages to a cloud service" are different requests in `PRIVACY.md` §7.
+- `TelegramChatId`, distinct from `TelegramUserId`, and **allowed to be negative**: Telegram numbers groups and channels below zero. A `> 0` check -- correct for a user identifier, and the obvious thing to copy -- would have rejected every group chat.
+
+**Persistence**
+
+- Migration `0005`: `chats`, plus the `contacts (account_id, id)` index its foreign key requires.
+- **The foreign key to `contacts` is composite, on `(account_id, contact_id)`** (ADR-043). A simple `contact_id -> contacts.id` guarantees the contact exists but *not* that it belongs to the same account, so a chat in one account could name another account's contact and nothing would object. Requiring the pair to exist together makes that unrepresentable. This is the pattern every later table in the graph should use.
+- Partial unique index giving a contact at most one private chat, and a unique `(account_id, telegram_chat_id)` -- two accounts may record the same Telegram chat, one account may not record it twice.
+
+**Application**
+
+- `OpenPrivateChat`, `OpenGroupChat`, `GetChat`, `ListChats`, `SetChatPolicy`.
+- `OpenPrivateChat` is the **first use case to compose two scoped repositories in one transaction**. The contact ownership check costs nothing: the contact repository is scoped to the same account, so another account's contact simply is not found.
+
+**CLI**
+
+- `chat open`, `show` (by identifier or `--contact`), `list`, `set --sync/--no-sync --ai`.
+
+**Tests**
+
+- The shared contract suite over both implementations, plus a graph suite: the edge reaches exactly one contact, that contact belongs to the same account, cross-account linkage is refused by the *store*, and the graph does not outlive its nodes.
+- The composite key is tested against the real schema and against a fake that models it independently -- a fake checking only existence would have accepted exactly the row the constraint was added to prevent.
+
+## Fixed
+
+- **`DATABASE.md` specified two things that cannot both hold.** `chats.contact_id ON DELETE SET NULL` alongside a check requiring a private chat to name its contact: purging a contact would null the column and violate the check on the line below. `SET NULL` also contradicts `PRIVACY.md` §7, which requires a contact purge to be "transactional removal across every table". Resolved as `ON DELETE CASCADE` (ADR-043).
+
+## Changed
+
+- `DOMAIN_MODEL.md` §5.5 corrected: the edge's role, both directions of the private-chat invariant, the composite ownership key, negative Telegram identifiers, and each deferred field with its reason.
+- `DATABASE.md`: `chats` documented as implemented, with a note that later tables should reference `(account_id, chat_id)` compositely; migration plan renumbered.
+- `API.md`: the implemented `ChatRepository`, and why `list_by_activity`, `list_sync_enabled`, `set_ai_processing_mode` and `purge` are absent.
+
+## Architecture Decisions
+
+- **ADR-043 -- Cross-Table Account Ownership Is Enforced by Composite Foreign Keys** (Proposed). The most consequential decision in this slice: it establishes the shape every later table in the graph uses, and closes a hole that would otherwise have been inherited by messages, memories, goals and profiles.
+- **ADR-044 -- The Communication Graph Is Established by Chat Alone** (Proposed). Why Chat is the edge, why Conversation and Message are not, and why a Chat has no lifecycle of its own.
+
+## Scope note
+
+Seventeen source and test files were created or modified, within the twenty-file limit.
+
 ### Milestone 1.3 -- Contact Aggregate
 
 The first aggregate describing somebody other than the operator. Its key appears

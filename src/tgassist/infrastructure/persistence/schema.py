@@ -21,6 +21,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     MetaData,
@@ -215,6 +216,203 @@ Index(
     contacts.c.id,
 )
 
+# Referenced by the composite foreign key from chats. Redundant with the primary
+# key on its own, and that is the point: it is what lets another table reference
+# (account_id, id) together, so a child row cannot name a contact belonging to a
+# different account (ADR-043).
+Index(
+    "uq_contacts_account_id_id",
+    contacts.c.account_id,
+    contacts.c.id,
+    unique=True,
+)
+
+CHATS_TABLE: Final = "chats"
+
+chats = Table(
+    CHATS_TABLE,
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=False),
+    Column(
+        "account_id",
+        Integer,
+        ForeignKey("accounts.id", ondelete="CASCADE", name="fk_chats_account_id_accounts"),
+        nullable=False,
+    ),
+    # Telegram numbers groups and channels below zero, so the check below is
+    # "not zero" rather than the "positive" that suits a user identifier.
+    Column("telegram_chat_id", Integer, nullable=False),
+    Column("chat_type", String(16), nullable=False),
+    # Null for every kind but private, and never null for private. Enforced in
+    # both directions by the check constraints below.
+    Column("contact_id", Integer, nullable=True),
+    Column("title", String(256), nullable=True),
+    Column("sync_enabled", Boolean, nullable=False, server_default=text("1")),
+    Column("ai_processing_mode", String(16), nullable=False, server_default="local_only"),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    # A composite foreign key, not the obvious contact_id -> contacts.id. The
+    # simple version would permit a chat in one account to name a contact in
+    # another; this one cannot, because the pair must exist together. Cascade
+    # rather than SET NULL: nulling the column would break the private-chat
+    # invariant, and a contact purge must remove everything referencing them
+    # (PRIVACY.md section 7, ADR-043).
+    ForeignKeyConstraint(
+        ["account_id", "contact_id"],
+        ["contacts.account_id", "contacts.id"],
+        name="fk_chats_account_id_contact_id_contacts",
+        ondelete="CASCADE",
+    ),
+    CheckConstraint("id > 0", name="id_positive"),
+    CheckConstraint("account_id > 0", name="account_id_positive"),
+    CheckConstraint("telegram_chat_id <> 0", name="telegram_chat_id_not_zero"),
+    CheckConstraint("contact_id IS NULL OR contact_id > 0", name="contact_id_positive"),
+    CheckConstraint(
+        "chat_type IN ('private', 'group', 'supergroup', 'channel', 'saved')",
+        name="chat_type_known",
+    ),
+    CheckConstraint(
+        "ai_processing_mode IN ('disabled', 'local_only', 'cloud_allowed')",
+        name="ai_processing_mode_known",
+    ),
+    # Both directions of one rule: a private chat is with exactly one person and
+    # has no name of its own; every other kind has a name and no single person.
+    CheckConstraint(
+        "(chat_type = 'private') = (contact_id IS NOT NULL)",
+        name="contact_iff_private",
+    ),
+    CheckConstraint(
+        "(chat_type <> 'private') = (title IS NOT NULL)",
+        name="title_iff_not_private",
+    ),
+    CheckConstraint(
+        "title IS NULL OR length(trim(title)) > 0",
+        name="title_not_blank",
+    ),
+    CheckConstraint("updated_at >= created_at", name="updated_after_created"),
+    comment=(
+        "Communication containers: the edge joining an account to a contact. "
+        "Messages, synchronisation state and per-chat AI policy all attach here."
+    ),
+)
+
+Index(
+    "uq_chats_account_id_telegram_chat_id",
+    chats.c.account_id,
+    chats.c.telegram_chat_id,
+    unique=True,
+)
+
+# At most one private chat per contact. Partial, because contact_id is null for
+# every other kind and many nulls must remain permitted. Both dialect predicates
+# are given so the same index exists on PostgreSQL (ADR-016).
+Index(
+    "uq_chats_account_id_contact_id",
+    chats.c.account_id,
+    chats.c.contact_id,
+    unique=True,
+    sqlite_where=text("contact_id IS NOT NULL"),
+    postgresql_where=text("contact_id IS NOT NULL"),
+)
+
+# The listing query: scoped by account, ordered by created_at with id as the
+# keyset tiebreaker.
+Index(
+    "ix_chats_account_id_created_at",
+    chats.c.account_id,
+    chats.c.created_at,
+    chats.c.id,
+)
+
+# Referenced by the composite foreign key from messages, for the same reason the
+# equivalent index on contacts exists: it is what lets a child row name a chat
+# and an account together, so a message cannot be filed in another account's
+# chat (ADR-043).
+Index(
+    "uq_chats_account_id_id",
+    chats.c.account_id,
+    chats.c.id,
+    unique=True,
+)
+
+MESSAGES_TABLE: Final = "messages"
+
+messages = Table(
+    MESSAGES_TABLE,
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=False),
+    Column("account_id", Integer, nullable=False),
+    Column("chat_id", Integer, nullable=False),
+    # Optional: ingestion is source-agnostic, and only Telegram issues these.
+    # Its presence is what makes a message re-ingestable without duplication;
+    # its absence means there is nothing to deduplicate against (ADR-045).
+    Column("telegram_message_id", Integer, nullable=True),
+    Column("sender_kind", String(16), nullable=False),
+    Column("message_type", String(16), nullable=False, server_default="text"),
+    # Conversation content. Nullable because a photo or a sticker has none.
+    Column("text", Text, nullable=True),
+    Column("sent_at", DateTime(timezone=True), nullable=False),
+    Column("ingested_at", DateTime(timezone=True), nullable=False),
+    # No updated_at. A message is an immutable factual record, and the absence
+    # of the column is what says so.
+    ForeignKeyConstraint(
+        ["account_id", "chat_id"],
+        ["chats.account_id", "chats.id"],
+        name="fk_messages_account_id_chat_id_chats",
+        ondelete="CASCADE",
+    ),
+    CheckConstraint("id > 0", name="id_positive"),
+    CheckConstraint("account_id > 0", name="account_id_positive"),
+    CheckConstraint("chat_id > 0", name="chat_id_positive"),
+    CheckConstraint(
+        "telegram_message_id IS NULL OR telegram_message_id > 0",
+        name="telegram_message_id_positive",
+    ),
+    CheckConstraint(
+        "sender_kind IN ('operator', 'contact', 'system')",
+        name="sender_kind_known",
+    ),
+    CheckConstraint(
+        "message_type IN ('text', 'photo', 'voice', 'video', 'document', "
+        "'sticker', 'location', 'poll', 'service', 'other')",
+        name="message_type_known",
+    ),
+    # A text message must have text; every other kind may have a caption or
+    # nothing.
+    CheckConstraint(
+        "message_type <> 'text' OR (text IS NOT NULL AND length(trim(text)) > 0)",
+        name="text_present_for_text_messages",
+    ),
+    comment=(
+        "The immutable factual record. Append-only: there is no update path, "
+        "which is why the table has no updated_at."
+    ),
+)
+
+# The idempotency guarantee, and the reason re-synchronisation is safe. Partial,
+# because a message from a source that issues no identifiers has NULL here and
+# many such rows must remain permitted (ADR-045).
+Index(
+    "uq_messages_account_id_chat_id_telegram_message_id",
+    messages.c.account_id,
+    messages.c.chat_id,
+    messages.c.telegram_message_id,
+    unique=True,
+    sqlite_where=text("telegram_message_id IS NOT NULL"),
+    postgresql_where=text("telegram_message_id IS NOT NULL"),
+)
+
+# The history query: one chat, newest first, with id as the keyset tiebreaker.
+# Ordered by sent_at rather than insertion order, because a backfill inserts old
+# messages after new ones.
+Index(
+    "ix_messages_account_id_chat_id_sent_at",
+    messages.c.account_id,
+    messages.c.chat_id,
+    messages.c.sent_at,
+    messages.c.id,
+)
+
 # Keys used in schema_metadata.
 KEY_CREATED_AT: Final = "created_at"
 KEY_CREATED_BY_VERSION: Final = "created_by_version"
@@ -225,15 +423,19 @@ APPLICATION_NAME: Final = "tgassist"
 __all__ = [
     "ACCOUNTS_TABLE",
     "APPLICATION_NAME",
+    "CHATS_TABLE",
     "CONTACTS_TABLE",
     "KEY_APPLICATION",
     "KEY_CREATED_AT",
     "KEY_CREATED_BY_VERSION",
+    "MESSAGES_TABLE",
     "NAMING_CONVENTION",
     "SCHEMA_METADATA_TABLE",
     "USER_PROFILES_TABLE",
     "accounts",
+    "chats",
     "contacts",
+    "messages",
     "metadata",
     "schema_metadata",
     "user_profiles",

@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from collections.abc import Coroutine
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -28,9 +29,12 @@ from tgassist import __version__
 from tgassist.application.container import Container
 from tgassist.application.use_cases.account import CreateAccountRequest
 from tgassist.application.use_cases.contact import ContactTransition
+from tgassist.application.use_cases.message import IncomingMessage
 from tgassist.application.use_cases.user_profile import ProfileChanges
 from tgassist.domain.errors import AppError, ConfigurationError, DomainValidationError
+from tgassist.domain.model.chat import AiProcessingMode, Chat, ChatType
 from tgassist.domain.model.identifiers import AccountId
+from tgassist.domain.model.message import MessageType, SenderKind
 from tgassist.domain.model.query import PageRequest
 from tgassist.domain.model.user_profile import (
     EmojiUsage,
@@ -72,6 +76,10 @@ profile_app = typer.Typer(help="Manage operator preferences.", no_args_is_help=T
 app.add_typer(profile_app, name="profile")
 contact_app = typer.Typer(help="Manage the people an account knows.", no_args_is_help=True)
 app.add_typer(contact_app, name="contact")
+chat_app = typer.Typer(help="Manage conversations and what may be done with them.")
+app.add_typer(chat_app, name="chat")
+message_app = typer.Typer(help="Ingest and read conversation history.", no_args_is_help=True)
+app.add_typer(message_app, name="message")
 
 ProfileOption = Annotated[
     str | None,
@@ -794,6 +802,380 @@ def _change_contact(
         typer.echo(f"Contact {contact.id} ({contact.display_name}) is now {contact.status}.")
 
     _run_async(container, run())
+
+
+@chat_app.command("open")
+def chat_open(  # noqa: PLR0913, PLR0917 - Typer reads the options from the signature
+    telegram_chat_id: Annotated[
+        int,
+        typer.Argument(
+            help=(
+                "Telegram chat identifier. Negative for groups and channels, "
+                "which the shell reads as an option -- put it after -- "
+                "(chat open --type group --title T -- -1001234)."
+            ),
+        ),
+    ],
+    contact_id: Annotated[
+        int | None,
+        typer.Option("--contact", "-c", help="Contact this private chat is with."),
+    ] = None,
+    title: Annotated[
+        str | None, typer.Option("--title", "-t", help="Title, for a non-private chat.")
+    ] = None,
+    chat_type: Annotated[
+        ChatType | None, typer.Option("--type", help="Kind of chat. Defaults to private.")
+    ] = None,
+    no_sync: Annotated[
+        bool, typer.Option("--no-sync", help="Do not synchronise this chat.")
+    ] = False,
+    ai_mode: Annotated[
+        AiProcessingMode | None,
+        typer.Option("--ai", help="What AI may do with this chat. Defaults to local-only."),
+    ] = None,
+    account_id: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Record a conversation.
+
+    Telegram synchronisation does not exist yet, so the chat is described rather
+    than discovered. From Milestone 3 chats arrive from the account's chat list,
+    and this command becomes a development affordance.
+
+    A private chat needs ``--contact`` and takes no title; every other kind needs
+    ``--title`` and takes no contact.
+    """
+    container = _open(profile, config_dir)
+    resolved_type = chat_type or ChatType.PRIVATE
+    scope = AccountId(account_id) if account_id is not None else None
+
+    async def run() -> None:
+        await container.start_database()
+        if resolved_type is ChatType.PRIVATE:
+            if contact_id is None:
+                typer.echo(
+                    "A private chat needs --contact. Use --type to record another kind.",
+                    err=True,
+                )
+                raise typer.Exit(code=EXIT_ERROR)
+            if title is not None:
+                typer.echo(
+                    "A private chat takes its name from the contact; drop --title.", err=True
+                )
+                raise typer.Exit(code=EXIT_ERROR)
+            chat = await container.open_private_chat().execute(
+                contact_id=contact_id,
+                telegram_chat_id=telegram_chat_id,
+                account_id=scope,
+                sync_enabled=not no_sync,
+                ai_processing_mode=ai_mode or AiProcessingMode.LOCAL_ONLY,
+            )
+        else:
+            if title is None:
+                typer.echo(f"A {resolved_type.value} chat needs --title.", err=True)
+                raise typer.Exit(code=EXIT_ERROR)
+            if contact_id is not None:
+                typer.echo("Only a private chat can name a single contact.", err=True)
+                raise typer.Exit(code=EXIT_ERROR)
+            chat = await container.open_group_chat().execute(
+                telegram_chat_id=telegram_chat_id,
+                title=title,
+                chat_type=resolved_type,
+                account_id=scope,
+                sync_enabled=not no_sync,
+                ai_processing_mode=ai_mode or AiProcessingMode.LOCAL_ONLY,
+            )
+        typer.echo(f"Opened {chat.chat_type.value} chat {chat.id} ({_chat_label(chat)}).")
+
+    _run_async(container, run())
+
+
+@chat_app.command("show")
+def chat_show(
+    chat_id: Annotated[
+        int | None, typer.Argument(help="Chat to show. Omit and use --contact instead.")
+    ] = None,
+    contact_id: Annotated[
+        int | None, typer.Option("--contact", "-c", help="Show the private chat with a contact.")
+    ] = None,
+    account_id: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Show one chat, by identifier or by the contact it is with."""
+    container = _open(profile, config_dir)
+    scope = AccountId(account_id) if account_id is not None else None
+
+    async def run() -> None:
+        await container.start_database()
+        if (chat_id is None) == (contact_id is None):
+            typer.echo("Give a chat identifier or --contact, not both.", err=True)
+            raise typer.Exit(code=EXIT_ERROR)
+
+        use_case = container.get_chat()
+        chat = (
+            await use_case.execute(chat_id, account_id=scope)
+            if chat_id is not None
+            else await use_case.with_contact(contact_id or 0, account_id=scope)
+        )
+        if chat is None:
+            typer.echo("No such chat.")
+            raise typer.Exit(code=EXIT_ERROR)
+        typer.echo(f"id               : {chat.id}")
+        typer.echo(f"account          : {chat.account_id}")
+        typer.echo(f"telegram chat id : {chat.telegram_chat_id}")
+        typer.echo(f"type             : {chat.chat_type.value}")
+        typer.echo(f"contact          : {chat.contact_id or '(none)'}")
+        typer.echo(f"title            : {chat.title or '(none)'}")
+        typer.echo(f"sync             : {chat.sync_enabled}")
+        typer.echo(f"ai processing    : {chat.ai_processing_mode.value}")
+        typer.echo(f"created          : {chat.created_at.isoformat()}")
+        typer.echo(f"updated          : {chat.updated_at.isoformat()}")
+
+    _run_async(container, run())
+
+
+@chat_app.command("list")
+def chat_list(
+    limit: Annotated[int, typer.Option("--limit", "-n", help="Rows per page.")] = 20,
+    account_id: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """List an account's chats, newest first."""
+    container = _open(profile, config_dir)
+
+    async def run() -> None:
+        await container.start_database()
+        page = await container.list_chats().execute(
+            PageRequest(limit=limit),
+            account_id=AccountId(account_id) if account_id is not None else None,
+        )
+        if not page:
+            typer.echo("No chats.")
+            return
+        for chat in page:
+            sync = "sync" if chat.sync_enabled else "----"
+            typer.echo(
+                f"  {chat.id:>6}  {_chat_label(chat):<28} {chat.chat_type.value:<11} "
+                f"{sync}  ai:{chat.ai_processing_mode.value}"
+            )
+        if page.has_more:
+            typer.echo("More chats available; raise --limit to see them.")
+
+    _run_async(container, run())
+
+
+@chat_app.command("set")
+def chat_set(  # noqa: PLR0913, PLR0917 - Typer reads the options from the signature
+    chat_id: Annotated[int, typer.Argument(help="Chat to change.")],
+    sync: Annotated[
+        bool | None, typer.Option("--sync/--no-sync", help="Synchronise this chat.")
+    ] = None,
+    ai_mode: Annotated[
+        AiProcessingMode | None, typer.Option("--ai", help="What AI may do with this chat.")
+    ] = None,
+    account_id: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Change what may be done with a chat.
+
+    ``--ai disabled`` is how a user answers "stop using AI on our chats", and
+    ``--ai local_only`` -- the default -- keeps content on this device.
+    """
+    container = _open(profile, config_dir)
+
+    async def run() -> None:
+        await container.start_database()
+        chat = await container.set_chat_policy().execute(
+            chat_id,
+            sync_enabled=sync,
+            ai_processing_mode=ai_mode,
+            account_id=AccountId(account_id) if account_id is not None else None,
+        )
+        typer.echo(f"Chat {chat.id} ({_chat_label(chat)}):")
+        typer.echo(f"  sync          : {chat.sync_enabled}")
+        typer.echo(f"  ai processing : {chat.ai_processing_mode.value}")
+
+    _run_async(container, run())
+
+
+def _chat_label(chat: Chat) -> str:
+    """Describe a chat in one phrase.
+
+    A private chat has no title of its own -- its name lives on the contact --
+    so it is identified by whom it is with. Resolving the contact's name would
+    mean a second query for a label, which the listing does not need.
+    """
+    return chat.title if chat.title is not None else f"contact {chat.contact_id}"
+
+
+@message_app.command("ingest")
+def message_ingest(  # noqa: PLR0913, PLR0917 - Typer reads the options from the signature
+    chat_id: Annotated[int, typer.Argument(help="Chat to ingest into.")],
+    text: Annotated[str, typer.Argument(help="What the message says.")],
+    sender: Annotated[SenderKind, typer.Option("--from", help="Who sent it.")] = SenderKind.CONTACT,
+    sent_at: Annotated[
+        str | None,
+        typer.Option(
+            "--sent-at",
+            help=(
+                "When it was sent, ISO 8601. An offset is honoured; a value "
+                "without one is read as UTC. Defaults to now."
+            ),
+        ),
+    ] = None,
+    telegram_message_id: Annotated[
+        int | None,
+        typer.Option(
+            "--telegram-id",
+            help="Its identifier in Telegram. Supplying one makes re-ingestion a no-op.",
+        ),
+    ] = None,
+    account_id: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Ingest one message.
+
+    The same pipeline synchronisation will use in Milestone 3. Supplying
+    ``--telegram-id`` makes the ingestion idempotent: running the command twice
+    stores one message and reports the second as already present.
+    """
+    container = _open(profile, config_dir)
+
+    async def run() -> None:
+        await container.start_database()
+        moment = _parse_instant(sent_at) if sent_at is not None else container.clock.now()
+        report = await container.ingest_messages().execute(
+            chat_id,
+            [
+                IncomingMessage(
+                    sender_kind=sender,
+                    sent_at=moment,
+                    text=text,
+                    message_type=MessageType.TEXT,
+                    telegram_message_id=telegram_message_id,
+                )
+            ],
+            account_id=AccountId(account_id) if account_id is not None else None,
+        )
+        if report.stored:
+            typer.echo(f"Ingested message {report.message_ids[0]}.")
+        else:
+            typer.echo("Already ingested; nothing stored.")
+
+    _run_async(container, run())
+
+
+@message_app.command("history")
+def message_history(
+    chat_id: Annotated[int, typer.Argument(help="Chat to read.")],
+    limit: Annotated[int, typer.Option("--limit", "-n", help="Messages per page.")] = 20,
+    account_id: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Show a chat's history, newest first.
+
+    Ordered by when each message was sent rather than by when it was ingested,
+    because a backfill stores old messages after new ones.
+    """
+    container = _open(profile, config_dir)
+
+    async def run() -> None:
+        await container.start_database()
+        page = await container.read_chat_history().execute(
+            chat_id,
+            PageRequest(limit=limit),
+            account_id=AccountId(account_id) if account_id is not None else None,
+        )
+        if not page:
+            typer.echo("No messages.")
+            return
+        for message in page:
+            marker = ">" if message.is_outgoing else "<"
+            when = message.sent_at.isoformat(timespec="minutes")
+            typer.echo(f"{marker} {when}  {message.id:>6}  {_preview(message.text)}")
+        if page.has_more:
+            typer.echo("More messages available; raise --limit to see them.")
+
+    _run_async(container, run())
+
+
+@message_app.command("show")
+def message_show(
+    message_id: Annotated[int, typer.Argument(help="Message to show.")],
+    account_id: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Show one message in full."""
+    container = _open(profile, config_dir)
+
+    async def run() -> None:
+        await container.start_database()
+        message = await container.get_message().execute(
+            message_id,
+            account_id=AccountId(account_id) if account_id is not None else None,
+        )
+        if message is None:
+            typer.echo("No such message.")
+            raise typer.Exit(code=EXIT_ERROR)
+        typer.echo(f"id            : {message.id}")
+        typer.echo(f"chat          : {message.chat_id}")
+        typer.echo(f"telegram id   : {message.telegram_message_id or '(none)'}")
+        typer.echo(f"from          : {message.sender_kind.value}")
+        typer.echo(f"type          : {message.message_type.value}")
+        typer.echo(f"sent          : {message.sent_at.isoformat()}")
+        typer.echo(f"ingested      : {message.ingested_at.isoformat()}")
+        typer.echo("")
+        typer.echo(message.text or "(no text)")
+
+    _run_async(container, run())
+
+
+def _parse_instant(value: str) -> datetime:
+    """Parse an ISO 8601 timestamp, reading a naive value as UTC.
+
+    Typer's own ``datetime`` type accepts three fixed formats, none carrying a
+    timezone offset -- so an import tool supplying a real ISO 8601 timestamp
+    would have been rejected. ``fromisoformat`` accepts the whole grammar.
+
+    Raises:
+        DomainValidationError: If the value is not a timestamp.
+    """
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        msg = f"{value!r} is not an ISO 8601 timestamp"
+        raise DomainValidationError(
+            msg,
+            user_message=(
+                f"{value!r} is not a timestamp. Use ISO 8601, "
+                f"for example 2026-01-31T09:30:00+00:00."
+            ),
+            cause=exc,
+        ) from exc
+    # A naive value is read as UTC rather than as local time: the application
+    # stores UTC throughout, and guessing a local zone here would silently
+    # shift every imported message.
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+
+PREVIEW_LENGTH = 60
+
+
+def _preview(text: str | None) -> str:
+    """Render a message's text as one line for a listing."""
+    if text is None:
+        return "(no text)"
+    flattened = " ".join(text.split())
+    if len(flattened) <= PREVIEW_LENGTH:
+        return flattened
+    return flattened[: PREVIEW_LENGTH - 1] + "\u2026"
 
 
 def _open(profile: str | None, config_dir: Path | None) -> Container:

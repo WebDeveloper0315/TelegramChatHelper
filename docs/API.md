@@ -444,17 +444,45 @@ the truth, which is that this person is already known and was deleted.
 
 ## `ChatRepository`
 
+*Implemented in Milestone 1.4.*
+
 ```python
-async def add(chat: Chat) -> Chat
-async def update(chat: Chat) -> Chat
-async def get(account_id: AccountId, chat_id: ChatId) -> Chat | None
-async def get_by_telegram_id(account_id: AccountId, tg_chat_id: TelegramChatId) -> Chat | None
-async def list_by_activity(account_id: AccountId, *, cursor: str | None, limit: int) -> Page[Chat]
-async def list_sync_enabled(account_id: AccountId) -> list[Chat]
-async def set_ai_processing_mode(account_id: AccountId, chat_id: ChatId,
-                                 mode: AIProcessingMode) -> None
-async def purge(account_id: AccountId, chat_id: ChatId) -> PurgeReport
+class ChatRepository(Protocol):
+    @property
+    def account_id() -> AccountId
+    async def add(chat: Chat) -> None
+    async def get(chat_id: ChatId) -> Chat | None
+    async def get_by_telegram_id(telegram_chat_id: TelegramChatId) -> Chat | None
+    async def get_private_with(contact_id: ContactId) -> Chat | None
+    async def list_chats(request: PageRequest) -> Page[Chat]
+    async def update(chat: Chat) -> None
 ```
+
+Scoped at construction (§7.2), so no method takes an account.
+
+`get_private_with` is the graph traversal in the direction the application reads
+it: from a person to the conversation with them. It returns a single chat rather
+than a page because a contact has at most one private chat, enforced by a partial
+unique index.
+
+Four methods from the version 1.0 sketch are **not** implemented:
+
+- `list_by_activity` — orders by `last_message_at`, which is written by
+  ingestion and does not exist yet. `list_chats` orders by `created_at` until
+  then, and the recency index arrives with the column.
+- `list_sync_enabled` — synchronisation will want it, and it should be added
+  with the query that needs it so its index can be chosen and measured rather
+  than guessed.
+- `set_ai_processing_mode` — a field-specific write where `update` already
+  serves. The rules for what a chat may become belong to the entity, and a
+  repository method deciding one would be a second place for them to be wrong.
+- `purge` — removing a chat must also remove its messages, conversations,
+  summaries, suggestions and attachments. None of those tables exists. Milestone
+  11 owns it; deletion today happens by cascade from the account or the contact.
+
+There is no `delete` either. A chat is not something a user removes: it exists
+because a conversation exists in Telegram. What they control is `sync_enabled`
+and `ai_processing_mode` (ADR-044).
 
 ## `ConversationRepository`
 
@@ -470,19 +498,81 @@ async def close(account_id: AccountId, conversation_id: ConversationId, ended_at
 
 ## `MessageRepository`
 
+*Implemented in Milestone 1.5.*
+
 ```python
-async def add(message: Message) -> Message
-async def add_batch(messages: Sequence[Message]) -> BatchResult   # idempotent bulk ingest
-async def update(message: Message) -> Message
-async def get(account_id: AccountId, message_id: MessageId) -> Message | None
-async def get_by_telegram_id(account_id: AccountId, chat_id: ChatId,
-                             tg_message_id: TelegramMessageId) -> Message | None
-async def list_recent(account_id: AccountId, chat_id: ChatId, *,
-                      before: datetime | None, limit: int) -> Page[Message]
-async def list_by_conversation(account_id: AccountId,
-                               conversation_id: ConversationId) -> list[Message]
-async def list_for_metrics(account_id: AccountId, chat_id: ChatId,
-                           window: TimeWindow) -> list[MessageMetricRow]
+class MessageRepository(Protocol):
+    @property
+    def account_id() -> AccountId
+    async def add(message: Message) -> None
+    async def get(message_id: MessageId) -> Message | None
+    async def get_by_telegram_id(
+        chat_id: ChatId, telegram_message_id: TelegramMessageId
+    ) -> Message | None
+    async def list_by_chat(chat_id: ChatId, request: PageRequest) -> Page[Message]
+```
+
+Scoped at construction (§7.2), and **append-only**: no `update`, no `delete`, no
+`soft_delete`. A message is the immutable factual record everything else is
+derived from, and the absence of those methods is what makes that a property of
+the code rather than a sentence in a document (ADR-046). A test asserts the
+absence on the port and on both implementations.
+
+`get_by_telegram_id` takes the chat because a Telegram message identifier is
+unique only within one.
+
+Five methods from the version 1.0 sketch are **not** implemented:
+
+- `add_batch` — batching is the *pipeline's* concern, not the repository's.
+  `IngestMessages` takes a sequence, resolves each against
+  `get_by_telegram_id`, and writes in one transaction. A repository method
+  deciding what counts as a duplicate would put the idempotency rule in two
+  places.
+- `update` — see above.
+- `list_by_conversation` — Conversation does not exist (ADR-044).
+- `list_for_metrics` — response-time metrics are Milestone 9, and the index
+  serving them should be chosen by the measured query.
+- `list_recent` with a `before` cursor — replaced by `list_by_chat` taking a
+  `PageRequest`, so message history uses the same keyset pagination as
+  everything else rather than a bespoke cursor.
+
+## Ingestion
+
+*Implemented in Milestone 1.5.*
+
+```python
+@dataclass(frozen=True)
+class IncomingMessage:
+    sender_kind: SenderKind
+    sent_at: datetime
+    text: str | None = None
+    message_type: MessageType = MessageType.TEXT
+    telegram_message_id: int | None = None
+
+class IngestMessages:
+    async def execute(
+        chat_id: int,
+        incoming: Sequence[IncomingMessage],
+        *,
+        account_id: AccountId | None = None,
+    ) -> IngestionReport
+```
+
+`IncomingMessage` is deliberately **not** a `Message`: a source knows what
+arrived, not what local identifier it will be given or when this application
+stored it. Keeping the two apart stops a caller inventing either.
+
+There is no `MessageSource` port. There is one source; a protocol with one
+implementation is an interface designed against a guess. Synchronisation will
+construct `IncomingMessage` values exactly as the CLI does, and if a third
+source then fits neither, the abstraction can be extracted from two real
+examples.
+
+The batch is validated **whole before anything is written**, so a batch
+containing one malformed message is refused entirely — a guarantee that does not
+depend on the store rolling back. Repeats are reported as `skipped` rather than
+raised, because a backfill overlapping live updates is the ordinary case rather
+than an error.
 async def mark_deleted_remotely(account_id: AccountId, message_id: MessageId) -> None
 async def count(account_id: AccountId, chat_id: ChatId) -> int
 ```

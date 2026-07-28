@@ -29,11 +29,23 @@ from tgassist.application.use_cases.account import (
     ListAccounts,
     SetActiveAccount,
 )
+from tgassist.application.use_cases.chat import (
+    GetChat,
+    ListChats,
+    OpenGroupChat,
+    OpenPrivateChat,
+    SetChatPolicy,
+)
 from tgassist.application.use_cases.contact import (
     ChangeContactStatus,
     CreateContact,
     GetContact,
     ListContacts,
+)
+from tgassist.application.use_cases.message import (
+    GetMessage,
+    IngestMessages,
+    ReadChatHistory,
 )
 from tgassist.application.use_cases.user_profile import (
     GetUserProfile,
@@ -41,11 +53,13 @@ from tgassist.application.use_cases.user_profile import (
 )
 from tgassist.domain.errors import SchemaVersionError, SecretStoreUnavailableError
 from tgassist.domain.ports.account_repository import AccountRepository
+from tgassist.domain.ports.chat_repository import ChatRepository
 from tgassist.domain.ports.clock import Clock
 from tgassist.domain.ports.contact_repository import ContactRepository
 from tgassist.domain.ports.database import HealthReport
 from tgassist.domain.ports.event_bus import EventBus
 from tgassist.domain.ports.id_generator import IdGenerator
+from tgassist.domain.ports.message_repository import MessageRepository
 from tgassist.domain.ports.migration_runner import SchemaState, SchemaStatus
 from tgassist.domain.ports.repository import RepositoryFactory, ScopedRepositoryFactory
 from tgassist.domain.ports.secret_store import SecretStore
@@ -67,7 +81,9 @@ from tgassist.infrastructure.persistence import (
     SqliteDatabase,
     UnitOfWorkFactory,
     account_repository,
+    chat_repository,
     contact_repository,
+    message_repository,
     user_profile_repository,
 )
 from tgassist.infrastructure.security import build_default_secret_store
@@ -257,6 +273,20 @@ class Container:
         """
         return contact_repository
 
+    @property
+    def chats(self) -> ScopedRepositoryFactory[ChatRepository]:
+        """Return the chat repository factory."""
+        return chat_repository
+
+    @property
+    def messages(self) -> ScopedRepositoryFactory[MessageRepository]:
+        """Return the message repository factory.
+
+        Append-only: the port has no update or delete, so nothing built from
+        this factory can change a stored message.
+        """
+        return message_repository
+
     # -- Use cases --------------------------------------------------------
     #
     # Built on demand rather than held, because a use case is a small object
@@ -307,6 +337,55 @@ class Container:
     def change_contact_status(self) -> ChangeContactStatus:
         """Build the contact archive, restore and delete use case."""
         return ChangeContactStatus(self._uow_factory, self.contacts, self.accounts, self._clock)
+
+    def open_private_chat(self) -> OpenPrivateChat:
+        """Build the private chat creation use case.
+
+        The one use case so far needing two scoped repositories: it resolves a
+        contact and creates a chat in a single transaction.
+        """
+        return OpenPrivateChat(
+            self._uow_factory, self.chats, self.contacts, self.accounts, self._clock, self._ids
+        )
+
+    def open_group_chat(self) -> OpenGroupChat:
+        """Build the group chat creation use case."""
+        return OpenGroupChat(self._uow_factory, self.chats, self.accounts, self._clock, self._ids)
+
+    def get_chat(self) -> GetChat:
+        """Build the chat lookup use case."""
+        return GetChat(self._uow_factory, self.chats, self.accounts)
+
+    def list_chats(self) -> ListChats:
+        """Build the chat listing use case."""
+        return ListChats(self._uow_factory, self.chats, self.accounts)
+
+    def set_chat_policy(self) -> SetChatPolicy:
+        """Build the chat policy use case."""
+        return SetChatPolicy(self._uow_factory, self.chats, self.accounts, self._clock)
+
+    def ingest_messages(self) -> IngestMessages:
+        """Build the ingestion pipeline.
+
+        Source-agnostic: the CLI feeds it today, synchronisation will feed the
+        same object in Milestone 3.
+        """
+        return IngestMessages(
+            self._uow_factory,
+            self.messages,
+            self.chats,
+            self.accounts,
+            self._clock,
+            self._ids,
+        )
+
+    def read_chat_history(self) -> ReadChatHistory:
+        """Build the chat history use case."""
+        return ReadChatHistory(self._uow_factory, self.messages, self.accounts)
+
+    def get_message(self) -> GetMessage:
+        """Build the message lookup use case."""
+        return GetMessage(self._uow_factory, self.messages, self.accounts)
 
     def repository[R](self, factory: RepositoryFactory[R], uow: UnitOfWork) -> R:
         """Build a repository bound to an open unit of work.

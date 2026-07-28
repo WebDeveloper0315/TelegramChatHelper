@@ -60,6 +60,16 @@ CONTENT_KEY_FRAGMENTS: frozenset[str] = frozenset(
 )
 """Key fragments holding conversation content, removed unless diagnostic mode."""
 
+CONTENT_KEYS: frozenset[str] = frozenset({"text"})
+"""Whole key names holding conversation content.
+
+Matched exactly rather than as fragments, which is the whole reason this set
+exists separately. ``Message.text`` is the most sensitive field in the
+application, but ``text`` cannot join :data:`CONTENT_KEY_FRAGMENTS`: it is a
+substring of ``context``, a structural key carried by every application error,
+and redacting that would hide the diagnostic information errors exist to give.
+"""
+
 SAFE_KEYS: frozenset[str] = frozenset({"event", "level", "logger", "timestamp"})
 """Structural keys whose names never indicate sensitivity.
 
@@ -107,6 +117,8 @@ def is_content_key(key: str) -> bool:
     lowered = key.lower()
     if lowered in SAFE_KEYS or lowered.endswith(REFERENCE_KEY_SUFFIXES):
         return False
+    if lowered in CONTENT_KEYS:
+        return True
     return any(fragment in lowered for fragment in CONTENT_KEY_FRAGMENTS)
 
 

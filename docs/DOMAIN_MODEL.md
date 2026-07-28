@@ -242,18 +242,30 @@ Three states, expressed as two nullable timestamps of which at most one is set; 
 
 ## 5.5 Chat
 
-**Responsibility.** Mirrors a Telegram conversation container and owns message history, synchronisation state and per-chat AI policy.
+*Implemented in Milestone 1.4. Corrected by ADR-043 and ADR-044.*
 
-**Attributes.** `id`, `account_id`, `telegram_chat_id`, `chat_type` (`private` | `group` | `supergroup` | `channel` | `saved`), `title`, `contact_id` (set for private chats only), `is_muted`, `is_archived`, `sync_enabled`, `ai_processing_mode` (`disabled` | `local_only` | `cloud_allowed`), `retention_days`, `last_message_at`, `created_at`, `updated_at`, `deleted_at`.
+**Responsibility.** The **edge of the communication graph**: the container joining an Account to a Contact. Account and Contact are the graph's nodes; Chat is what connects them, and it is where message history, synchronisation state and per-chat AI policy attach.
+
+**Identity.** A locally generated `id`, for the same reasons a Contact's is (ADR-041). `(account_id, telegram_chat_id)` is unique.
+
+**Attributes.** `id`, `account_id`, `telegram_chat_id`, `chat_type` (`private` | `group` | `supergroup` | `channel` | `saved`), `contact_id` (private chats only), `title` (every other kind), `sync_enabled`, `ai_processing_mode` (`disabled` | `local_only` | `cloud_allowed`), `created_at`, `updated_at`.
 
 **Invariants.**
-- `(account_id, telegram_chat_id)` is unique.
-- `contact_id` is non-null if and only if `chat_type = private`.
+- `(account_id, telegram_chat_id)` is unique. Two accounts may record the same Telegram chat; one account may not record it twice.
+- `contact_id` is non-null **if and only if** `chat_type = private`, and `title` is non-null if and only if it is not. Both directions are enforced, in the entity and in the schema: a private chat with nobody in it, and a group chat claiming a single counterpart, are equally unrepresentable.
+- A private chat has no title of its own. Its name is the Contact's display name, stored once, on the Contact.
+- A Contact has at most one private chat, enforced by a partial unique index.
+- `contact_id` must name a Contact **of the same Account**, enforced by a composite foreign key on `(account_id, contact_id)` (ADR-043).
+- `telegram_chat_id` is non-zero. It **may be negative**: Telegram numbers groups and channels below zero, so the "must be positive" rule that suits a user identifier is wrong here.
 - `ai_processing_mode` defaults to `local_only` (ADR-024); no content leaves the device for a Chat set to `disabled` or `local_only`.
 - A Chat with `sync_enabled = false` ingests no history and receives no live updates.
-- `retention_days = null` means "inherit the global policy".
+- `updated_at >= created_at`; every timestamp is timezone-aware UTC.
 
-**Notes.** MVP scope is private chats (`PROJECT_SPEC.md` §12). The entity models the others so that enabling group support later is additive rather than a schema change.
+**Lifecycle.** A Chat has none of its own. It exists because a conversation exists in Telegram, so a user does not create or remove one — what they control is `sync_enabled` and `ai_processing_mode`. Removal is by cascade: from the Account, or from the Contact purge in `PRIVACY.md` §7 (ADR-044).
+
+**Deferred attributes.** `last_message_at` (written by ingestion; until messages exist it would be null on every row), `is_muted` (nothing notifies), `is_archived` (a third way to hide something, after archiving the Contact and disabling sync), `retention_days` (no global policy to inherit until Milestone 10), `deleted_at` (see the lifecycle above). Each is one additive migration away.
+
+**Notes.** MVP scope is private chats (`PROJECT_SPEC.md` §12). All five kinds are modelled so that enabling group support is additive — and because the private-chat invariants are only meaningful if a non-private chat is representable.
 
 ---
 
@@ -261,16 +273,24 @@ Three states, expressed as two nullable timestamps of which at most one is set; 
 
 **Responsibility.** A single message. The immutable factual record from which everything else is derived.
 
-**Attributes.** `id`, `account_id`, `chat_id`, `conversation_id`, `telegram_message_id`, `sender_kind` (`operator` | `contact` | `system`), `sender_telegram_user_id`, `is_outgoing`, `message_type` (`text` | `photo` | `voice` | `video` | `document` | `sticker` | `location` | `poll` | `service` | `other`), `text`, `reply_to_message_id`, `forwarded_from`, `sent_at` (Telegram time, UTC), `edited_at`, `ingested_at` (local insert time, UTC), `is_deleted_remotely`, `deleted_at`.
+*Implemented in Milestone 1.5. Corrected by ADR-045 and ADR-046.*
+
+**Attributes.** `id`, `account_id`, `chat_id`, `telegram_message_id` (**optional**), `sender_kind` (`operator` | `contact` | `system`), `message_type` (`text` | `photo` | `voice` | `video` | `document` | `sticker` | `location` | `poll` | `service` | `other`), `text` (optional), `sent_at` (source time, UTC), `ingested_at` (local insert time, UTC).
+
+**Identity.** A locally generated `id`. `telegram_message_id` is **optional**, because ingestion accepts messages from any source and only Telegram issues identifiers (ADR-045).
 
 **Invariants.**
-- `(account_id, chat_id, telegram_message_id)` is unique — the idempotency guarantee that makes re-synchronisation safe.
-- `sent_at` and `ingested_at` are distinct concepts and both required. Timing analysis uses `sent_at`; sync diagnostics use `ingested_at`. Conflating them is a defect.
-- `is_outgoing` is derived from the sender at ingest and stored, because it is queried constantly.
-- Messages are **immutable after ingest** except for `edited_at`, `text` on edit, `is_deleted_remotely` and `deleted_at`.
-- `reply_to_message_id` references a local Message or is null; it is never a dangling Telegram identifier.
+- `(account_id, chat_id, telegram_message_id)` is unique **where the identifier is present** — the idempotency guarantee that makes re-synchronisation safe, enforced by a *partial* index so that many source-less messages remain permitted.
+- `(account_id, chat_id)` is a composite foreign key to `chats`, so a message cannot be filed in another account's chat (ADR-043).
+- `sent_at` and `ingested_at` are distinct concepts and both required. Timing analysis uses `sent_at`; sync diagnostics use `ingested_at`. Conflating them is a defect. Neither is required to precede the other: clock skew between a sender and this device is ordinary.
+- A `text` message has non-empty text. Every other kind may carry a caption or nothing.
+- Messages are **append-only**: there is no update path and no delete path, expressed by the repository having no such methods and the table having no `updated_at` (ADR-046). A test asserts the absence.
 
-**Deletion policy.** A remote deletion sets `is_deleted_remotely` and blanks `text` if the user has enabled *mirror remote deletions* (default: on). The row is retained so replies referencing it remain coherent (`PROJECT_SPEC.md` §4.1, `sync.mirror_remote_deletions`).
+**Derived, not stored.** `is_outgoing` is exactly `sender_kind == operator`. Version 1.0 stored it "because it is queried constantly"; that is an argument for an index on a derived value, not for a second copy of a fact that can then disagree with the first.
+
+**Deferred attributes.** `conversation_id` (Conversation does not exist — ADR-044), `sender_telegram_user_id` (identifies which participant in a group; `sender_kind` suffices for a private chat), `reply_to_message_id` (threading; a self-referential key with its own deletion semantics, read by context assembly in Milestone 8), `forwarded_from`, `edited_at`, `is_deleted_remotely` (all written by synchronisation), `deleted_at` (nothing deletes a message yet — see below).
+
+**Deletion policy.** Not implemented, and deliberately not decided. Retention is Milestone 10, purge is Milestone 11, and remote-deletion mirroring is Milestone 3; each will choose soft or hard deletion with its own code in front of it. Adding `deleted_at` now would settle the question early and put a filter nothing writes into every history query (ADR-046). The eventual behaviour remains as specified: a remote deletion sets `is_deleted_remotely` and blanks `text` if *mirror remote deletions* is enabled (default: on), retaining the row so replies referencing it stay coherent (`PROJECT_SPEC.md` §4.1).
 
 ---
 
