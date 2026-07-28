@@ -242,6 +242,34 @@ this milestone.
 | Regression and startup tests | Done -- 12 tests, suite at 749 |
 | ADR-040 marked **Accepted** | Done |
 
+### Milestone 1.3 -- Contact Aggregate (complete, 2026-07-28)
+
+The first aggregate describing somebody other than the operator, and the anchor
+every later aggregate references.
+
+| Deliverable | Status |
+|---|---|
+| `Contact` entity: identity, ownership, lifecycle, invariants, validation | Done |
+| Locally generated key; `(account_id, telegram_user_id)` unique | Done -- ADR-041 |
+| Lifecycle `active ⇄ archived`, either to `deleted`, one `restored` | Done -- ADR-042 |
+| Migration `0004` -- indexes, unique constraint, seven check constraints | Done |
+| `ContactMapper` with round-trip and column-coverage tests | Done |
+| `ContactRepository`: five operations, scoped at construction | Done |
+| Use cases: create, get, list, change status | Done |
+| CLI: `contact add | show | list | archive | restore | delete` | Done |
+| Both implementations pass the shared contract suite **and** the account-owned suite | Done |
+| Soft-deletion branch of the Milestone 1.0 contract, never previously executed | Now runs |
+| `discovered`, `dormant`, `is_blocked`, `notes`, `language`, name parts | **Deferred** -- ADR-042 |
+| `get_by_username`, `search`, `purge` | **Omitted** -- no consumer |
+| No Chat, Conversation, Message, Goal, Memory or Telegram | Confirmed |
+
+**Open item carried forward.** `DOMAIN_MODEL.md` section 5.4 states that a
+Contact cannot be its own Account's operator identity. It is not enforced:
+nothing knows the operator's own Telegram identifier until authentication
+establishes it (Milestone 2). Enforcing it there is a check in `Contact.create`
+plus one migration-time backfill, and doing it now would mean inventing the
+value it compares against.
+
 ---
 
 ## M1 — Persistence Core

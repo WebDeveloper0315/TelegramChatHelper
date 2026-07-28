@@ -145,6 +145,76 @@ user_profiles = Table(
     ),
 )
 
+CONTACTS_TABLE: Final = "contacts"
+
+contacts = Table(
+    CONTACTS_TABLE,
+    metadata,
+    # A locally generated key, not the Telegram identifier. The same person can
+    # be known to two accounts, so telegram_user_id is not unique in this table
+    # -- only the pair below is -- and a natural key would push both columns
+    # into every child table's foreign key (ADR-041).
+    Column("id", Integer, primary_key=True, autoincrement=False),
+    Column(
+        "account_id",
+        Integer,
+        ForeignKey("accounts.id", ondelete="CASCADE", name="fk_contacts_account_id_accounts"),
+        nullable=False,
+    ),
+    Column("telegram_user_id", Integer, nullable=False),
+    # The one genuinely optional column: many Telegram users have never set a
+    # username. Null here means "has none", not "not decided yet".
+    Column("username", String(32), nullable=True),
+    Column("display_name", String(128), nullable=False),
+    # Timestamps rather than booleans: retention has to ask "deleted before
+    # when", and a boolean cannot answer that.
+    Column("archived_at", DateTime(timezone=True), nullable=True),
+    Column("deleted_at", DateTime(timezone=True), nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint("id > 0", name="id_positive"),
+    CheckConstraint("account_id > 0", name="account_id_positive"),
+    CheckConstraint("telegram_user_id > 0", name="telegram_user_id_positive"),
+    CheckConstraint("length(trim(display_name)) > 0", name="display_name_not_blank"),
+    CheckConstraint(
+        "username IS NULL OR length(username) BETWEEN 5 AND 32",
+        name="username_length",
+    ),
+    CheckConstraint("updated_at >= created_at", name="updated_after_created"),
+    # Archived and deleted are mutually exclusive states, not two flags that
+    # happen to be usually apart.
+    CheckConstraint(
+        "archived_at IS NULL OR deleted_at IS NULL",
+        name="not_archived_and_deleted",
+    ),
+    comment=(
+        "People known to an account. Unique per (account_id, telegram_user_id): "
+        "the same person known to two accounts is two contacts, because what is "
+        "remembered about them differs per account."
+    ),
+)
+
+# The documented invariant, made structural. Covers soft-deleted rows
+# deliberately: a deleted contact still occupies the natural key, so re-adding
+# the same person is refused and the caller is told to restore instead. That is
+# what makes the deletion soft rather than a slow way to lose history.
+Index(
+    "uq_contacts_account_id_telegram_user_id",
+    contacts.c.account_id,
+    contacts.c.telegram_user_id,
+    unique=True,
+)
+
+# The listing query: scoped by account, ordered by created_at with id as the
+# keyset tiebreaker. Leading with account_id because every query this table
+# serves is account-scoped, so no query benefits from an index that is not.
+Index(
+    "ix_contacts_account_id_created_at",
+    contacts.c.account_id,
+    contacts.c.created_at,
+    contacts.c.id,
+)
+
 # Keys used in schema_metadata.
 KEY_CREATED_AT: Final = "created_at"
 KEY_CREATED_BY_VERSION: Final = "created_by_version"
@@ -155,6 +225,7 @@ APPLICATION_NAME: Final = "tgassist"
 __all__ = [
     "ACCOUNTS_TABLE",
     "APPLICATION_NAME",
+    "CONTACTS_TABLE",
     "KEY_APPLICATION",
     "KEY_CREATED_AT",
     "KEY_CREATED_BY_VERSION",
@@ -162,6 +233,7 @@ __all__ = [
     "SCHEMA_METADATA_TABLE",
     "USER_PROFILES_TABLE",
     "accounts",
+    "contacts",
     "metadata",
     "schema_metadata",
     "user_profiles",

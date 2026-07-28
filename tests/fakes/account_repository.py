@@ -10,14 +10,13 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime
 
+from tests.fakes.pagination import paginate
 from tgassist.domain.errors import ConstraintViolationError, RecordNotFoundError
 from tgassist.domain.model.account import Account
 from tgassist.domain.model.identifiers import AccountId, TelegramUserId
 from tgassist.domain.model.page import Page
 from tgassist.domain.model.query import PageRequest
 from tgassist.domain.ports.account_repository import AccountRepository
-from tgassist.infrastructure.persistence.cursor import Cursor
-from tgassist.infrastructure.persistence.pagination import SORT_KEY, TIEBREAK_KEY
 
 
 class InMemoryAccountRepository(AccountRepository):
@@ -69,39 +68,12 @@ class InMemoryAccountRepository(AccountRepository):
 
     async def list_accounts(self, request: PageRequest) -> Page[Account]:
         """Return one page of accounts."""
-        descending = request.sort is None or request.sort.direction.is_descending
-        ordered = sorted(
-            self._accounts.values(),
-            key=lambda a: (a.created_at, int(a.id)),
-            reverse=descending,
+        return paginate(
+            list(self._accounts.values()),
+            request,
+            sort_key=lambda a: (a.created_at, int(a.id)),
+            identity=lambda a: int(a.id),
         )
-
-        position = Cursor.decode(request.cursor)
-        if position is not None and SORT_KEY in position and TIEBREAK_KEY in position:
-            marker = (
-                datetime.fromisoformat(str(position[SORT_KEY])),
-                int(position[TIEBREAK_KEY]),
-            )
-            ordered = [
-                a
-                for a in ordered
-                if (
-                    (a.created_at, int(a.id)) < marker
-                    if descending
-                    else (a.created_at, int(a.id)) > marker
-                )
-            ]
-
-        limit = request.effective_limit()
-        items = ordered[:limit]
-        next_cursor = (
-            Cursor.encode(
-                {SORT_KEY: items[-1].created_at.isoformat(), TIEBREAK_KEY: int(items[-1].id)}
-            )
-            if len(ordered) > limit and items
-            else None
-        )
-        return Page(items=items, next_cursor=next_cursor)
 
     async def set_active(self, account_id: AccountId, now: datetime) -> Account:
         """Make this account the active one, deactivating any other."""

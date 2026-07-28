@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from tgassist.domain.errors import RecordNotFoundError
+from tgassist.application.use_cases.account_scope import resolve_account
 from tgassist.domain.model.identifiers import AccountId
 from tgassist.domain.model.user_profile import (
     EmojiUsage,
@@ -87,7 +87,7 @@ class GetUserProfile:
                 reported rather than silently returning nothing.
         """
         async with self._unit_of_work() as uow:
-            resolved = await self._resolve_account(uow, account_id)
+            resolved = await resolve_account(self._accounts(uow), account_id)
             profiles = self._profiles(uow, resolved)
 
             existing = await profiles.get()
@@ -99,28 +99,6 @@ class GetUserProfile:
             await uow.commit()
 
         return profile
-
-    async def _resolve_account(self, uow: object, account_id: AccountId | None) -> AccountId:
-        accounts = self._accounts(uow)  # type: ignore[arg-type]
-        if account_id is None:
-            active = await accounts.get_active()
-            if active is None:
-                msg = "No account is active"
-                raise RecordNotFoundError(
-                    msg,
-                    user_message="No account is active. Create one first.",
-                )
-            return active.id
-
-        account = await accounts.get(account_id)
-        if account is None:
-            msg = f"No account with identifier {int(account_id)}"
-            raise RecordNotFoundError(
-                msg,
-                user_message="That account was not found.",
-                context={"account_id": int(account_id)},
-            )
-        return account.id
 
 
 class UpdateUserProfile:

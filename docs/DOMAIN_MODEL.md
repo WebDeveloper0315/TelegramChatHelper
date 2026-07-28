@@ -205,17 +205,38 @@ disconnected → connecting → awaiting_phone → awaiting_code
 
 ## 5.4 Contact
 
+*Implemented in Milestone 1.3. Corrected by ADR-041 and ADR-042.*
+
 **Responsibility.** A person the operator communicates with, and the anchor for memory, goals and relationship data.
 
-**Attributes.** `id`, `account_id`, `telegram_user_id`, `username`, `display_name`, `first_name`, `last_name`, `phone_number_hash`, `language`, `country`, `timezone`, `is_blocked`, `is_deleted`, `notes`, `first_seen_at`, `last_seen_at`, `created_at`, `updated_at`, `deleted_at`.
+**Identity.** A locally generated `id`, **not** the Telegram user identifier. The same person can be known to two Accounts, so `telegram_user_id` is not unique in this table; a natural key would have to be the pair, and every child table would then carry both columns in its foreign key. See ADR-041.
+
+**Attributes.** `id`, `account_id`, `telegram_user_id`, `username`, `display_name`, `archived_at`, `deleted_at`, `created_at`, `updated_at`.
 
 **Invariants.**
-- `(account_id, telegram_user_id)` is unique.
-- A Contact cannot be its own Account's operator identity.
-- Soft deletion (`deleted_at`) hides a Contact and suspends all AI processing for it, but preserves history until hard deletion is requested.
-- Hard deletion removes the Contact and every Memory, Proposal, Goal, Relationship Profile, Style Profile and Suggestion referencing it (`PRIVACY.md` §7, contact purge).
+- `(account_id, telegram_user_id)` is unique, enforced by an index that **includes soft-deleted rows**: a deleted Contact still holds that person's history, so a second row for them would split it.
+- `username`, when present, is a structurally valid Telegram handle: 5–32 characters, letter first, letters, digits and underscores, no trailing underscore. A leading `@` is stripped.
+- `display_name` is non-empty and at most 128 characters.
+- `archived_at` and `deleted_at` are mutually exclusive; at most one is ever set.
+- `updated_at >= created_at`; every timestamp is timezone-aware UTC.
+- Soft deletion hides a Contact and suspends all AI processing for it, but preserves history until hard deletion is requested.
+- Hard deletion removes the Contact and every Memory, Proposal, Goal, Relationship Profile, Style Profile and Suggestion referencing it (`PRIVACY.md` §7, contact purge). Milestone 11 owns it; there is no hard delete today.
 
-**Lifecycle.** `discovered → active → dormant → archived → deleted`. *Dormant* is derived (no interaction within a configured window), not stored.
+**Lifecycle.**
+
+```
+active ⇄ archived
+  ↓  ↘     ↓
+    deleted → (restored) → active
+```
+
+Three states, expressed as two nullable timestamps of which at most one is set; both null means active. Timestamps rather than booleans because retention asks "deleted before when" (ADR-042). One `restored` transition serves both archived and deleted.
+
+`discovered` and `dormant` from version 1.0 are **not implemented**: the first is indistinguishable from `active` until synchronisation exists to discover anybody, and the second is derived from `last_seen_at` and a configured window, neither of which exists. Both are recorded in ADR-042 rather than dropped.
+
+**Deferred attributes.** `first_name` / `last_name` (duplicated by `display_name`; needed for salutation generation in Milestone 8), `phone_number_hash` (the salt strategy belongs with the code that first receives a phone number), `language` (nothing reads it; `UserProfile.primary_language` is what reply generation consults), `country` / `timezone` (Telegram supplies neither), `is_blocked` (distinct from archived, but nothing processes anybody until Milestone 8), `notes` (overlaps the Memory aggregate), `first_seen_at` / `last_seen_at` (written by synchronisation from message timestamps). Each is one additive migration away.
+
+**Note.** "A Contact cannot be its own Account's operator identity" is stated in version 1.0 but not enforced: nothing prevents adding a contact whose `telegram_user_id` equals the owning Account's. It becomes checkable once authentication establishes the operator's own identifier (Milestone 2), and is recorded as an open item in `ROADMAP.md` rather than half-enforced now.
 
 ---
 

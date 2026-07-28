@@ -29,6 +29,12 @@ from tgassist.application.use_cases.account import (
     ListAccounts,
     SetActiveAccount,
 )
+from tgassist.application.use_cases.contact import (
+    ChangeContactStatus,
+    CreateContact,
+    GetContact,
+    ListContacts,
+)
 from tgassist.application.use_cases.user_profile import (
     GetUserProfile,
     UpdateUserProfile,
@@ -36,6 +42,7 @@ from tgassist.application.use_cases.user_profile import (
 from tgassist.domain.errors import SchemaVersionError, SecretStoreUnavailableError
 from tgassist.domain.ports.account_repository import AccountRepository
 from tgassist.domain.ports.clock import Clock
+from tgassist.domain.ports.contact_repository import ContactRepository
 from tgassist.domain.ports.database import HealthReport
 from tgassist.domain.ports.event_bus import EventBus
 from tgassist.domain.ports.id_generator import IdGenerator
@@ -60,6 +67,7 @@ from tgassist.infrastructure.persistence import (
     SqliteDatabase,
     UnitOfWorkFactory,
     account_repository,
+    contact_repository,
     user_profile_repository,
 )
 from tgassist.infrastructure.security import build_default_secret_store
@@ -238,6 +246,17 @@ class Container:
         """
         return user_profile_repository
 
+    @property
+    def contacts(self) -> ScopedRepositoryFactory[ContactRepository]:
+        """Return the contact repository factory.
+
+        Scoped, like every repository over account-owned data. It matters more
+        here than for the profile: a profile is one row and a mistake is
+        obvious, whereas a contact list quietly containing somebody else's
+        contacts looks exactly like a correct one (ADR-039).
+        """
+        return contact_repository
+
     # -- Use cases --------------------------------------------------------
     #
     # Built on demand rather than held, because a use case is a small object
@@ -270,6 +289,24 @@ class Container:
         return UpdateUserProfile(
             self._uow_factory, self.user_profiles, self.get_user_profile(), self._clock
         )
+
+    def create_contact(self) -> CreateContact:
+        """Build the contact creation use case."""
+        return CreateContact(
+            self._uow_factory, self.contacts, self.accounts, self._clock, self._ids
+        )
+
+    def get_contact(self) -> GetContact:
+        """Build the contact lookup use case."""
+        return GetContact(self._uow_factory, self.contacts, self.accounts)
+
+    def list_contacts(self) -> ListContacts:
+        """Build the contact listing use case."""
+        return ListContacts(self._uow_factory, self.contacts, self.accounts)
+
+    def change_contact_status(self) -> ChangeContactStatus:
+        """Build the contact archive, restore and delete use case."""
+        return ChangeContactStatus(self._uow_factory, self.contacts, self.accounts, self._clock)
 
     def repository[R](self, factory: RepositoryFactory[R], uow: UnitOfWork) -> R:
         """Build a repository bound to an open unit of work.

@@ -39,7 +39,7 @@ Each decision must have one of the following statuses:
 - Rejected
 
 **ADR-001 through ADR-010 are Accepted.**
-**ADR-011 through ADR-039 are Proposed and require explicit approval.** ADR-011 through ADR-030 were approved for implementation at the close of the architecture stabilization session; ADR-031 through ADR-039 arose during implementation and await review.
+**ADR-011 through ADR-039 and ADR-041 through ADR-042 are Proposed and require explicit approval.** ADR-011 through ADR-030 were approved for implementation at the close of the architecture stabilization session; ADR-031 through ADR-039 arose during implementation and await review.
 
 **ADR-040 is Accepted and implemented.**
 
@@ -89,6 +89,8 @@ Each decision must have one of the following statuses:
 | 038 | UserProfile Identity Is the Account | Proposed |
 | 039 | Account Scope Is a Constructor Parameter, Not a Method Argument | Proposed |
 | 040 | The CLI Does Not Configure Logging, So Log Records Reach Standard Output | **Accepted** |
+| 041 | Contact Identity Is a Local Surrogate Key, Not the Telegram User Identifier | Proposed |
+| 042 | Contact Lifecycle: Archived and Deleted as Mutually Exclusive Timestamps | Proposed |
 
 ---
 
@@ -2865,6 +2867,291 @@ A `--verbose/-v` flag mapping to a console log level would make the level adjust
 ### Related Decisions
 
 ADR-018 (logging and observability), ADR-024 (secret handling), ADR-011 (dependency direction). Implemented in `presentation/cli/app.py` and `config/default.yaml`; no change to `infrastructure/logging`.
+
+---
+
+# ADR-041
+
+## Title
+
+Contact Identity Is a Local Surrogate Key, Not the Telegram User Identifier
+
+Status
+
+Proposed
+
+Date
+
+2026-07-28
+
+---
+
+### Context
+
+Contact is the first aggregate describing somebody other than the operator, and
+the anchor every later aggregate references: memories are about a contact, goals
+are pursued with a contact, a private chat belongs to one. Its key therefore
+appears in six tables that do not exist yet, which makes this the last cheap
+moment to choose it.
+
+Telegram already assigns every user a stable numeric identifier. Four candidates
+follow from that.
+
+| Candidate | Key |
+|---|---|
+| Natural | `telegram_user_id` alone |
+| Composite | `(account_id, telegram_user_id)` |
+| Surrogate | locally generated `contact_id` |
+| Dual | surrogate key, natural unique index |
+
+`DOMAIN_MODEL.md` section 5.4 lists both an `id` and the invariant that
+`(account_id, telegram_user_id)` is unique, which is the dual arrangement -- but
+it gives no reasoning, and the reasoning is what determines whether it survives
+contact with the Chat and Message tables.
+
+---
+
+### Decision
+
+**A locally generated `ContactId` is the primary key, and
+`(account_id, telegram_user_id)` is a unique index.**
+
+Three reasons, in descending order of how much they matter.
+
+**The Telegram identifier is not unique in this table.** The same person can be
+known to two accounts, and the two Contacts are genuinely different rows --
+what is remembered about somebody, and what the operator is trying to achieve
+with them, differs per account. `telegram_user_id` alone is therefore not a
+candidate key at all, and the natural key is the pair. A composite key would
+then propagate into every child table's foreign key: `messages` would carry
+`(account_id, contact_id)` rather than `contact_id`, and every join would compare
+two columns. That is a cost paid on every table for the life of the project.
+
+**A foreign system would own our identifiers.** Telegram's identifier space is
+theirs. It has already changed once in the platform's history -- user ids
+outgrew 32 bits -- and a key we do not control is a key we cannot migrate on our
+own schedule. A surrogate key insulates every child table from that.
+
+**Not every contact need come from Telegram.** Imported or manually created
+contacts have no Telegram identifier. Nothing requires that today, which is why
+this is the weakest of the three, but it costs nothing to keep open and would be
+expensive to reopen.
+
+The unique index is what preserves the documented invariant, and it is
+**deliberately not partial**: it covers soft-deleted rows. A deleted contact
+still holds that person's history, so allowing a second row for the same person
+would split the history between two contacts, with no way to say which is
+correct. Re-adding a deleted contact is therefore refused, and the caller is told
+to restore instead. That consequence is visible in the interface:
+`get_by_telegram_id` takes `include_deleted`, and creation passes it, so the
+message names the real situation rather than reporting a constraint violation.
+
+---
+
+### Alternatives Considered
+
+**`telegram_user_id` as the primary key.** Fewer columns, no generator, and
+synchronisation could insert without a lookup. Rejected because it is not
+unique: multi-account support is a stated requirement (`PROJECT_SPEC.md` section
+4.11), and this key would make the second account impossible without a migration
+touching every table that references a contact.
+
+**The composite `(account_id, telegram_user_id)`.** Correct, and it expresses
+ownership in the key itself, which is genuinely attractive -- a child row could
+not reference a contact without also naming its account. Rejected on cost: every
+child table carries both columns, every join compares both, and every index
+grows. The scope guarantee it would provide is already provided structurally by
+the scoped repository (ADR-039), so the cost buys a second copy of something we
+have.
+
+**A surrogate key with no natural unique index.** Simplest, and tempting because
+synchronisation could then upsert freely. Rejected: without the index, one
+Telegram user could become two contacts through a retry or a race, and the
+duplicate would be discovered later as two half-populated relationship profiles.
+
+---
+
+### Consequences
+
+Pros
+
+- Child tables carry one narrow column, both in their foreign keys and in their
+  indexes
+- Identifiers are ours, and are not affected by Telegram changing theirs
+- The documented uniqueness invariant is enforced by the database
+- The same person can be known to several accounts, independently
+
+Cons
+
+- Synchronisation must look a contact up by Telegram identifier before writing,
+  rather than inserting on the natural key. That lookup is indexed, and it is
+  needed anyway to decide between insert and update.
+- Two identifiers exist for one person, so a log record naming only one of them
+  is harder to correlate. Records therefore carry `contact_id`, and the CLI shows
+  both.
+
+---
+
+### Future Considerations
+
+If contacts from other platforms arrive, `telegram_user_id` becomes one of
+several external identifiers and would move to a `contact_identities` table
+keyed by `(contact_id, platform, external_id)`. This decision is what makes that
+an additive change rather than a rewrite.
+
+---
+
+### Related Decisions
+
+ADR-039 (account scoping), ADR-038 (UserProfile identity -- the opposite
+conclusion, for the opposite reason: a profile is one-to-one with its account and
+is referenced by nothing, so a surrogate key there would have been a second name
+for one row), ADR-042 (Contact lifecycle).
+
+---
+
+# ADR-042
+
+## Title
+
+Contact Lifecycle: Archived and Deleted as Mutually Exclusive Timestamps
+
+Status
+
+Proposed
+
+Date
+
+2026-07-28
+
+---
+
+### Context
+
+`DOMAIN_MODEL.md` version 1.0 gives Contact the lifecycle
+`discovered → active → dormant → archived → deleted`, and separately lists the
+attributes `is_blocked`, `is_deleted` and `deleted_at`. Implementing it raised
+three problems.
+
+**Two of the five states have no representation.** Nothing in the attribute list
+stores "archived", and `dormant` is explicitly described as derived rather than
+stored. So the documented lifecycle names five states while the documented
+attributes can express two.
+
+**Two of the five have no distinguishing behaviour yet.** `discovered` differs
+from `active` only in how the contact arrived, and nothing arrives until
+synchronisation exists (Milestone 3). `dormant` is a function of `last_seen_at`
+and a configured window, neither of which exists.
+
+**`is_deleted` and `deleted_at` are two owners of one fact.** They can disagree,
+and eventually will.
+
+---
+
+### Decision
+
+**Three states, two nullable timestamps, one invariant.**
+
+```
+active ⇄ archived
+  ↓  ↘     ↓
+    deleted → (restored) → active
+```
+
+* `archived_at` -- the operator has put this contact out of the way. Excluded
+  from the default listing, still returned by `get`, restorable.
+* `deleted_at` -- the operator has removed this contact. Excluded from every
+  listing and from `get` unless explicitly requested, restorable, and the target
+  of the purge described in `PRIVACY.md` section 7.
+* Both null -- active.
+
+**At most one is ever set.** Deleting an archived contact clears `archived_at`,
+so restoring returns it to active rather than silently back to the archive,
+which is not what the operator asked for. The exclusion is enforced in the
+entity and restated as a `CHECK` constraint.
+
+**Timestamps rather than booleans**, because retention has to ask "deleted
+before when" and a boolean cannot answer that. `is_deleted` is dropped: the
+timestamp already carries the fact, and a derived `is_deleted` property reads it.
+
+**One `restored` method for both states**, because both answer the same
+question -- make this contact ordinary again -- and a caller forced to know
+which state a contact is in before it can restore it has been handed the model's
+problem.
+
+`discovered` and `dormant` are **not implemented**. `discovered` is
+indistinguishable from `active` until something discovers contacts;
+`dormant` is derived and its inputs do not exist. A state that changes no
+behaviour is a column that will be wrong.
+
+`is_blocked` is **deferred**. It is genuinely distinct from archived -- archived
+means "out of my way", blocked means "never process this person" -- but nothing
+processes anybody until Milestone 8, so today the distinction has no observable
+effect. It is one additive migration away and should be added with the code that
+first honours it.
+
+---
+
+### Alternatives Considered
+
+**A single `status` enum column.** One column, mutually exclusive by
+construction, and a check constraint listing the values. Genuinely attractive,
+and rejected only because it loses *when*: retention needs the deletion
+timestamp, so the enum would need a companion `deleted_at` anyway, and then the
+two can disagree -- the exact defect `is_deleted` had.
+
+**Booleans plus timestamps** (`is_archived`, `archived_at`, ...). What the
+document implies. Rejected as two owners of one fact.
+
+**Hard deletion instead of soft.** Simpler, and no state to exclude from
+queries. Rejected: removing a Contact must also remove every Memory, Proposal,
+Goal, Relationship Profile, Style Profile and Suggestion that references it, and
+none of those tables exist yet. A hard delete now would appear to work while
+leaving orphans later. Milestone 11 owns the purge.
+
+**Archive only, no deletion.** Would have been the smaller milestone. Rejected
+because "remove this person" is a reasonable thing to want on day one, and
+because the shared repository contract has had a soft-deletion branch since
+Milestone 1.0 that no aggregate had ever exercised -- an untested contract clause
+is a clause that is probably wrong.
+
+---
+
+### Consequences
+
+Pros
+
+- Three states, each with an immediate observable effect
+- Mutual exclusion is structural, in the entity and in the schema
+- Retention can ask its question directly
+- The soft-deletion clause of the shared repository contract is finally executed,
+  against both implementations
+
+Cons
+
+- Two nullable columns rather than one enum, so a reader must know that "both
+  null" means active. The `status` property exists so no display code has to
+  work that out.
+- A soft-deleted contact keeps its `(account_id, telegram_user_id)`, so the same
+  person cannot be re-added while a deleted row exists. That is intended -- see
+  ADR-041 -- but it is a behaviour users will meet, so the message says to
+  restore rather than reporting a conflict.
+- Soft-deleted rows accumulate until Milestone 11 implements the purge.
+
+---
+
+### Future Considerations
+
+`is_blocked`, `last_seen_at` and the derived `dormant` state all arrive with the
+milestones that give them meaning. None requires changing what is decided here.
+
+---
+
+### Related Decisions
+
+ADR-041 (Contact identity), ADR-037 (Account lifecycle -- the same argument, that
+an entity should own only the lifecycle it genuinely has), ADR-039 (account
+scoping). `DOMAIN_MODEL.md` section 5.4 is corrected accordingly.
 
 ---
 

@@ -34,6 +34,63 @@ Not every release requires every category.
 
 # [Unreleased]
 
+## Added
+
+### Milestone 1.3 -- Contact Aggregate
+
+The first aggregate describing somebody other than the operator. Its key appears
+in six tables that do not exist yet -- memories, goals, chats, relationship and
+style profiles, suggestions -- which made this the last cheap moment to choose
+that key deliberately.
+
+**Domain**
+
+- `Contact` -- frozen, self-validating, with `archived`, `deleted`, `restored`, `renamed` and `with_username`. Each returns `self` when the change is a no-op.
+- **Identity is a locally generated `ContactId`**, not the Telegram identifier (ADR-041). The same person can be known to two accounts, so `telegram_user_id` is not unique in the table; a natural key would have to be the pair, and every child table would carry both columns in its foreign key.
+- **Lifecycle: `active ⇄ archived`, either state to `deleted`, and one `restored` transition back** (ADR-042). Two nullable timestamps, at most one ever set, rather than booleans -- retention has to ask "deleted before when", and a boolean cannot answer that.
+- `validate_username` -- structural Telegram handle validation with normalisation: a leading `@` is stripped, 5-32 characters, letter first, no trailing underscore.
+
+**Persistence**
+
+- Migration `0004`: `contacts`, the first table with many rows per account, and so the first whose indexes serve queries rather than only constraints.
+- **The unique index on `(account_id, telegram_user_id)` covers soft-deleted rows.** A deleted contact still holds that person's history; a second row for them would split it. Re-adding is therefore refused, and the caller is told to restore instead -- which is why `get_by_telegram_id` takes `include_deleted` and creation passes it.
+- Index `(account_id, created_at, id)`, matching the listing query and its keyset tiebreaker. `account_id` leads because every query this table serves is scoped.
+- Seven check constraints, including `archived_at IS NULL OR deleted_at IS NULL`, each with a test proving it rejects a bad row.
+
+**Application**
+
+- `CreateContact`, `GetContact`, `ListContacts`, `ChangeContactStatus`. The last is one use case parameterised by `ContactTransition` rather than three near-identical classes, because archive, restore and delete are the same transaction with a different entity method.
+- `resolve_account` extracted to `use_cases/account_scope.py`: every account-scoped use case begins by resolving the active account, and the rule was already duplicated between the profile use cases.
+
+**CLI**
+
+- `contact add`, `show`, `list`, `archive`, `restore`, `delete`, each accepting `--account`.
+
+**Tests**
+
+- Contact runs the shared Milestone 1.0 contract suite for the first time as an account-scoped collection -- including its **soft-deletion branch, which no aggregate had ever executed**. An untested contract clause is a clause that is probably wrong.
+- A second suite covers what only matters when rows belong to somebody: ownership, foreign-key integrity, cascade deletion, scope isolation, uniqueness within and across accounts, and the archive lifecycle.
+- `tests/fakes/pagination.py` extracts the keyset paging the fakes need. It is the code most likely to be subtly wrong in a way the contract suite would then pass for the wrong reason, so it is written once and verified by every aggregate's contract run. The account fake now uses it, and its contract suite still passes.
+
+## Fixed
+
+- **Archiving a deleted contact reported "not found".** `ChangeContactStatus` excluded deleted contacts from its lookup for every transition except restore, so the entity's own rule -- that a deleted contact must be restored before it can be archived -- was never reached, and the caller got a message that was untrue. The lookup now includes deleted contacts for every transition and lets the entity judge legality. Found by a test, not by review.
+
+## Changed
+
+- `DOMAIN_MODEL.md` §5.4 corrected: identity, the three-state lifecycle, the reduced attribute set, and each deferred field with its reason.
+- `DATABASE.md`: `contacts` documented as implemented; the migration plan renumbered into milestone order, with a note that numbers beyond `0004` are a plan rather than a commitment.
+- `API.md`: the implemented `ContactRepository`, and why `get_by_username`, `search`, `soft_delete` and `purge` are absent.
+
+## Architecture Decisions
+
+- **ADR-041 -- Contact Identity Is a Local Surrogate Key** (Proposed). Weighs the natural, composite, surrogate and dual arrangements, and records why the unique index deliberately covers soft-deleted rows.
+- **ADR-042 -- Contact Lifecycle** (Proposed). Three states with immediate value; `discovered` and `dormant` deferred as unrepresentable today; `is_blocked` deferred until something processes contacts.
+
+## Scope note
+
+Nineteen source and test files were created or modified, within the twenty-file limit.
+
 ## Fixed
 
 ### Maintenance -- CLI logging configuration (ADR-040, now Accepted)

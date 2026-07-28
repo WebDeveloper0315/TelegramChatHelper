@@ -397,18 +397,48 @@ review.
 
 ## `ContactRepository`
 
+*Implemented in Milestone 1.3.*
+
 ```python
-async def add(contact: Contact) -> Contact
-async def update(contact: Contact) -> Contact
-async def get(account_id: AccountId, contact_id: ContactId) -> Contact | None
-async def get_by_telegram_id(account_id: AccountId, tg_id: TelegramUserId) -> Contact | None
-async def get_by_username(account_id: AccountId, username: str) -> Contact | None
-async def list(account_id: AccountId, *, cursor: str | None, limit: int,
-               include_deleted: bool = False) -> Page[Contact]
-async def search(account_id: AccountId, query: str, limit: int) -> list[Contact]
-async def soft_delete(account_id: AccountId, contact_id: ContactId) -> None
-async def purge(account_id: AccountId, contact_id: ContactId) -> PurgeReport
+class ContactRepository(Protocol):
+    @property
+    def account_id() -> AccountId
+    async def add(contact: Contact) -> None
+    async def get(contact_id: ContactId, *, include_deleted: bool = False) -> Contact | None
+    async def get_by_telegram_id(
+        telegram_user_id: TelegramUserId, *, include_deleted: bool = False
+    ) -> Contact | None
+    async def list_contacts(
+        request: PageRequest, *, include_archived: bool = False
+    ) -> Page[Contact]
+    async def update(contact: Contact) -> None
 ```
+
+Scoped at construction (§7.2), so no method takes an account.
+
+Five operations, each with a caller. Four methods from the version 1.0 sketch
+are **not** implemented:
+
+- `get_by_username` and `search` — nothing looks a contact up by handle or by
+  free text yet, and each implies an index whose shape should be chosen by the
+  query that needs it. `search` is also dialect-specific, which is why message
+  search is a separate port (`MessageSearchPort`).
+- `soft_delete` — deletion is `update` with `Contact.deleted` applied. The rule
+  for what may be deleted belongs to the entity, and a repository method would
+  be a second place for it to be wrong. The same argument removes `archive` and
+  `restore`.
+- `purge` — removing a Contact must also remove every Memory, Proposal, Goal,
+  Relationship Profile, Style Profile and Suggestion referencing it. None of
+  those tables exists; a partial version would appear to work while leaving
+  orphans. Milestone 11 owns it.
+
+`include_deleted` and `include_archived` are separate flags because the two
+states hide differently. Archived means "not in my way": excluded from the
+listing, still returned by `get`, so restore can find it. Deleted means "gone":
+excluded from both, unless a caller says otherwise. Creation is the caller that
+says otherwise — a soft-deleted row still holds `(account_id, telegram_user_id)`,
+so looking only at live contacts would report a constraint violation instead of
+the truth, which is that this person is already known and was deleted.
 
 `purge()` removes every row referencing the contact across all tables in one transaction and returns counts per table — the operation behind a contact's erasure request (`PRIVACY.md` §7).
 

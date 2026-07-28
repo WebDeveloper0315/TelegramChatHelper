@@ -31,7 +31,17 @@ AccountId = NewType("AccountId", int)
 """Local identifier for an :class:`~tgassist.domain.model.account.Account`."""
 
 TelegramUserId = NewType("TelegramUserId", int)
-"""Identifier assigned by Telegram. Never used as a local primary key."""
+"""Identifier assigned by Telegram. Never used as a local primary key.
+
+The same Telegram user can be known to more than one Account, so this value is
+not unique in any table that holds it -- only ``(account_id, telegram_user_id)``
+is. Using it as a key would therefore force every child table into a composite
+foreign key, and would hand a foreign system control of our identifiers
+(ADR-041).
+"""
+
+ContactId = NewType("ContactId", int)
+"""Local identifier for a :class:`~tgassist.domain.model.contact.Contact`."""
 
 MIN_IDENTIFIER: Final = 1
 """Identifiers are positive. Zero and negatives indicate an unset value."""

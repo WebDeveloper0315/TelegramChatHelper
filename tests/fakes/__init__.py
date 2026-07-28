@@ -8,6 +8,10 @@ every test using it into a false positive.
 
 from tests.fakes.account_repository import InMemoryAccountRepository
 from tests.fakes.clock import EPOCH, AdvanceableClock, FixedClock
+from tests.fakes.contact_repository import (
+    InMemoryContactRepository,
+    InMemoryContactStore,
+)
 from tests.fakes.event_bus import RecordingEventBus
 from tests.fakes.id_generator import SequentialIdGenerator
 from tests.fakes.secret_store import InMemorySecretStore, UnavailableSecretStore
@@ -22,6 +26,8 @@ __all__ = [
     "AdvanceableClock",
     "FixedClock",
     "InMemoryAccountRepository",
+    "InMemoryContactRepository",
+    "InMemoryContactStore",
     "InMemoryProfileStore",
     "InMemorySecretStore",
     "InMemoryUnitOfWork",

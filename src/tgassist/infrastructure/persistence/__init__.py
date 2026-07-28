@@ -9,6 +9,11 @@ from tgassist.infrastructure.persistence.accounts import (
     SqlAccountRepository,
     account_repository,
 )
+from tgassist.infrastructure.persistence.contacts import (
+    ContactMapper,
+    SqlContactRepository,
+    contact_repository,
+)
 from tgassist.infrastructure.persistence.cursor import Cursor
 from tgassist.infrastructure.persistence.engine import MEMORY_URL, SqliteDatabase, build_url
 from tgassist.infrastructure.persistence.executor import DatabaseExecutor
@@ -34,12 +39,14 @@ __all__ = [
     "MEMORY_URL",
     "AccountMapper",
     "AlembicMigrationRunner",
+    "ContactMapper",
     "Cursor",
     "DatabaseExecutor",
     "KeysetPaginator",
     "Repository",
     "SqlAccountRepository",
     "SqlAlchemyUnitOfWork",
+    "SqlContactRepository",
     "SqlUserProfileRepository",
     "SqliteDatabase",
     "UnitOfWorkFactory",
@@ -47,6 +54,7 @@ __all__ = [
     "account_repository",
     "build_alembic_config",
     "build_url",
+    "contact_repository",
     "metadata",
     "schema_metadata",
     "translate_database_error",

@@ -160,12 +160,10 @@ erDiagram
         int telegram_user_id
         text username
         text display_name
-        text language
-        text timezone
-        int is_blocked
-        timestamp first_seen_at
-        timestamp last_seen_at
+        timestamp archived_at
         timestamp deleted_at
+        timestamp created_at
+        timestamp updated_at
     }
 
     chats {
@@ -548,10 +546,22 @@ Columns: `account_id`, `primary_language`, `tone_preference`, `preferred_message
 
 ### `contacts`
 
-- Unique: `(account_id, telegram_user_id)`
-- Index: `(account_id, username)`, `(account_id, last_seen_at DESC)`
-- FK: `account_id → accounts(id) ON DELETE CASCADE`
-- Soft delete: `deleted_at`
+People known to an account. Created by migration `0004`, and the first table
+with many rows per account -- so the first whose indexes are chosen to serve
+queries rather than only to enforce constraints.
+
+Columns: `id`, `account_id`, `telegram_user_id`, `username`, `display_name`,
+`archived_at`, `deleted_at`, `created_at`, `updated_at`.
+
+- Primary key `id` is **locally generated, not the Telegram identifier** and not autoincrement (ADR-041). The same person can be known to two accounts, so `telegram_user_id` is not unique here; a natural key would have to be the pair, and every child table would carry both columns.
+- **Unique: `(account_id, telegram_user_id)`** — the documented invariant, made structural. Deliberately **not partial**: it covers soft-deleted rows, because a deleted contact still holds that person's history and a second row for them would split it. Re-adding a deleted contact is therefore refused and the caller is told to restore instead.
+- Index: `(account_id, created_at, id)` — the listing query, scoped and ordered with the keyset tiebreaker. `account_id` leads because every query this table serves is account-scoped, so an index that does not lead with it serves nothing.
+- FK: `account_id → accounts(id) ON DELETE CASCADE`.
+- `username` is the one genuinely nullable column: many Telegram users have never set one, so null means "has none" rather than "not decided yet".
+- Soft delete: `deleted_at`. Archive: `archived_at`. Mutually exclusive, enforced by a check constraint rather than by convention (ADR-042).
+- Check constraints: `id > 0`, `account_id > 0`, `telegram_user_id > 0`, `length(trim(display_name)) > 0`, `username IS NULL OR length(username) BETWEEN 5 AND 32`, `updated_at >= created_at`, `archived_at IS NULL OR deleted_at IS NULL`.
+- **No index on `(account_id, username)`** yet: nothing looks a contact up by handle. It arrives with the search that needs it, measured against `DATABASE.md` §20 rather than added on the assumption that it will be wanted.
+- Access is through a repository **scoped at construction** (ADR-039).
 
 ### `chats`
 
@@ -804,16 +814,20 @@ Initial migration sequence:
 | `0001` | `schema_metadata` -- infrastructure baseline | **Applied** |
 | `0002` | `accounts` — the ownership root | **Applied** |
 | `0003` | `user_profiles` — the first account-scoped table | **Applied** |
-| `0004` | `telegram_sessions`, `settings`, `audit_log` | Milestone 2 |
-| `0005` | `contacts`, `chats`, `conversations`, `messages`, `attachments`, `sync_cursors` | Milestone 3 |
-| `0006` | `messages_fts` and synchronisation triggers | Milestone 3 |
-| `0007` | `memories`, `memory_proposals`, `memory_revisions`, `goals` | Milestone 5 |
-| `0008` | `relationship_profiles`, `style_profiles` | Milestone 6 |
-| `0009` | `embedding_models`, `embeddings` | Milestone 7 |
-| `0010` | `analyses`, `conversation_summaries`, `conversation_plans`, `reply_suggestions`, `behavior_recommendations` | Milestone 8 |
-| `0011` | `ai_providers`, `ai_calls` | Milestone 8 |
-| `0012` | `notifications`, `retention_policies` | Milestone 10 |
-| `0013` | `plugins`, `plugin_data` | Milestone 12 |
+| `0004` | `contacts` — the first many-per-account table | **Applied** |
+| `0005` | `telegram_sessions`, `settings`, `audit_log` | Milestone 2 |
+| `0006` | `chats`, `conversations`, `messages`, `attachments`, `sync_cursors` | Milestone 3 |
+| `0007` | `messages_fts` and synchronisation triggers | Milestone 3 |
+| `0008` | `memories`, `memory_proposals`, `memory_revisions`, `goals` | Milestone 5 |
+| `0009` | `relationship_profiles`, `style_profiles` | Milestone 6 |
+| `0010` | `embedding_models`, `embeddings` | Milestone 7 |
+| `0011` | `analyses`, `conversation_summaries`, `conversation_plans`, `reply_suggestions`, `behavior_recommendations` | Milestone 8 |
+| `0012` | `ai_providers`, `ai_calls` | Milestone 8 |
+| `0013` | `notifications`, `retention_policies` | Milestone 10 |
+| `0014` | `plugins`, `plugin_data` | Milestone 12 |
+
+Numbers beyond `0004` are a plan, not a commitment: each is assigned when its
+migration is written, in the order the milestones actually land.
 
 One migration adds one aggregate's table rather than a milestone's worth at once, so each is reviewable on its own and a failure has one cause to look for.
 

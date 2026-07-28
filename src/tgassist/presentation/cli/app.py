@@ -27,6 +27,7 @@ import typer
 from tgassist import __version__
 from tgassist.application.container import Container
 from tgassist.application.use_cases.account import CreateAccountRequest
+from tgassist.application.use_cases.contact import ContactTransition
 from tgassist.application.use_cases.user_profile import ProfileChanges
 from tgassist.domain.errors import AppError, ConfigurationError, DomainValidationError
 from tgassist.domain.model.identifiers import AccountId
@@ -69,6 +70,8 @@ account_app = typer.Typer(help="Manage Telegram accounts.", no_args_is_help=True
 app.add_typer(account_app, name="account")
 profile_app = typer.Typer(help="Manage operator preferences.", no_args_is_help=True)
 app.add_typer(profile_app, name="profile")
+contact_app = typer.Typer(help="Manage the people an account knows.", no_args_is_help=True)
+app.add_typer(contact_app, name="contact")
 
 ProfileOption = Annotated[
     str | None,
@@ -77,6 +80,10 @@ ProfileOption = Annotated[
 ConfigDirOption = Annotated[
     Path | None,
     typer.Option("--config-dir", help="Directory holding configuration files."),
+]
+AccountOption = Annotated[
+    int | None,
+    typer.Option("--account", help="Account to operate on. Defaults to the active one."),
 ]
 
 
@@ -593,6 +600,200 @@ def _parse_quiet_hours(value: str | None) -> TimeRange | None:
             ),
         )
     return TimeRange.from_clock(parts[0], parts[1])
+
+
+@contact_app.command("add")
+def contact_add(  # noqa: PLR0913, PLR0917 - Typer reads the options from the signature
+    telegram_user_id: Annotated[int, typer.Argument(help="Telegram user identifier.")],
+    display_name: Annotated[str, typer.Argument(help="Name to show for this person.")],
+    username: Annotated[
+        str | None, typer.Option("--username", "-u", help="Telegram handle, with or without @.")
+    ] = None,
+    account_id: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Record a person this account knows.
+
+    Telegram synchronisation does not exist yet, so the identifier is supplied
+    rather than discovered. From Milestone 3 contacts arrive from the account's
+    chat list, and this command becomes a development affordance.
+    """
+    container = _open(profile, config_dir)
+
+    async def run() -> None:
+        await container.start_database()
+        contact = await container.create_contact().execute(
+            telegram_user_id=telegram_user_id,
+            display_name=display_name,
+            username=username,
+            account_id=AccountId(account_id) if account_id is not None else None,
+        )
+        handle = f" (@{contact.username})" if contact.username else ""
+        typer.echo(f"Added contact {contact.id}: {contact.display_name}{handle}.")
+
+    _run_async(container, run())
+
+
+@contact_app.command("show")
+def contact_show(
+    contact_id: Annotated[int, typer.Argument(help="Contact to show.")],
+    account_id: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Show one contact, including a deleted one."""
+    container = _open(profile, config_dir)
+
+    async def run() -> None:
+        await container.start_database()
+        # Deleted contacts are shown here deliberately: somebody asking for a
+        # specific identifier wants to know it was deleted, not to be told it
+        # does not exist.
+        contact = await container.get_contact().execute(
+            contact_id,
+            account_id=AccountId(account_id) if account_id is not None else None,
+            include_deleted=True,
+        )
+        if contact is None:
+            typer.echo("No such contact.")
+            raise typer.Exit(code=EXIT_ERROR)
+        typer.echo(f"id               : {contact.id}")
+        typer.echo(f"account          : {contact.account_id}")
+        typer.echo(f"telegram user id : {contact.telegram_user_id}")
+        typer.echo(f"username         : {contact.username or '(none)'}")
+        typer.echo(f"display name     : {contact.display_name}")
+        typer.echo(f"status           : {contact.status}")
+        typer.echo(f"created          : {contact.created_at.isoformat()}")
+        typer.echo(f"updated          : {contact.updated_at.isoformat()}")
+
+    _run_async(container, run())
+
+
+@contact_app.command("list")
+def contact_list(
+    limit: Annotated[int, typer.Option("--limit", "-n", help="Rows per page.")] = 20,
+    include_archived: Annotated[
+        bool, typer.Option("--archived/--no-archived", help="Include archived contacts.")
+    ] = False,
+    account_id: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """List an account's contacts, newest first.
+
+    Deleted contacts are never listed. Archived ones appear only with
+    ``--archived``, because the reason to archive somebody is to stop seeing
+    them.
+    """
+    container = _open(profile, config_dir)
+
+    async def run() -> None:
+        await container.start_database()
+        page = await container.list_contacts().execute(
+            PageRequest(limit=limit),
+            account_id=AccountId(account_id) if account_id is not None else None,
+            include_archived=include_archived,
+        )
+        if not page:
+            typer.echo("No contacts." if not include_archived else "No contacts, archived or not.")
+            return
+        for contact in page:
+            marker = "-" if contact.is_archived else " "
+            handle = f"@{contact.username}" if contact.username else ""
+            typer.echo(
+                f"{marker} {contact.id:>6}  {contact.display_name:<24} "
+                f"{handle:<20} telegram:{contact.telegram_user_id}"
+            )
+        if include_archived:
+            typer.echo("")
+            typer.echo("- = archived")
+        if page.has_more:
+            typer.echo("More contacts available; raise --limit to see them.")
+
+    _run_async(container, run())
+
+
+@contact_app.command("archive")
+def contact_archive(
+    contact_id: Annotated[int, typer.Argument(help="Contact to archive.")],
+    account_id: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Hide a contact from the default list, keeping everything."""
+    _change_contact(
+        ContactTransition.ARCHIVE,
+        contact_id,
+        account_id=account_id,
+        profile=profile,
+        config_dir=config_dir,
+    )
+
+
+@contact_app.command("restore")
+def contact_restore(
+    contact_id: Annotated[int, typer.Argument(help="Contact to restore.")],
+    account_id: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Return a contact to active, whether archived or deleted."""
+    _change_contact(
+        ContactTransition.RESTORE,
+        contact_id,
+        account_id=account_id,
+        profile=profile,
+        config_dir=config_dir,
+    )
+
+
+@contact_app.command("delete")
+def contact_delete(
+    contact_id: Annotated[int, typer.Argument(help="Contact to delete.")],
+    account_id: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Delete a contact.
+
+    Soft deletion: the row and its history stay until the purge described in
+    ``PRIVACY.md`` section 7 removes them, and ``contact restore`` undoes this.
+    """
+    _change_contact(
+        ContactTransition.DELETE,
+        contact_id,
+        account_id=account_id,
+        profile=profile,
+        config_dir=config_dir,
+    )
+
+
+def _change_contact(
+    transition: ContactTransition,
+    contact_id: int,
+    *,
+    account_id: int | None,
+    profile: str | None,
+    config_dir: Path | None,
+) -> None:
+    """Apply a lifecycle transition and report the result.
+
+    One helper for three commands: they differ only in the transition, and three
+    copies of this body would be three places for the reporting to drift.
+    """
+    container = _open(profile, config_dir)
+
+    async def run() -> None:
+        await container.start_database()
+        contact = await container.change_contact_status().execute(
+            contact_id,
+            transition,
+            account_id=AccountId(account_id) if account_id is not None else None,
+        )
+        typer.echo(f"Contact {contact.id} ({contact.display_name}) is now {contact.status}.")
+
+    _run_async(container, run())
 
 
 def _open(profile: str | None, config_dir: Path | None) -> Container:

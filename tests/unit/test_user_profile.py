@@ -361,8 +361,15 @@ class TestUserProfilesMigration:
 
         assert USER_PROFILES_TABLE in await _tables(database)
 
-    async def test_head_is_the_profiles_revision(self, database: SqliteDatabase) -> None:
-        assert AlembicMigrationRunner(database).head_revision() == "0003"
+    async def test_upgrading_reaches_the_profiles_revision(self, database: SqliteDatabase) -> None:
+        # Not pinned to head: head moves with every new migration, and asserting
+        # it here would fail the next milestone for no reason.
+        await AlembicMigrationRunner(database).upgrade()
+        applied = await AlembicMigrationRunner(database).current_revision()
+
+        assert USER_PROFILES_TABLE in await _tables(database)
+        assert applied is not None
+        assert applied >= "0003"
 
     async def test_round_trips_up_down_up(self, database: SqliteDatabase) -> None:
         runner = AlembicMigrationRunner(database)
