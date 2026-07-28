@@ -221,12 +221,26 @@ follows: foreign key, cascade, and scoping that cannot be bypassed.
 | Surrogate key, `display_name`, `timezone`, `available_hours`, thresholds | **Omitted** -- ADR-038 |
 | No Contact, Conversation, Message, Goal, Memory or Telegram | Confirmed |
 
-**Uncovered during implementation.** The CLI never configures logging, so
-structlog falls back to its default `PrintLogger` and every record -- at every
-level, unredacted -- is written to standard output alongside command output.
-Recorded as **ADR-040 (Proposed)** with the fix deliberately not applied, since
-it changes behaviour outside this milestone. It should be settled before
-Milestone 2, when records begin carrying message content.
+**Uncovered during implementation.** The CLI never configured logging, so
+structlog fell back to its default `PrintLogger` and every record -- at every
+level, unredacted -- was written to standard output alongside command output.
+Recorded as ADR-040 and left unapplied here, since it changed behaviour outside
+this milestone.
+
+---
+
+### Maintenance -- ADR-040, CLI logging configuration (complete, 2026-07-28)
+
+| Deliverable | Status |
+|---|---|
+| `_open` configures logging like every other entry point | Done |
+| One initialisation path, no CLI-specific logging behaviour | Done |
+| Level, console, file and format settings honoured on the CLI | Done |
+| Redaction installed on the CLI path | Done |
+| Standard output byte-identical across repeated runs | Done |
+| Third-party component levels shipped in `config/default.yaml` | Done |
+| Regression and startup tests | Done -- 12 tests, suite at 749 |
+| ADR-040 marked **Accepted** | Done |
 
 ---
 

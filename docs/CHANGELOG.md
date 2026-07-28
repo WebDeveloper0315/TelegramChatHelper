@@ -34,6 +34,65 @@ Not every release requires every category.
 
 # [Unreleased]
 
+## Fixed
+
+### Maintenance -- CLI logging configuration (ADR-040, now Accepted)
+
+**The CLI never configured logging, so every log record was printed to standard
+output, unfiltered and unredacted.** `_open` called `Container.create` with
+`configure_logging_on_start=False` to keep command output clean. Suppressing the
+call did not silence logging: structlog falls back to its default `PrintLogger`,
+which writes to standard output at every level. The comment described the
+opposite of what the code did.
+
+Two consequences, one cosmetic and one not:
+
+- Records appeared in the middle of command output, so no command's output was
+  deterministic.
+- The whole `logging` configuration section was ignored on this path --
+  including `mask_secret_values`. Records emitted by a CLI command had never
+  passed through redaction. Nothing secret was being logged yet, which is why
+  this is a fix rather than an incident, but Milestone 2 introduces records that
+  carry Telegram identifiers and message metadata.
+
+**The fix is one line**: `_open` no longer suppresses the call. The CLI now uses
+the same logging configuration as every other entry point, with no CLI-specific
+default and no second initialisation path -- `configure_logging` remains the
+only place logging is set up, and it already resets handlers, so repeated
+invocation in one process cannot accumulate them.
+
+The console handler writes to **standard error**, so configured output never
+reaches standard output. This is why the proposal's suggestion of a CLI-specific
+"console off by default" was dropped: it would have bought nothing, while giving
+`console_enabled` a second answer and ignoring the user's setting -- the same
+class of defect the ADR exists to remove.
+
+**Configuration**
+
+- `config/default.yaml` now ships `component_levels` for `asyncio`, `alembic`
+  and `sqlalchemy.engine` at `WARNING`. Routing every record through one chain
+  is deliberate, since redaction must cover more than our own call sites, but at
+  `DEBUG` it also meant the event loop announcing its selector. The
+  application's own records are untouched, and a developer who wants the detail
+  raises the level.
+
+**Tests**
+
+- Twelve tests in `TestCliLoggingStartup`: structlog is configured by a command;
+  records do not reach standard output; standard output is byte-identical across
+  runs; records do reach standard error; the configured level is honoured; debug
+  appears only when configured; `console_enabled: false` silences it; redaction
+  is installed on this path; the file sink receives command records; repeated
+  invocation duplicates neither handlers nor records; third-party libraries stay
+  quiet.
+- `restore_logging` now also calls `structlog.reset_defaults()`. structlog's
+  configuration is process-wide, so a test invoking a command would otherwise
+  leave every later test running against whatever that command installed. This
+  immediately exposed an order-dependent test that had been asserting on
+  configuration leaked from an earlier one; it now configures logging itself.
+- The Milestone 1.2 test that compared only the profile fields a command printed
+  compares whole output again, the workaround for this defect being gone.
+
 ## Added
 
 ### Milestone 1.2 -- UserProfile Vertical Slice
@@ -81,13 +140,13 @@ work while the aggregate is small enough to get them right.
 
 ## Fixed
 
-- Nothing in this milestone's code. One pre-existing defect was found and is **not** fixed here -- see ADR-040 below.
+- Nothing in this milestone's code. One pre-existing defect was found here and fixed in the maintenance entry above -- see ADR-040.
 
 ## Architecture Decisions
 
 - **ADR-038 -- UserProfile Identity Is the Account** (Proposed). Drops the surrogate key, and defers `display_name`, `timezone`, `available_hours`, `auto_approve_memory_categories` and `confidence_thresholds` -- the first two because Account already owns them, the rest because the vocabulary each draws on does not exist yet and a column that accepts anything is worse than an absent one.
 - **ADR-039 -- Account Scope Is a Constructor Parameter** (Proposed). Establishes scoped repositories for every account-owned aggregate to come.
-- **ADR-040 -- The CLI Does Not Configure Logging** (Proposed). Found by comparing the output of two identical `profile show` runs. `_open` suppresses `configure_logging` to keep command output clean; the effect is the opposite, because unconfigured structlog defaults to a `PrintLogger` on standard output with no level filtering. The whole `logging` configuration section -- including secret redaction -- is therefore ignored for every CLI command. The fix is proposed and deliberately not applied, as it changes behaviour outside this milestone; it matters most before Milestone 2, when records begin carrying message content.
+- **ADR-040 -- The CLI Does Not Configure Logging** (**Accepted**; found here, fixed in the maintenance entry above). Found by comparing the output of two identical `profile show` runs. `_open` suppressed `configure_logging` to keep command output clean; the effect was the opposite, because unconfigured structlog defaults to a `PrintLogger` on standard output with no level filtering. The whole `logging` configuration section -- including secret redaction -- was therefore ignored for every CLI command. Left unapplied in this milestone as it changed behaviour outside its scope.
 
 ## Scope note
 

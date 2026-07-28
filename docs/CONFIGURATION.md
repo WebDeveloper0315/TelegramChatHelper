@@ -298,7 +298,18 @@ Deterministic timing engine bounds (`AI_MODELS.md` §3).
 | `logging.backup_count` | int | `5` | Rotated files kept |
 | `logging.console_enabled` | bool | `true` | Human-readable output to stderr |
 | `logging.file_enabled` | bool | `true` | Rotating file output |
-| `logging.component_levels` | map | `{}` | Per-logger overrides |
+| `logging.component_levels` | map | see below | Per-logger overrides |
+
+`component_levels` ships with `asyncio`, `alembic` and `sqlalchemy.engine` set
+to `WARNING`. Every record from every source passes through one processor chain,
+which is what makes redaction complete (`SECURITY.md` §9) -- but at `DEBUG` that
+also means the event loop announcing its own selector. These entries quieten the
+libraries without touching the application's own records; raise any of them when
+you need the detail.
+
+Every entry point applies this configuration, the CLI included (ADR-040). The
+console sink writes to standard error, so command output on standard output is
+unaffected by the level you choose.
 
 ## 6.11 `security`
 

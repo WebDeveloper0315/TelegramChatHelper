@@ -69,10 +69,19 @@ logging:
   # rejected outright in the production profile. See docs/SECURITY.md section 9.
   diagnostic_mode: false
 
-  # Per-logger level overrides, for example:
+  # Per-logger level overrides. Add your own, for example:
   #   component_levels:
   #     tgassist.infrastructure.telegram: DEBUG
-  component_levels: {}
+  #
+  # The entries below quieten third-party libraries that log their internals at
+  # DEBUG or INFO. Records from every source pass through the same processor
+  # chain (including redaction), which is deliberate -- but at level DEBUG that
+  # also means the event loop announcing its own selector. These are the
+  # application's own diagnostics, not the library's.
+  component_levels:
+    asyncio: WARNING
+    alembic: WARNING
+    sqlalchemy.engine: WARNING
 
 security:
   # Apply owner-only permissions to directories the application creates.

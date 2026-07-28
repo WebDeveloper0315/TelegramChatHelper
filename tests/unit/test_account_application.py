@@ -254,8 +254,17 @@ class TestSetActiveAccount:
 
 
 @pytest.fixture
-def cli_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Point the CLI at an isolated data directory."""
+def cli_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    restore_logging: None,  # noqa: ARG001 - a command configures logging process-wide
+) -> Path:
+    """Point the CLI at an isolated data directory with logging silenced.
+
+    Commands configure logging on startup (ADR-040), so the fixture both turns
+    the sinks off -- these tests assert on command output, not on records -- and
+    depends on ``restore_logging`` so the configuration does not outlive them.
+    """
     data_dir = tmp_path / "data"
     monkeypatch.setenv("TGASSIST_APP__DATA_DIR", str(data_dir))
     monkeypatch.setenv("TGASSIST_LOGGING__CONSOLE_ENABLED", "false")

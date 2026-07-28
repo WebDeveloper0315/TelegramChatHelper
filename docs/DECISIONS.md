@@ -39,7 +39,9 @@ Each decision must have one of the following statuses:
 - Rejected
 
 **ADR-001 through ADR-010 are Accepted.**
-**ADR-011 through ADR-040 are Proposed and require explicit approval.** ADR-011 through ADR-030 were approved for implementation at the close of the architecture stabilization session; ADR-031 through ADR-040 arose during implementation and await review. ADR-040 records a defect whose fix has deliberately not been applied.
+**ADR-011 through ADR-039 are Proposed and require explicit approval.** ADR-011 through ADR-030 were approved for implementation at the close of the architecture stabilization session; ADR-031 through ADR-039 arose during implementation and await review.
+
+**ADR-040 is Accepted and implemented.**
 
 ---
 
@@ -86,7 +88,7 @@ Each decision must have one of the following statuses:
 | 037 | Account Lifecycle Separated from Session Lifecycle | Proposed |
 | 038 | UserProfile Identity Is the Account | Proposed |
 | 039 | Account Scope Is a Constructor Parameter, Not a Method Argument | Proposed |
-| 040 | The CLI Does Not Configure Logging, So Log Records Reach Standard Output | Proposed |
+| 040 | The CLI Does Not Configure Logging, So Log Records Reach Standard Output | **Accepted** |
 
 ---
 
@@ -2766,11 +2768,11 @@ The CLI Does Not Configure Logging, So Log Records Reach Standard Output
 
 Status
 
-Proposed
+Accepted
 
 Date
 
-2026-07-28
+2026-07-28 (proposed), 2026-07-28 (accepted and implemented)
 
 ---
 
@@ -2810,17 +2812,21 @@ The defect predates this milestone; it was invisible until a command emitted a r
 
 ### Decision
 
-Proposed, and **not implemented** in Milestone 1.2, because it changes behaviour outside this milestone scope.
+**`_open` configures logging** using the loaded configuration - that is, it calls `Container.create` without suppressing it. The original goal (clean command output) is reached by configuration rather than by omission, and the configuration a user writes is honoured.
 
-**`_open` should configure logging** using the loaded configuration - that is, call `Container.create` without suppressing it - and the CLI should default to console logging **off** rather than to no configuration at all. The original goal (clean command output) is then reached by configuration rather than by omission, and the configuration a user writes is honoured.
+**The CLI applies no logging behaviour of its own.** It uses the same configuration as every other entry point, with no CLI-specific default and no second initialisation path. `configure_logging` remains the single place logging is set up.
 
-Concretely:
+This is a correction to the proposal, which suggested the CLI should default console logging **off**. That was written before checking where the console handler writes: it is constructed with `stream=sys.stderr`, so configured output never touches standard output in the first place. A CLI-specific default would therefore have bought nothing except a second answer to "what is the log level", and a user who set `console_enabled: true` would have found it ignored - the same class of defect this ADR exists to remove.
 
-1. Remove `configure_logging_on_start=False` from `_open`.
-2. Have the CLI presentation layer apply an output-preserving default: console logging disabled unless the user enables it, so diagnostics are opt-in.
-3. Keep records flowing to the file handler when the user has enabled it, so operations remain diagnosable.
+What remained was noise from *third-party* libraries. Routing every record through one processor chain is deliberate (redaction must cover more than our own call sites), but at `DEBUG` it also means the event loop announcing its selector and Alembic narrating its migration context. `config/default.yaml` therefore ships `component_levels` for `asyncio`, `alembic` and `sqlalchemy.engine` at `WARNING`. This is configuration, not code: a developer who wants the detail raises it, and the application's own records are untouched.
 
-Until this is approved, `tests/unit/test_user_profile_application.py` compares the profile fields a command prints rather than its whole output stream, with a comment pointing here. No test asserts the current behaviour is correct.
+Concretely, as implemented:
+
+1. `configure_logging_on_start=False` removed from `_open`. The parameter remains on `Container.create` for tests that must not mutate process-wide logging state.
+2. Third-party component levels added to the shipped configuration.
+3. `tests/conftest.py`'s `restore_logging` fixture also calls `structlog.reset_defaults()`, because structlog's configuration is process-wide too and a test invoking a command would otherwise leave every later test running against whatever that command installed.
+
+Behaviour after the change: standard output carries only what the command printed; log records go to the sinks the configuration names; `level`, `console_enabled`, `file_enabled`, `format` and `component_levels` all take effect; and records on this path pass through `mask_secret_values` like every other.
 
 ---
 
@@ -2836,29 +2842,29 @@ Until this is approved, `tests/unit/test_user_profile_application.py` compares t
 
 ### Consequences
 
-If accepted
+Pros
 
 - Configuration is honoured on every path, including redaction
-- Command output contains only what the command printed
-- Users can turn diagnostics on deliberately
+- Standard output contains only what the command printed, and is byte-identical across repeated runs
+- One initialisation path, so there is no second answer to what the log level is
+- Diagnostics remain available on standard error, where diagnostics belong
 
-If deferred
+Cons
 
-- Log records, including any containing message content once Milestone 2 begins, are printed unredacted to standard output by every CLI command
-
-The second is why this is worth deciding before Telegram integration, rather than after.
+- The development profile logs at `DEBUG`, so a developer running a command sees several records on standard error. That is the configuration doing what it says; `TGASSIST_LOGGING__LEVEL` or the profile file changes it.
+- Every command now creates the log directory and opens the file sink, where previously the CLI wrote no log file at all. That is the intended behaviour, but it is a behaviour change for anyone who relied on the CLI being silent on disk.
 
 ---
 
 ### Future Considerations
 
-A `--verbose` flag mapping to a console log level is the natural way to expose this once the configuration is applied.
+A `--verbose/-v` flag mapping to a console log level would make the level adjustable without an environment variable. It needs a Typer callback, which changes the command surface, so it is left for whenever the CLI grows global options for another reason.
 
 ---
 
 ### Related Decisions
 
-ADR-018 (logging and observability), ADR-024 (secret handling), ADR-011 (dependency direction). Affects `presentation/cli/app.py` only.
+ADR-018 (logging and observability), ADR-024 (secret handling), ADR-011 (dependency direction). Implemented in `presentation/cli/app.py` and `config/default.yaml`; no change to `infrastructure/logging`.
 
 ---
 

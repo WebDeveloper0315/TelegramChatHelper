@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 import structlog
+from typer.testing import CliRunner, Result
 
 from tgassist.domain.services.sensitivity import (
     REDACTED,
@@ -30,6 +31,7 @@ from tgassist.infrastructure.logging import (
     get_logger,
     purge_expired_logs,
 )
+from tgassist.presentation.cli.app import app
 
 # A deliberately realistic fake, so the value-shape detector is exercised.
 SECRET = "sk-ant-abcdefghijklmnopqrstuvwxyz012345"  # noqa: S105
@@ -289,8 +291,198 @@ class TestRetention:
         assert purge_expired_logs(tmp_path / "absent", retention_days=14) == 0
 
 
+@pytest.mark.usefixtures("restore_logging")
 class TestLoggerFactory:
-    def test_get_logger_returns_a_bound_logger(self) -> None:
+    def test_get_logger_returns_a_bound_logger(self, config: AppConfig) -> None:
+        # Configured explicitly: the wrapper class is part of our configuration,
+        # so without it this asserts structlog's default rather than ours.
+        configure_logging(config)
+
         logger = get_logger("x")
 
         assert isinstance(logger.bind(a=1), structlog.stdlib.BoundLogger)
+
+
+@pytest.mark.usefixtures("restore_logging")
+class TestCliLoggingStartup:
+    """Every CLI command configures logging before application code runs.
+
+    The regression these guard against is subtle: an unconfigured structlog does
+    not stay silent, it falls back to a ``PrintLogger`` on standard output with
+    no level filtering and no redaction (ADR-040). "No configuration" therefore
+    meant "every record, unredacted, in the middle of the command output".
+    """
+
+    @staticmethod
+    def _env(monkeypatch: pytest.MonkeyPatch, data_dir: Path, **logging_env: str) -> None:
+        monkeypatch.setenv("TGASSIST_APP__DATA_DIR", str(data_dir))
+        monkeypatch.setenv("TGASSIST_LOGGING__FILE_ENABLED", "false")
+        for key, value in logging_env.items():
+            monkeypatch.setenv(f"TGASSIST_LOGGING__{key.upper()}", value)
+
+    @staticmethod
+    def _run(*args: str) -> Result:
+        result = CliRunner().invoke(app, list(args))
+        assert result.exit_code == 0, result.output
+        return result
+
+    def test_structlog_is_configured_by_a_command(
+        self, monkeypatch: pytest.MonkeyPatch, data_dir: Path
+    ) -> None:
+        self._env(monkeypatch, data_dir)
+        assert not structlog.is_configured()
+
+        self._run("config", "show")
+
+        assert structlog.is_configured()
+
+    def test_records_do_not_reach_standard_output(
+        self, monkeypatch: pytest.MonkeyPatch, data_dir: Path
+    ) -> None:
+        # The original defect, at its most visible: a debug record printed
+        # between the command output and its heading.
+        self._env(monkeypatch, data_dir, level="DEBUG")
+        self._run("account", "create", "100", "Primary")
+
+        result = self._run("profile", "show")
+
+        assert "transaction_committed" not in result.stdout
+        assert "[debug" not in result.stdout
+        assert result.stdout.startswith("account")
+
+    def test_standard_output_is_deterministic_across_runs(
+        self, monkeypatch: pytest.MonkeyPatch, data_dir: Path
+    ) -> None:
+        # First and later runs differ in what they log -- migrations, profile
+        # creation -- so identical stdout is a real assertion, not a tautology.
+        self._env(monkeypatch, data_dir, level="DEBUG")
+        self._run("account", "create", "100", "Primary")
+
+        first = self._run("profile", "show")
+        second = self._run("profile", "show")
+
+        assert first.stdout == second.stdout
+
+    def test_records_reach_standard_error(
+        self, monkeypatch: pytest.MonkeyPatch, data_dir: Path
+    ) -> None:
+        # Diagnostics are not discarded, only moved to where diagnostics belong.
+        self._env(monkeypatch, data_dir, level="INFO")
+
+        result = self._run("config", "show")
+
+        assert "application_configured" in result.stderr
+
+    def test_configured_level_is_honoured(
+        self, monkeypatch: pytest.MonkeyPatch, data_dir: Path
+    ) -> None:
+        self._env(monkeypatch, data_dir, level="WARNING")
+
+        result = self._run("config", "show")
+
+        assert result.stderr == ""
+
+    def test_debug_records_appear_only_when_configured(
+        self, monkeypatch: pytest.MonkeyPatch, data_dir: Path
+    ) -> None:
+        self._env(monkeypatch, data_dir, level="INFO")
+        quiet = self._run("account", "create", "100", "Primary")
+
+        self._env(monkeypatch, data_dir, level="DEBUG")
+        verbose = self._run("profile", "show")
+
+        assert "transaction_committed" not in quiet.stderr
+        assert "transaction_committed" in verbose.stderr
+
+    def test_disabling_the_console_silences_standard_error(
+        self, monkeypatch: pytest.MonkeyPatch, data_dir: Path
+    ) -> None:
+        # Previously this setting had no effect on the CLI at all, because no
+        # configuration was applied for it to have an effect on.
+        self._env(monkeypatch, data_dir, level="DEBUG", console_enabled="false")
+
+        result = self._run("config", "show")
+
+        assert result.stderr == ""
+        assert "profile:" in result.stdout
+
+    def test_redaction_is_installed_by_the_command(
+        self, monkeypatch: pytest.MonkeyPatch, data_dir: Path
+    ) -> None:
+        # The security-relevant half of the defect: records emitted on this path
+        # had never passed through the redaction processor.
+        monkeypatch.setenv("TGASSIST_APP__DATA_DIR", str(data_dir))
+        monkeypatch.setenv("TGASSIST_LOGGING__LEVEL", "INFO")
+        monkeypatch.setenv("TGASSIST_LOGGING__FORMAT", "json")
+        self._run("config", "show")
+
+        get_logger("test").info("provider_configured", api_key=SECRET, message_text="private")
+        logging.shutdown()
+
+        contents = (data_dir / "logs" / LOG_FILE_NAME).read_text(encoding="utf-8")
+        assert SECRET not in contents
+        assert "private" not in contents
+        assert REDACTED in contents
+
+    def test_the_file_sink_receives_command_records(
+        self, monkeypatch: pytest.MonkeyPatch, data_dir: Path
+    ) -> None:
+        monkeypatch.setenv("TGASSIST_APP__DATA_DIR", str(data_dir))
+        monkeypatch.setenv("TGASSIST_LOGGING__LEVEL", "INFO")
+        monkeypatch.setenv("TGASSIST_LOGGING__FORMAT", "json")
+
+        self._run("config", "show")
+        logging.shutdown()
+
+        contents = (data_dir / "logs" / LOG_FILE_NAME).read_text(encoding="utf-8")
+        assert "application_configured" in contents
+
+    def test_repeated_invocation_does_not_accumulate_handlers(
+        self, monkeypatch: pytest.MonkeyPatch, data_dir: Path
+    ) -> None:
+        # One process, several commands: the test runner does this, and so does
+        # anything embedding the CLI.
+        self._env(monkeypatch, data_dir, level="INFO")
+
+        self._run("config", "show")
+        after_one = list(logging.getLogger().handlers)
+        self._run("config", "show")
+        self._run("config", "show")
+
+        assert len(logging.getLogger().handlers) == len(after_one)
+
+    def test_repeated_invocation_does_not_duplicate_records(
+        self, monkeypatch: pytest.MonkeyPatch, data_dir: Path
+    ) -> None:
+        # Handler counts can stay level while a processor chain doubles, so the
+        # observable outcome is asserted too.
+        monkeypatch.setenv("TGASSIST_APP__DATA_DIR", str(data_dir))
+        monkeypatch.setenv("TGASSIST_LOGGING__LEVEL", "INFO")
+        monkeypatch.setenv("TGASSIST_LOGGING__FORMAT", "json")
+
+        self._run("config", "show")
+        self._run("config", "show")
+
+        get_logger("test").info("once")
+        logging.shutdown()
+
+        contents = (data_dir / "logs" / LOG_FILE_NAME).read_text(encoding="utf-8")
+        assert len([line for line in contents.splitlines() if "once" in line]) == 1
+
+    def test_third_party_libraries_do_not_dominate_the_output(
+        self, monkeypatch: pytest.MonkeyPatch, repo_config_dir: Path, data_dir: Path
+    ) -> None:
+        # Routing every record through one chain is deliberate, but at DEBUG it
+        # also means the event loop announcing its own selector. The shipped
+        # component levels quieten the libraries without touching our own.
+        monkeypatch.setenv("TGASSIST_APP__DATA_DIR", str(data_dir))
+        monkeypatch.setenv("TGASSIST_LOGGING__FILE_ENABLED", "false")
+        monkeypatch.setenv("TGASSIST_LOGGING__LEVEL", "DEBUG")
+        monkeypatch.setenv("TGASSIST_CONFIG_DIR", str(repo_config_dir))
+
+        result = CliRunner().invoke(app, ["account", "create", "100", "Primary"])
+
+        assert result.exit_code == 0, result.output
+        assert "IocpProactor" not in result.stderr
+        assert "alembic.runtime.migration" not in result.stderr
+        assert "migration_applied" in result.stderr

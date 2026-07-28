@@ -598,16 +598,16 @@ def _parse_quiet_hours(value: str | None) -> TimeRange | None:
 def _open(profile: str | None, config_dir: Path | None) -> Container:
     """Build a container, reporting configuration failures as a clean CLI error.
 
-    Logging is deliberately not configured here: these commands report on the
-    application rather than run it, and reconfiguring global logging would
-    interleave log records with their output.
+    Logging is configured here, like everywhere else. An earlier version skipped
+    it to keep command output clean, which had the opposite effect: unconfigured,
+    structlog falls back to a ``PrintLogger`` on standard output with no level
+    filtering and no redaction, so every record landed in the middle of the
+    command's own output (ADR-040). Configured, records go to the sinks the
+    user asked for -- the console handler writes to standard error -- and
+    standard output carries only what the command printed.
     """
     try:
-        return Container.create(
-            profile=profile,
-            config_dir=config_dir,
-            configure_logging_on_start=False,
-        )
+        return Container.create(profile=profile, config_dir=config_dir)
     except ConfigurationError as exc:
         typer.echo(f"Configuration error: {exc.user_message}", err=True)
         typer.echo(f"  {exc.code}: {exc.message}", err=True)

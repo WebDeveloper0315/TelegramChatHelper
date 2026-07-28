@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import structlog
 
 from tgassist.application.container import Container
 from tgassist.infrastructure.config import AppConfig, LoadedConfig, Profile, load_config
@@ -88,7 +89,13 @@ def load_from(write_config: Any) -> Any:
 
 @pytest.fixture
 def restore_logging() -> Iterator[None]:
-    """Restore the root logger after a test that reconfigures logging."""
+    """Restore logging state after a test that reconfigures it.
+
+    Both halves matter. The root logger is process-wide, and so is structlog's
+    configuration: since the CLI now configures logging on startup (ADR-040),
+    a test invoking a command would otherwise leave every later test running
+    against whatever that command installed.
+    """
     root = logging.getLogger()
     original_handlers = list(root.handlers)
     original_level = root.level
@@ -101,3 +108,4 @@ def restore_logging() -> Iterator[None]:
         for handler in original_handlers:
             root.addHandler(handler)
         root.setLevel(original_level)
+        structlog.reset_defaults()

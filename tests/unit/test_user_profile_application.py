@@ -302,14 +302,18 @@ class TestUpdateUserProfile:
             await harness.update().execute(ProfileChanges(), AccountId(999))
 
 
-def _profile_lines(output: str) -> list[str]:
-    """Return the profile fields the command printed, ignoring log records."""
-    return [line for line in output.splitlines() if " : " in line]
-
-
 @pytest.fixture
-def cli_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Point the CLI at an isolated data directory."""
+def cli_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    restore_logging: None,  # noqa: ARG001 - a command configures logging process-wide
+) -> Path:
+    """Point the CLI at an isolated data directory with logging silenced.
+
+    Commands configure logging on startup (ADR-040), so the fixture both turns
+    the sinks off -- these tests assert on command output, not on records -- and
+    depends on ``restore_logging`` so the configuration does not outlive them.
+    """
     data_dir = tmp_path / "data"
     monkeypatch.setenv("TGASSIST_APP__DATA_DIR", str(data_dir))
     monkeypatch.setenv("TGASSIST_LOGGING__CONSOLE_ENABLED", "false")
@@ -342,10 +346,7 @@ class TestProfileCli:
         second = runner.invoke(app, ["profile", "show"])
 
         assert second.exit_code == 0
-        # Only the command's own output is compared. Log records currently
-        # reach stdout as well, which is a defect in the CLI wiring rather than
-        # in this command -- see ADR-040.
-        assert _profile_lines(second.stdout) == _profile_lines(first.stdout)
+        assert second.stdout == first.stdout
 
     def test_set_changes_a_preference(self) -> None:
         result = runner.invoke(app, ["profile", "set", "--tone", "formal"])
