@@ -13,55 +13,20 @@ actually makes, each of which can then be indexed and tested.
 
 from __future__ import annotations
 
-import base64
-import json
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from sqlalchemy import Executable, Row
+from sqlalchemy import Executable, Row, Select
 from sqlalchemy.engine import CursorResult
 
 from tgassist.domain.errors import ConstraintViolationError, RecordNotFoundError
-from tgassist.domain.model.page import Page, clamp_page_size
+from tgassist.domain.model.page import Page
+from tgassist.domain.model.query import PageRequest
+from tgassist.infrastructure.persistence.pagination import KeysetPaginator
 from tgassist.infrastructure.persistence.unit_of_work import (
     SqlAlchemyUnitOfWork,
     translate_database_error,
 )
-
-
-class Cursor:
-    """Encodes and decodes opaque pagination cursors.
-
-    Base64-wrapped JSON. The encoding is not a security measure -- a caller can
-    trivially decode it -- but it does discourage constructing cursors by hand,
-    which matters because a cursor's shape is coupled to the ``ORDER BY`` of the
-    query that issued it and has no meaning anywhere else.
-    """
-
-    __slots__ = ()
-
-    @staticmethod
-    def encode(values: dict[str, Any]) -> str:
-        """Encode cursor values into an opaque token."""
-        payload = json.dumps(values, sort_keys=True, separators=(",", ":"), default=str)
-        return base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
-
-    @staticmethod
-    def decode(token: str | None) -> dict[str, Any] | None:
-        """Decode a cursor token, or return ``None`` if absent or malformed.
-
-        A malformed cursor is treated as absent rather than as an error. It
-        almost always means a stale bookmark or a hand-edited URL, and starting
-        from the beginning is a better answer than a stack trace.
-        """
-        if not token:
-            return None
-        try:
-            padded = token + "=" * (-len(token) % 4)
-            decoded = json.loads(base64.urlsafe_b64decode(padded.encode()).decode())
-        except (ValueError, TypeError):
-            return None
-        return decoded if isinstance(decoded, dict) else None
 
 
 class Repository[T]:
@@ -142,40 +107,25 @@ class Repository[T]:
 
     # -- Pagination -------------------------------------------------------
 
-    async def fetch_page(
+    async def fetch_page[R](
         self,
-        statement_factory: Callable[[int], Executable],
+        statement: Select[Any],
         *,
-        mapper: Callable[[Row[Any]], T],
-        cursor_builder: Callable[[Row[Any]], dict[str, Any]],
-        limit: int | None = None,
+        paginator: KeysetPaginator,
+        request: PageRequest,
+        mapper: Callable[[Row[Any]], R],
         operation: str = "page",
-    ) -> Page[T]:
+    ) -> Page[R]:
         """Fetch one keyset page.
 
-        Fetches one row more than requested to determine whether a further page
-        exists. The alternative -- a second ``COUNT(*)`` query -- doubles the
-        work to answer a question the extra row already answers.
-
-        Args:
-            statement_factory: Builds the statement given a row limit. Receives
-                ``limit + 1``.
-            mapper: Converts a row into a domain object.
-            cursor_builder: Extracts the continuation values from the last row
-                of the page. Must match the statement's ordering columns, or
-                the next page will skip or repeat rows.
-            limit: Requested page size, clamped to a sane range.
-            operation: Label used in error context.
+        The paginator owns the ordering, the position predicate and the
+        lookahead row, so a repository supplies only its base query and the row
+        mapper. Centralising it is what keeps the tiebreaker requirement -- the
+        thing that stops rows being silently skipped -- from being each
+        repository's problem to remember.
         """
-        size = clamp_page_size(limit)
-        rows = await self.fetch_all(statement_factory(size + 1), operation=operation)
-
-        has_more = len(rows) > size
-        page_rows = rows[:size]
-        next_cursor = (
-            Cursor.encode(cursor_builder(page_rows[-1])) if has_more and page_rows else None
-        )
-        return Page(items=[mapper(row) for row in page_rows], next_cursor=next_cursor)
+        rows = await self.fetch_all(paginator.apply(statement, request), operation=operation)
+        return paginator.build_page(rows, request, mapper)
 
     # -- Write helpers ----------------------------------------------------
 

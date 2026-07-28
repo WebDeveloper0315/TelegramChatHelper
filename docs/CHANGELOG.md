@@ -36,6 +36,46 @@ Not every release requires every category.
 
 ## Added
 
+### Milestone 1.0 -- Repository Contracts
+
+**Domain**
+
+- `SortDirection`, `SortOrder`, `PageRequest`, `TimeWindow` -- query intent expressed as domain value objects. `SortOrder.field` is a domain field name, never a column, so a schema rename cannot reach the application layer.
+- `RepositoryFactory` -- a callable taking a unit of work. Use cases declare the repositories they need as constructor parameters, which keeps their real dependencies visible in their signature.
+- `domain/ports/repository.py` -- the repository contract, stated as obligations rather than as a base class, with the reasoning for that choice.
+
+**Infrastructure**
+
+- `KeysetPaginator` -- ordering, cursor position and lookahead in one place. **Requires a unique tiebreaker column**, because ordering by a non-unique column alone silently skips rows.
+- `Cursor` extracted to its own module, with lossless datetime encoding.
+- `EntityMapper` -- the mapping framework, with the four properties a mapper must satisfy stated as a contract and verified by test.
+- `Repository.fetch_page` rewritten to take a `PageRequest` and a paginator, so the tiebreaker requirement is the framework's responsibility rather than each repository's to remember.
+
+**Testing**
+
+- `tests/support/repository_contract.py` -- a reusable contract suite every future repository inherits. Covers identity, round-trip equality, snapshot semantics, pagination completeness and stability, malformed cursors, sort inversion, transaction participation, and optional soft-delete and count capabilities.
+- `tests/support/sample_aggregate.py` -- a toy aggregate that exists only to exercise the framework, with a deliberately non-unique sort column so the tiebreaker is tested where it actually matters. Test scaffolding: its table is created by a fixture and never reaches a user's database.
+- Two independent implementations -- SQLAlchemy and in-memory -- run the identical suite, plus a further suite asserting they agree with each other.
+- 443 tests passing.
+
+**Composition root**
+
+- `Container.repository(factory, uow)` for wiring. No business registrations.
+
+## Fixed
+
+- **Cursors silently skipped rows.** Encoding stringified a `datetime` through a generic `str()` fallback; decoding produced text, and binding text against a `DateTime` column compared the wrong things -- returning wrong rows without any error. Datetimes now encode as ISO-8601 and decode back to the column's own Python type. Found by the contract suite on its first run against both implementations, which is precisely the failure that suite exists to catch.
+
+## Changed
+
+- `API.md` §7: recorded that there is no generic repository interface and why; documented `SortOrder`, `PageRequest`, the mandatory pagination tiebreaker, and repository construction via factories.
+- `DATABASE.md` §14: added the mapping contract, identity and loading policy, and the absence of optimistic locking.
+
+## Architecture Decisions
+
+- **ADR-035 -- No Generic Repository Base** (Proposed). A generic CRUD interface is wrong for four of the five aggregates examined and would break the guarantee that an audit trail cannot be rewritten. `ReadRepository`/`WriteRepository`, `Specification` and a factory registry are omitted for stated reasons rather than by oversight.
+- **ADR-036 -- No Optimistic Locking** (Proposed). The database-level lost update is structurally impossible under serialized transactions. The remaining think-time race is narrow and better served by memory revisions, which merge rather than reject. Records the three conditions that would require revisiting.
+
 ### Milestone 0.2 -- Persistence Foundation
 
 **Ports (domain layer)**

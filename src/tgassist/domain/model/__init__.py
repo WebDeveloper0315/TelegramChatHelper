@@ -1,16 +1,28 @@
 """Domain entities and value objects.
 
 Plain dataclasses and enums with no persistence, transport or framework
-concerns. Entities arrive with Milestone 1; see ``docs/DOMAIN_MODEL.md``.
+concerns. Business entities arrive with the aggregate milestones; see
+``docs/DOMAIN_MODEL.md``.
 """
 
-from tgassist.domain.model.page import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, Page, clamp_page_size
+from tgassist.domain.model.page import Page
+from tgassist.domain.model.query import (
+    DEFAULT_PAGE_SIZE,
+    MAX_PAGE_SIZE,
+    PageRequest,
+    SortDirection,
+    SortOrder,
+    TimeWindow,
+)
 from tgassist.domain.model.secret import SecretValue
 
 __all__ = [
     "DEFAULT_PAGE_SIZE",
     "MAX_PAGE_SIZE",
     "Page",
+    "PageRequest",
     "SecretValue",
-    "clamp_page_size",
+    "SortDirection",
+    "SortOrder",
+    "TimeWindow",
 ]

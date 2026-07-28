@@ -920,6 +920,46 @@ Repositories: `AccountRepository`, `UserProfileRepository`, `SessionRepository`,
 
 Full signatures are specified in `API.md` §7–§9.
 
+**No generic repository base** (ADR-035). Each repository declares only the
+operations its aggregate supports; the shared obligations are a contract
+enforced by a test suite every implementation runs, and the shared *mechanics*
+(execution, pagination, mapping, error normalisation) come from an
+infrastructure base class used for code reuse rather than polymorphism.
+
+**No optimistic locking and no version columns** (ADR-036). Transactions
+serialize on one connection (ADR-034), so the database-level lost update cannot
+occur. The remaining race spans user think-time and is handled, where it
+matters, by memory revisions -- which merge rather than reject.
+
+## Mapping
+
+Mapping is hand-written and explicit. Each mapper implements `to_domain` and
+`to_params` and must satisfy four properties, verified by test:
+
+1. **Round-trip fidelity** — `to_domain(to_params(entity)) == entity`. This is
+   what catches a column added by a migration and forgotten in the mapper,
+   which otherwise looks like a field silently reverting to its default.
+2. **Purity** — no clock, no query, no mutation, so the round trip is testable.
+3. **Total conversion** — every column the mapper claims is converted.
+4. **Identity preservation** — the identifier survives unchanged.
+
+Mappers contain **no version branching**. A mapper reads what the current schema
+provides; when a migration adds a column it supplies a default for existing
+rows, so old rows read correctly without the mapper knowing which migration
+wrote them. A mapper that needs to branch on schema version is the signal that
+the migration should have backfilled instead.
+
+## Identity and loading
+
+There is **no identity map**. Reading the same row twice produces two equal
+objects, not the same object, so entities are compared by identifier and a
+caller holding a stale copy holds a snapshot rather than a live view.
+
+**Everything is eager.** There are no lazy proxies, no session-attached state
+and no relationship traversal, so an accidental N+1 query is not expressible. A
+use case needing related data asks for it explicitly, which puts the second
+query where its cost is visible.
+
 ---
 
 # 15. Transactions and Unit of Work

@@ -277,6 +277,18 @@ Use cases receive a **`UnitOfWorkFactory`**, not a unit of work: a use case deci
 
 # 7. Repository Ports — Common Contract
 
+There is **no generic `Repository[T, ID]` interface** (ADR-035). Each aggregate
+declares its own port exposing only the operations it supports, because the
+aggregates do not share a lifecycle: `Message` is append-only and bulk-inserted,
+`AuditEvent` has no mutation path at all, `RelationshipProfile` is upserted
+whole, and `Memory` cannot be updated without simultaneously writing a revision.
+A shared CRUD base would be wrong for four of those five and would break the
+guarantee that an audit trail cannot be rewritten.
+
+What every repository shares is a **contract**, enforced by a shared test suite
+(`tests/support/repository_contract.py`) that every implementation runs, rather
+than by inheritance:
+
 Every repository:
 
 1. Is account-scoped. Methods take an `AccountId` or an entity that carries one. **There is no unscoped query path.**
@@ -287,12 +299,62 @@ Every repository:
 6. Performs no business logic — no validation beyond schema constraints, no derived values.
 
 ```python
+class SortDirection(StrEnum):
+    ASCENDING = "asc"
+    DESCENDING = "desc"
+
+@dataclass(frozen=True)
+class SortOrder:
+    field: str                      # a DOMAIN field name, never a column
+    direction: SortDirection = SortDirection.DESCENDING
+
+@dataclass(frozen=True)
+class PageRequest:
+    cursor: str | None = None       # opaque; belongs to the query that issued it
+    limit: int = 50                 # clamped by effective_limit()
+    sort: SortOrder | None = None
+
 @dataclass(frozen=True)
 class Page[T]:
-    items: list[T]
+    items: Sequence[T]
     next_cursor: str | None
-    has_more: bool
+    # has_more is derived from next_cursor
 ```
+
+`SortOrder.field` is a domain field name. The repository maps it to a column,
+which stops a schema rename reaching the application layer and stops a caller
+ordering by a column that has no index. A request to sort by an unsupported
+field is **rejected**, not ignored: ignoring it would return correctly-shaped
+results in the wrong order.
+
+**Pagination requires a unique tiebreaker.** Ordering by a non-unique column
+alone silently skips rows -- three messages sharing a timestamp, a page boundary
+inside that group, and `WHERE sent_at < :last` drops the other two. Every
+paginated query therefore sorts by `(sort_column, unique_column)` and compares
+the pair. This is enforced by `KeysetPaginator`, which cannot be constructed
+without a tiebreaker, because the failure it prevents is silent.
+
+## 7.1 Repository construction
+
+Use cases receive `RepositoryFactory[R]` -- a callable taking a `UnitOfWork` --
+as constructor parameters, and create repositories inside their transaction:
+
+```python
+class IngestMessage:
+    def __init__(
+        self,
+        unit_of_work: UnitOfWorkFactory,
+        messages: RepositoryFactory[MessageRepository],
+        chats: RepositoryFactory[ChatRepository],
+    ) -> None: ...
+```
+
+Two common alternatives are deliberately not used. Hanging repositories off the
+unit of work (`uow.messages`) requires that interface to catalogue every
+repository in the system and tells a reader nothing about what a use case
+touches. Passing the container and asking it for repositories is a service
+locator: the real dependencies vanish from the signature, which is exactly the
+information a reader and a test need most.
 
 ---
 

@@ -19,9 +19,6 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 
-DEFAULT_PAGE_SIZE = 50
-MAX_PAGE_SIZE = 500
-
 
 @dataclass(frozen=True, slots=True)
 class Page[T]:
@@ -60,20 +57,3 @@ class Page[T]:
     def empty(cls) -> Page[T]:
         """Return a page with no items and no continuation."""
         return cls(items=())
-
-
-def clamp_page_size(requested: int | None) -> int:
-    """Constrain a requested page size to a sane range.
-
-    A caller asking for a million rows is either mistaken or attempting to
-    exhaust memory; either way the request is capped rather than honoured.
-
-    Args:
-        requested: The caller's page size, or ``None`` for the default.
-
-    Returns:
-        A page size between 1 and :data:`MAX_PAGE_SIZE`.
-    """
-    if requested is None:
-        return DEFAULT_PAGE_SIZE
-    return max(1, min(requested, MAX_PAGE_SIZE))

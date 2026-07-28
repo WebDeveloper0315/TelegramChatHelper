@@ -10,12 +10,17 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-from sqlalchemy import Column, Integer, MetaData, String, Table, insert, select, text
+from sqlalchemy import select, text
 
+from tests.support.sample_aggregate import (
+    SqlWidgetRepository,
+    make_widget,
+    sample_metadata,
+    widgets,
+)
 from tgassist.application.container import Container
 from tgassist.domain.errors import (
     ConstraintViolationError,
@@ -24,34 +29,16 @@ from tgassist.domain.errors import (
     RecordNotFoundError,
     SchemaVersionError,
 )
-from tgassist.domain.model.page import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, Page, clamp_page_size
+from tgassist.domain.model.query import PageRequest
 from tgassist.domain.ports.migration_runner import SchemaState
 from tgassist.infrastructure.config import AppConfig, DatabaseSection, LoadedConfig
 from tgassist.infrastructure.persistence import (
     AlembicMigrationRunner,
-    Cursor,
     DatabaseExecutor,
-    Repository,
     SqlAlchemyUnitOfWork,
     SqliteDatabase,
 )
-from tgassist.infrastructure.persistence.mappers import (
-    from_stored_bool,
-    from_stored_datetime,
-    from_stored_json,
-    to_stored_bool,
-    to_stored_datetime,
-    to_stored_json,
-)
 from tgassist.infrastructure.persistence.schema import SCHEMA_METADATA_TABLE
-
-_metadata = MetaData()
-widgets = Table(
-    "widgets",
-    _metadata,
-    Column("id", Integer, primary_key=True),
-    Column("name", String(32), nullable=False, unique=True),
-)
 
 
 @pytest.fixture
@@ -68,7 +55,7 @@ async def database(tmp_path: Path) -> AsyncIterator[SqliteDatabase]:
 @pytest.fixture
 async def seeded(database: SqliteDatabase) -> SqliteDatabase:
     """A database with the sample table created."""
-    await database.executor.run(_metadata.create_all, database.connection)
+    await database.executor.run(sample_metadata.create_all, database.connection)
     return database
 
 
@@ -374,186 +361,45 @@ class TestMigrations:
 # ---------------------------------------------------------------------------
 
 
-class WidgetRepository(Repository[str]):
-    """A minimal repository, used to exercise the generic base."""
-
-    async def add(self, widget_id: int, name: str) -> None:
-        await self.execute_write(
-            insert(widgets).values(id=widget_id, name=name),
-            operation="add_widget",
-            conflict_message="A widget with that name already exists.",
-        )
-
-    async def names(self) -> list[str]:
-        rows = await self.fetch_all(select(widgets.c.name).order_by(widgets.c.id))
-        return [row.name for row in rows]
-
-    async def page(self, cursor: str | None, limit: int) -> Page[str]:
-        after = Cursor.decode(cursor)
-        last_id = int(after["id"]) if after else 0
-
-        def statement(row_limit: int) -> object:
-            return (
-                select(widgets.c.id, widgets.c.name)
-                .where(widgets.c.id > last_id)
-                .order_by(widgets.c.id)
-                .limit(row_limit)
-            )
-
-        return await self.fetch_page(
-            statement,  # type: ignore[arg-type]
-            mapper=lambda row: str(row.name),
-            cursor_builder=lambda row: {"id": row.id},
-            limit=limit,
-        )
-
-    async def require(self, name: str) -> str:
-        row = await self.require_one(
-            select(widgets.c.name).where(widgets.c.name == name), entity="widget"
-        )
-        return str(row.name)
-
-
 class TestRepositoryInfrastructure:
+    """The generic base, exercised through the shared sample aggregate.
+
+    Pagination, cursor and mapping behaviour is covered by the contract suite
+    and ``test_repository_framework``; this covers the base's own mechanics.
+    """
+
     async def test_writes_and_reads_within_a_transaction(self, seeded: SqliteDatabase) -> None:
         async with SqlAlchemyUnitOfWork(seeded) as uow:
-            repo = WidgetRepository(uow)
-            await repo.add(1, "alpha")
-            assert await repo.names() == ["alpha"]
+            repo = SqlWidgetRepository(uow)
+            await repo.add(make_widget(1))
+
+            assert await repo.get(1) is not None
             await uow.commit()
 
     async def test_constraint_violations_become_domain_errors(self, seeded: SqliteDatabase) -> None:
         async with SqlAlchemyUnitOfWork(seeded) as uow:
-            repo = WidgetRepository(uow)
-            await repo.add(1, "alpha")
+            repo = SqlWidgetRepository(uow)
+            await repo.add(make_widget(1))
 
             with pytest.raises(ConstraintViolationError) as excinfo:
-                await repo.add(2, "alpha")
+                await repo.add(make_widget(1))
 
         assert "already exists" in excinfo.value.user_message
 
     async def test_require_one_raises_when_absent(self, seeded: SqliteDatabase) -> None:
         async with SqlAlchemyUnitOfWork(seeded) as uow:
+            repo = SqlWidgetRepository(uow)
+
             with pytest.raises(RecordNotFoundError):
-                await WidgetRepository(uow).require("missing")
+                await repo.require_one(select(widgets).where(widgets.c.id == 999), entity="widget")
 
-    async def test_pagination_walks_every_row_exactly_once(self, seeded: SqliteDatabase) -> None:
+    async def test_counting_reflects_stored_rows(self, seeded: SqliteDatabase) -> None:
         async with SqlAlchemyUnitOfWork(seeded) as uow:
-            repo = WidgetRepository(uow)
-            for index in range(25):
-                await repo.add(index + 1, f"widget-{index:02d}")
-            await uow.commit()
+            repo = SqlWidgetRepository(uow)
+            for index in range(4):
+                await repo.add(make_widget(index + 1))
 
-        seen: list[str] = []
-        cursor: str | None = None
-        async with SqlAlchemyUnitOfWork(seeded) as uow:
-            repo = WidgetRepository(uow)
-            while True:
-                page = await repo.page(cursor, limit=7)
-                seen.extend(page.items)
-                if not page.has_more:
-                    break
-                cursor = page.next_cursor
-
-        assert len(seen) == 25
-        assert len(set(seen)) == 25
-        assert seen == sorted(seen)
-
-    async def test_last_page_has_no_cursor(self, seeded: SqliteDatabase) -> None:
-        async with SqlAlchemyUnitOfWork(seeded) as uow:
-            repo = WidgetRepository(uow)
-            await repo.add(1, "only")
-            await uow.commit()
-
-        async with SqlAlchemyUnitOfWork(seeded) as uow:
-            page = await WidgetRepository(uow).page(None, limit=10)
-
-        assert not page.has_more
-        assert page.next_cursor is None
-
-
-class TestCursor:
-    def test_round_trips(self) -> None:
-        token = Cursor.encode({"id": 42, "at": "2026-01-01"})
-
-        assert Cursor.decode(token) == {"id": 42, "at": "2026-01-01"}
-
-    def test_absent_token_decodes_to_none(self) -> None:
-        assert Cursor.decode(None) is None
-        assert Cursor.decode("") is None
-
-    def test_malformed_token_decodes_to_none(self) -> None:
-        # A stale bookmark should start from the beginning, not raise.
-        assert Cursor.decode("not-a-cursor!!") is None
-
-    def test_is_url_safe(self) -> None:
-        token = Cursor.encode({"value": "a/b+c=d"})
-
-        assert "/" not in token
-        assert "+" not in token
-
-
-class TestPage:
-    def test_empty_page(self) -> None:
-        page: Page[str] = Page.empty()
-
-        assert not page
-        assert len(page) == 0
-        assert not page.has_more
-
-    def test_iterates_items(self) -> None:
-        page = Page(items=["a", "b"])
-
-        assert list(page) == ["a", "b"]
-
-    @pytest.mark.parametrize(
-        ("requested", "expected"),
-        [(None, DEFAULT_PAGE_SIZE), (0, 1), (-5, 1), (10, 10), (10_000, MAX_PAGE_SIZE)],
-    )
-    def test_page_size_is_clamped(self, requested: int | None, expected: int) -> None:
-        assert clamp_page_size(requested) == expected
-
-
-class TestMappers:
-    def test_datetime_round_trips_in_utc(self) -> None:
-        value = datetime(2026, 3, 1, 9, 30, tzinfo=timezone(timedelta(hours=9)))
-
-        restored = from_stored_datetime(to_stored_datetime(value))
-
-        assert restored == value
-        assert restored is not None
-        assert restored.utcoffset() == timedelta(0)
-
-    def test_naive_datetimes_are_refused(self) -> None:
-        # The same rule the Clock port enforces, applied at the storage boundary.
-        with pytest.raises(ValueError, match="naive"):
-            to_stored_datetime(datetime(2026, 1, 1))  # noqa: DTZ001
-
-    def test_none_passes_through(self) -> None:
-        assert to_stored_datetime(None) is None
-        assert from_stored_datetime(None) is None
-        assert to_stored_bool(None) is None
-        assert to_stored_json(None) is None
-
-    def test_bool_round_trips(self) -> None:
-        assert from_stored_bool(to_stored_bool(True)) is True
-        assert from_stored_bool(to_stored_bool(False)) is False
-
-    def test_json_round_trips(self) -> None:
-        value = {"b": 1, "a": [1, 2, {"c": None}]}
-
-        assert from_stored_json(to_stored_json(value)) == value
-
-    def test_json_encoding_is_stable(self) -> None:
-        # Content fingerprints and cache keys depend on byte-identical output
-        # for equal structures; an unsorted dump would invalidate caches at random.
-        assert to_stored_json({"b": 1, "a": 2}) == to_stored_json({"a": 2, "b": 1})
-
-    def test_datetime_is_stored_as_utc_text(self) -> None:
-        stored = to_stored_datetime(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
-
-        assert stored is not None
-        assert stored.startswith("2026-01-01T12:00:00")
+            assert await repo.count() == 4
 
 
 # ---------------------------------------------------------------------------
@@ -566,18 +412,18 @@ class TestConcurrentAccess:
         self, seeded: SqliteDatabase
     ) -> None:
         async with SqlAlchemyUnitOfWork(seeded) as uow:
-            repo = WidgetRepository(uow)
+            repo = SqlWidgetRepository(uow)
             for index in range(10):
-                await repo.add(index + 1, f"w{index}")
+                await repo.add(make_widget(index + 1))
             await uow.commit()
 
-        async def read() -> list[str]:
+        async def read() -> int:
             async with SqlAlchemyUnitOfWork(seeded) as uow:
-                return await WidgetRepository(uow).names()
+                return await SqlWidgetRepository(uow).count()
 
         results = await asyncio.gather(*(read() for _ in range(20)))
 
-        assert all(len(names) == 10 for names in results)
+        assert all(count == 10 for count in results)
 
     async def test_concurrent_writes_do_not_produce_database_locked(
         self, seeded: SqliteDatabase
@@ -586,21 +432,21 @@ class TestConcurrentAccess:
         # contend and surface as intermittent SQLITE_BUSY under load.
         async def write(index: int) -> None:
             async with SqlAlchemyUnitOfWork(seeded) as uow:
-                await WidgetRepository(uow).add(index, f"concurrent-{index}")
+                await SqlWidgetRepository(uow).add(make_widget(index))
                 await uow.commit()
 
         await asyncio.gather(*(write(i) for i in range(1, 21)))
 
         async with SqlAlchemyUnitOfWork(seeded) as uow:
-            names = await WidgetRepository(uow).names()
+            total = await SqlWidgetRepository(uow).count()
 
-        assert len(names) == 20
+        assert total == 20
 
     async def test_every_statement_runs_on_the_database_thread(
         self, seeded: SqliteDatabase
     ) -> None:
         async with SqlAlchemyUnitOfWork(seeded) as uow:
-            await WidgetRepository(uow).names()
+            await SqlWidgetRepository(uow).page(PageRequest(limit=5))
 
         assert not seeded.executor.is_database_thread()
 

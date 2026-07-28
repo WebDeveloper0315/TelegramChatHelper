@@ -142,6 +142,14 @@ Responsibilities: segment chats into conversations deterministically; detect top
 
 Output: `Conversation`, `ConversationContext`, `ConversationAnalysis`.
 
+## 4.2a Persistence
+
+**Layers:** domain (ports, query value objects) + infrastructure (engine, unit of work, repositories, mappers).
+
+Responsibilities: transaction boundaries, keyset pagination, row-to-domain mapping, schema migration, health.
+
+Constraints: **no generic repository base** (ADR-035) -- each aggregate declares only the operations it supports, and the shared obligations are enforced by a contract test suite rather than by inheritance. **No identity map and no lazy loading**: entities are snapshots compared by identifier, and an accidental N+1 query is not expressible. **No optimistic locking** (ADR-036), because serialized transactions make the database-level race impossible.
+
 ## 4.3 Memory Engine
 
 Responsibilities: extract memory **proposals**; detect conflicts; merge duplicates; rank and retrieve; manage embeddings; apply decay to ranking.

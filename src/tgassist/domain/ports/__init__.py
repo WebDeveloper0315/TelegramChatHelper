@@ -16,6 +16,7 @@ from tgassist.domain.ports.migration_runner import (
     SchemaState,
     SchemaStatus,
 )
+from tgassist.domain.ports.repository import RepositoryFactory
 from tgassist.domain.ports.secret_store import SecretStore
 from tgassist.domain.ports.unit_of_work import UnitOfWork, UnitOfWorkFactory
 
@@ -30,6 +31,7 @@ __all__ = [
     "MigrationReport",
     "MigrationRunner",
     "PragmaState",
+    "RepositoryFactory",
     "SchemaState",
     "SchemaStatus",
     "SecretStore",

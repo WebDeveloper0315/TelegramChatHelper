@@ -176,6 +176,20 @@ flowchart LR
 
 ---
 
+### Milestone 1.0 -- Repository Contracts (complete, 2026-07-28)
+
+| Deliverable | Status |
+|---|---|
+| Query value objects: `SortOrder`, `PageRequest`, `TimeWindow` | Done |
+| Keyset pagination with a mandatory unique tiebreaker | Done |
+| Mapping framework with a stated, tested contract | Done |
+| Reusable repository contract suite | Done -- run against two independent implementations |
+| Repository construction via typed factories, no service locator | Done |
+| Generic CRUD base, read/write split, specification, optimistic locking | **Omitted** -- ADR-035, ADR-036 |
+| No business entities, repositories or tables | Confirmed |
+
+---
+
 ## M1 — Persistence Core
 
 **Complexity:** L · **Depends on:** M0

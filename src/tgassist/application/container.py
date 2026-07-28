@@ -29,7 +29,9 @@ from tgassist.domain.ports.database import HealthReport
 from tgassist.domain.ports.event_bus import EventBus
 from tgassist.domain.ports.id_generator import IdGenerator
 from tgassist.domain.ports.migration_runner import SchemaState, SchemaStatus
+from tgassist.domain.ports.repository import RepositoryFactory
 from tgassist.domain.ports.secret_store import SecretStore
+from tgassist.domain.ports.unit_of_work import UnitOfWork
 from tgassist.infrastructure.clock import SystemClock
 from tgassist.infrastructure.config import (
     AppConfig,
@@ -203,6 +205,17 @@ class Container:
     def migrations(self) -> AlembicMigrationRunner:
         """Return the migration runner."""
         return self._migrations
+
+    def repository[R](self, factory: RepositoryFactory[R], uow: UnitOfWork) -> R:
+        """Build a repository bound to an open unit of work.
+
+        This is a convenience for wiring, not a service locator: the caller
+        supplies the factory it already depends on, so nothing is looked up by
+        name or type. A use case receives its factories as constructor
+        parameters and calls them directly; this exists for the composition
+        root and for tests.
+        """
+        return factory(uow)
 
     # -- Database startup -------------------------------------------------
 

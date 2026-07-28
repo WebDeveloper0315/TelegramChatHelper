@@ -39,7 +39,7 @@ Each decision must have one of the following statuses:
 - Rejected
 
 **ADR-001 through ADR-010 are Accepted.**
-**ADR-011 through ADR-034 are Proposed and require explicit approval.** ADR-011 through ADR-030 were approved for implementation at the close of the architecture stabilization session; ADR-031 through ADR-033 arose during implementation and await review.
+**ADR-011 through ADR-036 are Proposed and require explicit approval.** ADR-011 through ADR-030 were approved for implementation at the close of the architecture stabilization session; ADR-031 through ADR-033 arose during implementation and await review.
 
 ---
 
@@ -81,6 +81,8 @@ Each decision must have one of the following statuses:
 | 032 | Secrets as a Domain Value Object | Proposed |
 | 033 | Identifier Generation Strategy | Proposed |
 | 034 | Single Connection and Serialized Transactions | Proposed |
+| 035 | No Generic Repository Base | Proposed |
+| 036 | No Optimistic Locking | Proposed |
 
 ---
 
@@ -2307,6 +2309,164 @@ The seam already exists: `DatabaseExecutor` and the connection accessor are the 
 ### Related Decisions
 
 ADR-013 (concurrency model), ADR-015 (database access layer), ADR-016 (PostgreSQL path — where a real pool becomes both possible and necessary).
+
+---
+
+# ADR-035
+
+## Title
+
+No Generic Repository Base
+
+Status
+
+Proposed
+
+Date
+
+2026-07-28
+
+---
+
+### Context
+
+A generic `Repository[T, ID]` with `create`, `update`, `delete`, `find_by_id`, `exists` and `count`, inherited by every concrete repository, is close to universal in layered applications. Milestone 1.0 asked whether this project should have one.
+
+Examining the aggregates in `DOMAIN_MODEL.md` against that interface shows it does not fit any of them well and actively breaks one:
+
+* **`Message`** is append-only and arrives in bulk. It is never updated except to record a remote edit, never deleted except by retention. Its meaningful write is `add_batch`, which a single-entity `create` cannot express, and batching is what makes history backfill viable at all.
+* **`AuditEvent`** has no update or delete path whatsoever. An architectural test currently asserts that `AuditRepository` exposes no mutation method, because an audit trail that can be rewritten is not an audit trail. A base class providing `delete` would either break that guarantee or force the subclass to inherit a method that raises.
+* **`RelationshipProfile`** is a computed singleton per contact, upserted whole. "Create" and "update" are the same operation, so two of the six base methods are one method wearing two names.
+* **`Memory`** cannot be updated in the ordinary sense. Changing a value must create a `MemoryRevision` in the same transaction (invariant 10), so its write takes two arguments where `update(entity)` takes one. The repository interface enforces this today: `update()` *requires* a revision, which is what makes the invariant unbreakable rather than merely documented.
+
+The intersection of these lifecycles is close to empty. The union is a base class most of whose methods are wrong for most of its subclasses.
+
+---
+
+### Decision
+
+**No generic repository base class or interface.**
+
+Each aggregate declares its own repository port in the domain, exposing only the operations that aggregate actually supports, named for the intent they serve.
+
+What *is* shared is documented as a **contract** rather than expressed as a type: account scoping, domain objects only, absence returning `None`, soft-delete exclusion, typed errors, no transaction control, keyset pagination, no business logic. That contract is enforced by a shared test suite (`tests/support/repository_contract.py`) that every implementation runs, rather than by inheritance.
+
+The **mechanics** are shared through an infrastructure base class (`Repository[T]`): transaction-aware execution, pagination, mapping and error normalisation. This is inheritance for code reuse, not for polymorphism -- no caller ever holds a `Repository` and asks it to do something generic.
+
+Correspondingly, **`ReadRepository` / `WriteRepository`**, **`Specification`** and a **`RepositoryFactory` registry** are also omitted:
+
+* A read/write split needs a consumer that holds a repository and must be prevented from writing. The only read-only consumer in the design is a plugin, and plugins receive `PluginDataAccess` -- a separate, narrower surface -- rather than repositories at all.
+* A specification pattern exists to compose predicates at runtime, which is needed for user-built queries: report builders, admin search screens. Every query in this application is fixed and known at development time, and each one is matched to an index. A specification that must become SQL either drags SQLAlchemy into the domain or needs a translator layer larger than the queries it replaces.
+* A factory registry is a service locator with a nicer name. Repositories are instead created by a `RepositoryFactory` **type alias** -- a callable taking a unit of work -- which use cases declare as constructor parameters. A use case that needs four repositories says so in its signature.
+
+---
+
+### Consequences
+
+Pros
+
+- No repository inherits a method that is wrong for its aggregate
+- `AuditRepository` remains structurally incapable of deletion
+- `MemoryRepository.update` can require a revision, making an invariant unbreakable
+- Query surfaces stay small, so every query can be matched to an index and measured
+- A use case's dependencies are visible in its signature
+
+Cons
+
+- Each repository declares its own port, which is more interface code than one shared base
+- The shared obligations live in prose and a test suite rather than in a type, so a new repository could omit one. The contract suite is the mitigation and is why it exists.
+- No compile-time guarantee that a component holding a repository will not write to it
+
+---
+
+### Alternatives Considered
+
+| Option | Pros | Cons |
+|---|---|---|
+| No generic base (chosen) | Each repository fits its aggregate; invariants enforceable per aggregate | Shared rules enforced by tests rather than types |
+| Generic CRUD base | Familiar; less interface code | Wrong for four of the five aggregates examined; breaks the audit guarantee |
+| Generic base plus opt-out mixins | Reuse where it fits | The opt-outs outnumber the opt-ins, which is the abstraction telling you it does not fit |
+| Read/write split | Compile-time read-only guarantee | No consumer needs it; plugins use a different surface entirely |
+
+---
+
+### Related Decisions
+
+ADR-004 (repository pattern), ADR-015 (SQLAlchemy Core, no ORM), ADR-034 (connection and transaction model).
+
+---
+
+# ADR-036
+
+## Title
+
+No Optimistic Locking
+
+Status
+
+Proposed
+
+Date
+
+2026-07-28
+
+---
+
+### Context
+
+Optimistic locking -- a version column compared on write, rejecting the update if it changed -- protects against lost updates when two writers read the same row, both modify it, and the second overwrites the first.
+
+Milestone 1.0 asked whether the repository framework should provide it.
+
+---
+
+### Decision
+
+**No optimistic locking, and no version column.**
+
+The database-level race it protects against **cannot occur** in this design. Every write goes through one connection on one thread, and transactions serialize on a lock (ADR-034). Two transactions cannot interleave: the second begins only after the first has committed or rolled back, so it necessarily reads the first transaction's result. The classic lost update is structurally impossible.
+
+A second, genuinely different race does exist: a user opens a memory for editing, thinks for two minutes, and saves -- while a background job has updated that memory in between. Transaction serialization does not help here, because the read and the write are in different transactions separated by human time.
+
+That race is real but narrow, and optimistic locking is the wrong answer to it:
+
+1. It affects one aggregate family in practice -- user-editable records, principally `Memory` and `Goal`.
+2. For `Memory` specifically, a better mechanism already exists. Value changes create a `MemoryRevision` and conflicts are resolved by supersession (ADR-019), so a concurrent change is *merged and recorded* rather than rejected with an error the user can do nothing useful about.
+3. A version conflict surfaced to a user who has just spent two minutes editing is a poor outcome. "Your change was rejected, try again" loses their work.
+
+Adding the machinery now would also violate the project's own rule that only branches with a live consumer are implemented: there is no aggregate to version yet.
+
+---
+
+### Revisit criteria
+
+This decision is reconsidered if any of the following becomes true:
+
+1. **Multi-device synchronisation** is implemented. Two devices writing the same record is a genuine distributed lost update, and neither transaction serialization nor revisions solve it.
+2. **PostgreSQL with a real connection pool** is adopted (ADR-016), removing the single-connection serialization this decision rests on.
+3. A user-facing editing surface appears for an aggregate that has **no revision history**, where a silent overwrite would lose work invisibly.
+
+The seam is small: a `version` column, a `WHERE version = :expected` clause in the update, and a typed `ConcurrentModificationError`. Retrofitting it per aggregate is a contained change, which is part of why deferring is safe.
+
+---
+
+### Consequences
+
+Pros
+
+- No version column, no conflict-handling code, no error path with no good user response
+- The mechanism that would be needed is already present where it matters, in a form that merges rather than rejects
+
+Cons
+
+- The think-time race is unhandled for aggregates without revision history. Currently there are none; when the first appears, this ADR is the record of why it was not already covered.
+- If the concurrency model changes, this decision must be revisited rather than assumed
+
+---
+
+### Related Decisions
+
+ADR-013 (concurrency), ADR-019 (memory approval and revisions), ADR-034 (serialized transactions), ADR-016 (PostgreSQL path).
 
 ---
 
