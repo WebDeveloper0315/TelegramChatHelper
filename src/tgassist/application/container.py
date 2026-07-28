@@ -23,10 +23,12 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
 
-from tgassist.domain.errors import SecretStoreUnavailableError
+from tgassist.domain.errors import SchemaVersionError, SecretStoreUnavailableError
 from tgassist.domain.ports.clock import Clock
+from tgassist.domain.ports.database import HealthReport
 from tgassist.domain.ports.event_bus import EventBus
 from tgassist.domain.ports.id_generator import IdGenerator
+from tgassist.domain.ports.migration_runner import SchemaState, SchemaStatus
 from tgassist.domain.ports.secret_store import SecretStore
 from tgassist.infrastructure.clock import SystemClock
 from tgassist.infrastructure.config import (
@@ -39,6 +41,11 @@ from tgassist.infrastructure.config import (
 from tgassist.infrastructure.events import InProcessEventBus
 from tgassist.infrastructure.ids import UuidV7IdGenerator
 from tgassist.infrastructure.logging import configure_logging, get_logger
+from tgassist.infrastructure.persistence import (
+    AlembicMigrationRunner,
+    SqliteDatabase,
+    UnitOfWorkFactory,
+)
 from tgassist.infrastructure.security import build_default_secret_store
 
 
@@ -54,7 +61,17 @@ class Container:
     container with fakes rather than patching module globals.
     """
 
-    __slots__ = ("_clock", "_closed", "_events", "_ids", "_loaded", "_secrets")
+    __slots__ = (
+        "_clock",
+        "_closed",
+        "_database",
+        "_events",
+        "_ids",
+        "_loaded",
+        "_migrations",
+        "_secrets",
+        "_uow_factory",
+    )
 
     def __init__(
         self,
@@ -64,6 +81,7 @@ class Container:
         ids: IdGenerator | None = None,
         events: EventBus | None = None,
         secrets: SecretStore | None = None,
+        database: SqliteDatabase | None = None,
     ) -> None:
         """Store a resolved configuration and build or accept the core ports.
 
@@ -79,12 +97,23 @@ class Container:
                 identifiers.
             events: Event bus. Defaults to synchronous in-process delivery.
             secrets: Secret store. Defaults to environment over credential store.
+            database: Database. Defaults to SQLite at the configured path. Tests
+                inject an in-memory database this way.
         """
         self._loaded = loaded
         self._clock = clock if clock is not None else SystemClock()
         self._ids = ids if ids is not None else UuidV7IdGenerator(self._clock)
         self._events = events if events is not None else InProcessEventBus()
         self._secrets = secrets if secrets is not None else build_default_secret_store()
+        self._database = (
+            database
+            if database is not None
+            else SqliteDatabase(
+                loaded.config.database.model_copy(update={"path": loaded.config.database_path})
+            )
+        )
+        self._uow_factory = UnitOfWorkFactory(self._database)
+        self._migrations = AlembicMigrationRunner(self._database)
         self._closed = False
 
     @classmethod
@@ -155,6 +184,78 @@ class Container:
         """Return the application's secret store."""
         return self._secrets
 
+    @property
+    def database(self) -> SqliteDatabase:
+        """Return the database."""
+        return self._database
+
+    @property
+    def unit_of_work(self) -> UnitOfWorkFactory:
+        """Return the unit of work factory.
+
+        A factory rather than a unit of work: a use case decides when its
+        transaction begins, and an injected open transaction would outlive the
+        operation it was meant to bound.
+        """
+        return self._uow_factory
+
+    @property
+    def migrations(self) -> AlembicMigrationRunner:
+        """Return the migration runner."""
+        return self._migrations
+
+    # -- Database startup -------------------------------------------------
+
+    async def start_database(self, *, migrate: bool | None = None) -> SchemaStatus:
+        """Open the database and bring its schema to the expected revision.
+
+        Args:
+            migrate: Apply pending migrations. Defaults to the configured
+                ``database.auto_migrate``.
+
+        Returns:
+            The schema position after any migration.
+
+        Raises:
+            DatabaseUnavailableError: If the database cannot be opened.
+            SchemaVersionError: If the database was written by a newer version.
+                Refusing to start is the only safe response, because a migration
+                that removed a column cannot restore what it discarded.
+            MigrationFailedError: If a migration fails, leaving the database at
+                its previous revision.
+        """
+        await self._database.connect()
+        status = await self._migrations.status()
+
+        if status.state in (SchemaState.AHEAD, SchemaState.UNKNOWN):
+            msg = (
+                f"The database is at revision {status.current_revision!r}; this "
+                f"application expects {status.head_revision!r}"
+            )
+            raise SchemaVersionError(
+                msg,
+                user_message=(
+                    "This database was created by a newer version of the application. "
+                    "Please update to open it."
+                ),
+                context={
+                    "current": status.current_revision,
+                    "expected": status.head_revision,
+                    "state": status.state.value,
+                },
+            )
+
+        should_migrate = self.config.database.auto_migrate if migrate is None else migrate
+        if should_migrate and status.state in (SchemaState.EMPTY, SchemaState.BEHIND):
+            await self._migrations.upgrade()
+            status = await self._migrations.status()
+
+        return status
+
+    async def database_health(self) -> HealthReport:
+        """Check the database and report what was found. Never raises."""
+        return await self._database.health()
+
     # -- Logging ----------------------------------------------------------
 
     def logger(self, name: str | None = None) -> Any:
@@ -209,14 +310,24 @@ class Container:
 
     # -- Lifecycle --------------------------------------------------------
 
-    def close(self) -> None:
-        """Release held resources.
-
-        Nothing holds an external resource at this milestone. The method exists
-        so that the lifecycle contract is established before the first adapter
-        that needs it, rather than being retrofitted across every call site.
-        """
+    async def aclose(self) -> None:
+        """Release held resources, including the database and its worker thread."""
+        if self._closed:
+            return
         self._closed = True
+        await self._database.close()
+
+    def close(self) -> None:
+        """Release resources that can be released without an event loop.
+
+        The database owns a worker thread and is closed properly by
+        :meth:`aclose`. This synchronous form exists for callers that never
+        opened it, and still shuts the executor down so no thread is leaked.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        self._database.executor.close(wait=False)
 
     @property
     def is_closed(self) -> bool:
@@ -235,3 +346,16 @@ class Container:
     ) -> None:
         """Leave the container's lifetime, releasing resources."""
         self.close()
+
+    async def __aenter__(self) -> Self:
+        """Enter the container's lifetime."""
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Leave the container's lifetime, closing the database."""
+        await self.aclose()

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections.abc import Coroutine
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -39,7 +40,6 @@ MIN_PYTHON = (3, 12)
 # is an honest picture of what has and has not been checked, rather than a
 # green result that quietly omits everything unimplemented.
 PENDING_SUBSYSTEMS = (
-    "Database",
     "Telegram library",
     "AI providers",
     "Prompt registry",
@@ -53,6 +53,8 @@ app = typer.Typer(
 )
 config_app = typer.Typer(help="Inspect and validate configuration.", no_args_is_help=True)
 app.add_typer(config_app, name="config")
+db_app = typer.Typer(help="Inspect and migrate the database.", no_args_is_help=True)
+app.add_typer(db_app, name="db")
 
 ProfileOption = Annotated[
     str | None,
@@ -194,7 +196,31 @@ def _collect_checks(container: Container) -> list[tuple[str, bool | None, str]]:
     )
     checks.append(("Log directory", config.log_dir.is_dir(), str(config.log_dir)))
     checks.append(_secret_store_check(container))
+    checks.append(_schema_check(container))
     return checks
+
+
+def _schema_check(container: Container) -> tuple[str, bool | None, str]:
+    """Report the database schema position without migrating anything.
+
+    ``doctor`` diagnoses; it does not repair. Silently migrating here would make
+    a read-only diagnostic command modify the user's data.
+    """
+
+    async def probe() -> tuple[str, bool | None, str]:
+        try:
+            await container.database.connect()
+            status = await container.migrations.status()
+        except AppError as exc:
+            return ("Database", False, exc.message)
+        finally:
+            await container.database.close()
+        detail = f"{status.state.value}, at {status.current_revision or '(empty)'}"
+        if status.pending:
+            detail += f", {len(status.pending)} migration(s) pending"
+        return ("Database", status.can_start, detail)
+
+    return asyncio.run(probe())
 
 
 def _permission_detail(owner_only: bool | None) -> str:
@@ -214,6 +240,124 @@ def _secret_store_check(container: Container) -> tuple[str, bool | None, str]:
     else:
         detail = "unavailable, not required by this profile"
     return ("Secret store", available or not required, detail)
+
+
+@db_app.command("status")
+def db_status(
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Report the database schema position without changing anything."""
+    container = _open(profile, config_dir)
+
+    async def run() -> None:
+        await container.database.connect()
+        status = await container.migrations.status()
+        typer.echo(f"database : {container.config.database_path}")
+        typer.echo(f"state    : {status.state.value}")
+        typer.echo(f"current  : {status.current_revision or '(none)'}")
+        typer.echo(f"expected : {status.head_revision}")
+        if status.pending:
+            typer.echo("")
+            typer.echo("pending migrations:")
+            for info in status.pending:
+                typer.echo(f"  {info.revision}  {info.description}")
+        if not status.can_start:
+            typer.echo("")
+            typer.echo("This database cannot be opened by this version.")
+
+    _run_async(container, run())
+
+
+@db_app.command("migrate")
+def db_migrate(
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+    target: Annotated[str, typer.Option("--target", help="Revision to migrate to.")] = "head",
+) -> None:
+    """Apply pending migrations."""
+    container = _open(profile, config_dir)
+
+    async def run() -> None:
+        await container.database.connect()
+        report = await container.migrations.upgrade(target)
+        if not report.changed:
+            typer.echo(f"Already at {report.to_revision}; nothing to do.")
+            return
+        typer.echo(
+            f"Migrated {report.from_revision or '(empty)'} -> {report.to_revision} "
+            f"in {report.duration_seconds}s."
+        )
+        if not report.backup_taken:
+            typer.echo("No backup was taken: the backup subsystem is not implemented yet.")
+
+    _run_async(container, run())
+
+
+@db_app.command("downgrade")
+def db_downgrade(
+    target: Annotated[str, typer.Argument(help="Revision to revert to, or 'base'.")],
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Revert migrations. Intended for development and for backing out a release."""
+    container = _open(profile, config_dir)
+
+    async def run() -> None:
+        await container.database.connect()
+        report = await container.migrations.downgrade(target)
+        typer.echo(f"Reverted {report.from_revision} -> {report.to_revision or '(empty)'}.")
+
+    _run_async(container, run())
+
+
+@db_app.command("check")
+def db_check(
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Run a database health check."""
+    container = _open(profile, config_dir)
+
+    async def run() -> None:
+        await container.database.connect()
+        health = await container.database_health()
+        typer.echo(f"reachable      : {health.reachable}")
+        typer.echo(f"integrity      : {'ok' if health.integrity_ok else 'FAILED'}")
+        typer.echo(f"foreign keys   : {'ok' if health.foreign_keys_ok else 'FAILED'}")
+        if health.pragmas:
+            typer.echo(f"journal mode   : {health.pragmas.journal_mode}")
+            typer.echo(f"fk enforcement : {health.pragmas.foreign_keys}")
+            typer.echo(f"busy timeout   : {health.pragmas.busy_timeout_ms} ms")
+            typer.echo(f"synchronous    : {health.pragmas.synchronous}")
+        typer.echo(f"schema revision: {health.schema_revision or '(none)'}")
+        typer.echo(f"size           : {health.size_bytes} bytes")
+        typer.echo(f"free pages     : {health.freelist_pages}")
+        for problem in health.problems:
+            typer.echo(f"problem        : {problem}")
+        typer.echo("")
+        typer.echo("Healthy." if health.healthy else "Problems were found.")
+        if not health.healthy:
+            raise typer.Exit(code=EXIT_ERROR)
+
+    _run_async(container, run())
+
+
+def _run_async(container: Container, coro: Coroutine[Any, Any, None]) -> None:
+    """Run a coroutine, translating domain errors and always closing the database."""
+
+    async def wrapper() -> None:
+        try:
+            await coro
+        finally:
+            await container.aclose()
+
+    try:
+        asyncio.run(wrapper())
+    except AppError as exc:
+        typer.echo(f"Error: {exc.user_message}", err=True)
+        typer.echo(f"  {exc.code}: {exc.message}", err=True)
+        raise typer.Exit(code=EXIT_ERROR) from exc
 
 
 def _open(profile: str | None, config_dir: Path | None) -> Container:

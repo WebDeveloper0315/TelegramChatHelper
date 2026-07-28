@@ -62,7 +62,18 @@ PRAGMA synchronous = NORMAL;
 PRAGMA temp_store = MEMORY;
 ```
 
+Pragmas are **read back after connecting**, not assumed. A pragma that silently failed to apply -- `journal_mode=WAL` on a filesystem without shared-memory support, for instance -- looks identical to one that worked, right up until concurrent access starts corrupting data.
+
 Writes are serialized through a single dedicated thread (ADR-013), so `SQLITE_BUSY` should never occur in normal operation; the busy timeout exists for backup and maintenance overlap.
+
+## Connection and transaction model
+
+Established by ADR-034, which records the consequences the threading decision implies:
+
+1. **Exactly one connection**, held for the process lifetime, via `StaticPool`. One thread implies one connection, and an in-memory database lives inside its connection, so a second connection would be a second, empty database.
+2. **Units of work serialize on a lock.** One connection holds one transaction, so a second concurrent use case waits rather than failing. Acquisition is bounded at 30 seconds, turning the pathological overlapping-transaction case into a named error rather than a hang.
+3. **Every read outside a unit of work releases its autobegun transaction.** SQLAlchemy 2.0 opens a transaction on any statement; on a connection held for the process lifetime that would block the next explicit `begin()`.
+4. **Reads serialize behind writes.** This forfeits WAL's concurrent-reader capability and is the model's significant limitation. ADR-034 states exactly what must be measured at Milestone 13 before a reader pool is adopted.
 
 ---
 
@@ -720,6 +731,16 @@ Registry of embedding models ever used, so vectors from different models are nev
 - Index: `(account_id, created_at DESC)`, `(event_type, created_at DESC)`
 - **Append-only.** No `UPDATE` or `DELETE` path exists in any repository. Enforced additionally by SQLite triggers that raise on update or delete.
 
+### `schema_metadata`
+
+Infrastructure metadata about the database file itself -- not a business table. Records which application wrote the file and when, so that backups can embed provenance (section 10) and a restore can refuse an incompatible file before overwriting anything.
+
+- Primary key: `key`
+- Columns: `key`, `value`
+- Created by migration `0001`
+
+It also gives the baseline migration something real to create. A migration sequence whose first step is a no-op cannot be tested in either direction, so the migration machinery would go unverified until the first business table -- exactly when a fault in it is most expensive.
+
 ### `alembic_version`
 
 Managed by Alembic. Records the current schema revision. Read by backups (§17) and by the startup compatibility check (§16).
@@ -769,18 +790,23 @@ Rules:
 
 Initial migration sequence:
 
-| Revision | Contents |
-|---|---|
-| `0001` | `accounts`, `user_profiles`, `telegram_sessions`, `settings`, `audit_log` |
-| `0002` | `contacts`, `chats`, `conversations`, `messages`, `attachments`, `sync_cursors` |
-| `0003` | `messages_fts` and synchronisation triggers |
-| `0004` | `memories`, `memory_proposals`, `memory_revisions`, `goals` |
-| `0005` | `relationship_profiles`, `style_profiles` |
-| `0006` | `embedding_models`, `embeddings` |
-| `0007` | `analyses`, `conversation_summaries`, `conversation_plans`, `reply_suggestions`, `behavior_recommendations` |
-| `0008` | `ai_providers`, `ai_calls` |
-| `0009` | `notifications`, `retention_policies` |
-| `0010` | `plugins`, `plugin_data` |
+| Revision | Contents | Status |
+|---|---|---|
+| `0001` | `schema_metadata` -- infrastructure baseline | **Applied** |
+| `0002` | `accounts`, `user_profiles`, `telegram_sessions`, `settings`, `audit_log` | Milestone 1 |
+| `0003` | `contacts`, `chats`, `conversations`, `messages`, `attachments`, `sync_cursors` | Milestone 1 |
+| `0004` | `messages_fts` and synchronisation triggers | Milestone 1 |
+| `0005` | `memories`, `memory_proposals`, `memory_revisions`, `goals` | Milestone 1 |
+| `0006` | `relationship_profiles`, `style_profiles` | Milestone 1 |
+| `0007` | `embedding_models`, `embeddings` | Milestone 1 |
+| `0008` | `analyses`, `conversation_summaries`, `conversation_plans`, `reply_suggestions`, `behavior_recommendations` | Milestone 1 |
+| `0009` | `ai_providers`, `ai_calls` | Milestone 1 |
+| `0010` | `notifications`, `retention_policies` | Milestone 1 |
+| `0011` | `plugins`, `plugin_data` | Milestone 1 |
+
+Business tables begin at `0002`: `0001` is the infrastructure baseline described above.
+
+**Constraint naming is declared once**, in a `MetaData` naming convention. Without it SQLite invents constraint names, and an unnamed constraint cannot be dropped by a migration -- a problem that surfaces the first time a constraint needs changing, by which point every user has a database full of anonymous constraints.
 
 ---
 

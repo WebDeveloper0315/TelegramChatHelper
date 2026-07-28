@@ -36,6 +36,72 @@ Not every release requires every category.
 
 ## Added
 
+### Milestone 0.2 -- Persistence Foundation
+
+**Ports (domain layer)**
+
+- `Database` -- connection lifecycle and health, with `HealthReport` and `PragmaState`.
+- `UnitOfWork` -- transaction boundary, savepoints, and event release gated on commit.
+- `UnitOfWorkFactory` -- use cases open their own transaction rather than receiving one.
+- `MigrationRunner` -- schema status, upgrade, downgrade, and a pre-upgrade hook.
+- `Page` -- keyset pagination. Every collection query uses a cursor, never an offset, because `OFFSET 50000` makes the database walk and discard fifty thousand rows to return twenty.
+
+**Implementations (infrastructure)**
+
+- `DatabaseExecutor` -- the single dedicated worker thread all database work runs on (ADR-013).
+- `SqliteDatabase` -- SQLAlchemy Core engine, pragma application and read-back verification, health checks reporting integrity, foreign keys, page counts and schema revision.
+- `SqlAlchemyUnitOfWork` -- transactions, savepoints, error normalisation, and events withheld until commit.
+- `Repository` base -- transaction-aware execution, keyset pagination, and constraint-violation messages phrased in the domain rather than the schema. No business repositories: those arrive with Milestone 1.
+- `Cursor` -- opaque pagination tokens; a malformed one is treated as absent, because a stale bookmark should start from the beginning rather than raise.
+- Mapping utilities for datetimes, booleans and JSON, with naive datetimes refused at the storage boundary and stable JSON key ordering so content fingerprints do not shift.
+- `AlembicMigrationRunner` -- drives Alembic against the application's own connection, so migrations run on the database thread with the application's pragmas in force.
+
+**Migration framework**
+
+- `alembic.ini`, `migrations/env.py` and a script template. Batch mode is enabled, because SQLite cannot alter a column in place.
+- Migration `0001` creates `schema_metadata`. A baseline that creates nothing cannot be tested in either direction, so the machinery would go unverified until the first business table.
+- Constraint naming conventions declared once. Without them SQLite invents names, and an unnamed constraint cannot be dropped by a later migration.
+
+**Composition root**
+
+- `Database`, `UnitOfWorkFactory` and `MigrationRunner` registered and overridable by constructor injection.
+- `start_database()` opens the database, checks the schema position and migrates when configured, refusing outright if the database was written by a newer version.
+- Async lifecycle (`aclose`, `async with`) so the worker thread is released deterministically.
+
+**Configuration**
+
+- `database` section: path, journal mode, synchronous mode, busy timeout, auto-migrate, archive directory.
+
+**Command line**
+
+- `db status`, `db migrate`, `db downgrade`, `db check`. `doctor` now reports the schema position, and diagnoses rather than repairs -- silently migrating would make a read-only command modify user data.
+
+**Tests**
+
+- 391 passing, 93% coverage. New shared contract suite for the unit of work, run against both the SQLAlchemy implementation and an in-memory fake.
+- Covers pragma verification, migration up/down/up round trips, rollback, savepoint isolation, event release timing, concurrent reads and writes, cursor pagination walking every row exactly once, and startup refusing a newer database.
+
+**Dependencies**
+
+- Added `sqlalchemy` and `alembic`.
+
+## Fixed
+
+Three defects found by the Milestone 0.2 tests before any of this shipped:
+
+- **A pool deadlock.** `QueuePool(pool_size=1)` held its one connection for the process lifetime, so any second checkout blocked forever rather than failing. Replaced with `StaticPool`, which expresses the actual design -- one connection, reused -- instead of a pool that happens to hold one.
+- **SQLAlchemy autobegin blocked transactions.** Reading pragmas or running a health check on the long-lived connection silently opened a transaction, so the next explicit `begin()` was refused. Every read outside a unit of work now releases its implicit transaction.
+- **Concurrent units of work collided.** One connection holds one transaction, so a second concurrent use case failed with an error unrelated to what the caller did. Transactions now serialize on a bounded lock: the second waits, and a genuine overlap surfaces as a named error rather than a hang.
+
+## Changed
+
+- `DATABASE.md`: added the connection and transaction model, pragma read-back, `schema_metadata`, constraint naming conventions, and renumbered business migrations to begin at `0002`.
+- `API.md`: expanded the `UnitOfWork` contract with savepoints, event-release timing and transaction serialization; replaced the `MigrationRunner` sketch with the implemented interface; added the `Database` port.
+
+## Architecture Decisions
+
+- **ADR-034 -- Single Connection and Serialized Transactions** (Proposed). Records what ADR-013's threading decision implies for connections and transactions, and states explicitly that reads serialize behind writes. The remedy -- a reader pool exploiting WAL -- is deliberately deferred, with the measurements required before adopting it written down rather than left to judgement.
+
 ### Milestone 0.1 — Core Domain Ports
 
 **Ports (domain layer)**

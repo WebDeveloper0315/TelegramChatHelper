@@ -116,6 +116,78 @@ class UnknownConfigurationKeyError(ConfigurationError):
     code = "CONFIG_UNKNOWN_KEY"
 
 
+class PersistenceError(AppError):
+    """Storage could not satisfy a request.
+
+    Adapters normalise driver exceptions into this family at the boundary, so a
+    use case never catches ``sqlite3.IntegrityError`` or a SQLAlchemy type.
+    """
+
+    code = "PERSISTENCE_ERROR"
+
+
+class DatabaseUnavailableError(PersistenceError):
+    """The database could not be reached or opened."""
+
+    code = "PERSISTENCE_DATABASE_UNAVAILABLE"
+    retryable = True
+
+
+class ConstraintViolationError(PersistenceError):
+    """A write violated a uniqueness, foreign key or check constraint.
+
+    Usually a defect rather than a condition: the constraints exist to make
+    domain invariants unbreakable, so violating one means the caller tried to
+    break an invariant.
+    """
+
+    code = "PERSISTENCE_CONSTRAINT_VIOLATION"
+
+
+class RecordNotFoundError(PersistenceError):
+    """A record required by the operation does not exist.
+
+    Only raised by methods that promise a record. Ordinary lookups return
+    ``None``, because absence is usually an expected state.
+    """
+
+    code = "PERSISTENCE_RECORD_NOT_FOUND"
+
+
+class TransactionFailedError(PersistenceError):
+    """A transaction could not be started, committed or rolled back."""
+
+    code = "PERSISTENCE_TRANSACTION_FAILED"
+    retryable = True
+
+
+class MigrationFailedError(PersistenceError):
+    """A schema migration did not complete.
+
+    The database is left at its previous revision: migrations run inside a
+    transaction so a failure rolls back rather than leaving a partial schema.
+    """
+
+    code = "PERSISTENCE_MIGRATION_FAILED"
+
+
+class SchemaVersionError(PersistenceError):
+    """The database schema revision is incompatible with this application.
+
+    Raised when the database is *newer* than the application understands.
+    Downgrading user data is never attempted, so the only safe response is to
+    refuse to start and say which version is required.
+    """
+
+    code = "PERSISTENCE_SCHEMA_VERSION"
+
+
+class IntegrityCheckFailedError(PersistenceError):
+    """The database reported internal corruption."""
+
+    code = "PERSISTENCE_INTEGRITY_CHECK_FAILED"
+
+
 class SecurityError(AppError):
     """A security control could not be applied.
 

@@ -104,6 +104,49 @@ class LoggingSection(_Section):
     )
 
 
+class DatabaseSection(_Section):
+    """SQLite connection settings.
+
+    See ``docs/DATABASE.md`` section 2 for why each pragma is set the way it is.
+    """
+
+    path: Path | None = Field(
+        default=None,
+        description="Database file. Defaults to <data_dir>/tgassist.db.",
+    )
+    journal_mode: Literal["WAL", "DELETE", "TRUNCATE", "PERSIST", "MEMORY"] = Field(
+        default="WAL",
+        description=(
+            "Write-ahead logging allows readers to proceed during a write, which "
+            "is what keeps the interface responsive while a sync runs."
+        ),
+    )
+    synchronous: Literal["OFF", "NORMAL", "FULL", "EXTRA"] = Field(
+        default="NORMAL",
+        description=(
+            "NORMAL is durable against application crashes under WAL, and only "
+            "risks the last transaction on a power loss."
+        ),
+    )
+    busy_timeout_ms: int = Field(
+        default=5000,
+        ge=0,
+        le=120_000,
+        description=(
+            "How long a statement waits for a lock. Writes are serialised through "
+            "one thread, so this covers overlap with maintenance and backups."
+        ),
+    )
+    auto_migrate: bool = Field(
+        default=True,
+        description="Apply pending migrations at startup, after a backup.",
+    )
+    archive_dir: Path | None = Field(
+        default=None,
+        description="Archived message databases. Defaults to <data_dir>/archives.",
+    )
+
+
 class SecuritySection(_Section):
     """Security controls that apply from the first milestone."""
 
@@ -139,6 +182,7 @@ class AppConfig(BaseSettings):
 
     profile: Profile = Profile.DEVELOPMENT
     app: AppSection = Field(default_factory=AppSection)
+    database: DatabaseSection = Field(default_factory=DatabaseSection)
     logging: LoggingSection = Field(default_factory=LoggingSection)
     security: SecuritySection = Field(default_factory=SecuritySection)
 
@@ -170,6 +214,11 @@ class AppConfig(BaseSettings):
     def paths(self) -> AppPaths:
         """Return the resolved directory layout."""
         return AppPaths.from_data_dir(self.app.data_dir or default_data_dir())
+
+    @property
+    def database_path(self) -> Path:
+        """Return the resolved database file path."""
+        return self.database.path or (self.paths.data_dir / "tgassist.db")
 
     @property
     def log_dir(self) -> Path:

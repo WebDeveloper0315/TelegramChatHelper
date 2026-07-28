@@ -264,10 +264,14 @@ class UnitOfWork(Protocol):
 Rules:
 
 1. Repositories never commit. Only the unit of work does.
-2. Exiting without `commit()` rolls back. There is no implicit commit.
-3. **Domain events are collected during the transaction and published only after a successful commit.** Publishing inside the transaction would announce facts that may be rolled back.
-4. Nesting is not supported; a nested `UnitOfWork` is a design error and raises.
-5. The fake implementation is fully in-memory and honours the same commit/rollback semantics, so use-case tests need no database.
+2. Exiting without `commit()` rolls back. There is no implicit commit: forgetting to commit loses the work loudly rather than persisting a half-finished operation quietly.
+3. **Domain events are collected during the transaction and released only after a successful commit.** `collect_events()` returns nothing until the transaction commits, so publishing a rolled-back fact is not merely discouraged but impossible. Calling it twice returns the events once.
+4. **Nesting is refused**; a nested `UnitOfWork` raises. Two overlapping boundaries mean neither is a boundary. A use case needing partial rollback uses `savepoint()`, which is explicit about what it does.
+5. **`savepoint()`** opens a nested savepoint for partial rollback within the transaction -- the bulk-import case, where one bad record should not discard the batch. Leaving with an exception rolls back to the savepoint and re-raises; the enclosing transaction is unaffected.
+6. **Transactions serialize.** One connection holds one transaction, so a second concurrent unit of work waits rather than failing (ADR-034). Acquisition is bounded, so an overlapping-transaction defect surfaces as a named error rather than a hang.
+7. The fake implementation is fully in-memory and honours the same semantics, so use-case tests need no database. Both are held to one shared contract suite.
+
+Use cases receive a **`UnitOfWorkFactory`**, not a unit of work: a use case decides when its transaction begins, and an injected open transaction would outlive the operation it was meant to bound.
 
 ---
 
@@ -461,15 +465,32 @@ class MessageSearchPort(Protocol):
 
 ```python
 class MigrationRunner(Protocol):
+    async def status(self) -> SchemaStatus: ...          # never modifies the database
     async def current_revision(self) -> str | None: ...
-    async def head_revision(self) -> str: ...
-    async def pending(self) -> list[MigrationInfo]: ...
+    def head_revision(self) -> str: ...
     async def upgrade(self, target: str = "head", *, backup_first: bool = True) -> MigrationReport: ...
     async def downgrade(self, target: str) -> MigrationReport: ...
-    async def verify(self) -> IntegrityReport: ...
+    def set_pre_upgrade_hook(self, hook: PreUpgradeHook | None) -> None: ...
 ```
 
-`upgrade()` backs up by default and restores automatically on failure (`DATABASE.md` §7.6).
+`SchemaStatus.state` is one of `empty`, `current`, `behind`, `ahead`, `unknown`. The last two mean the database was written by a newer application; startup refuses, because a migration that dropped a column cannot restore what it discarded.
+
+`upgrade()` runs the registered pre-upgrade hook first and refuses to proceed if it fails. **No hook is registered until Milestone 11** implements backups; until then the report records `backup_taken=False` and a warning is logged, which is honest rather than claiming a safety net that does not exist.
+
+## 9.2 `Database`
+
+**Responsibility.** Connection lifecycle and health.
+
+```python
+class Database(Protocol):
+    async def connect(self) -> None: ...
+    async def close(self) -> None: ...
+    @property
+    def is_connected(self) -> bool: ...
+    async def health(self) -> HealthReport: ...
+```
+
+Rules: `connect()` and `close()` are idempotent; connection settings are **verified after connecting** rather than assumed; `health()` **never raises**, because it is the call a caller makes precisely to find out whether something is wrong.
 
 ---
 

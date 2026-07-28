@@ -145,9 +145,21 @@ flowchart LR
 | `doctor` checks the credential backend | ✅ |
 | ADRs raised for architecture changes rather than changing silently | ✅ ADR-031, ADR-032, ADR-033 |
 
+### Milestone 0.2 -- Persistence Foundation (complete, 2026-07-28)
+
+| Deliverable | Status |
+|---|---|
+| Database engine: pragmas, WAL, foreign keys, busy timeout, health checks | Done |
+| `UnitOfWork` with begin, commit, rollback, savepoints, automatic cleanup | Done |
+| Generic repository infrastructure: execution, pagination, mapping, error normalisation | Done |
+| Alembic configured; baseline migration; runner; status; version verification | Done |
+| Registered in the composition root by constructor injection | Done |
+| Contract, migration, rollback, transaction, concurrency and startup tests | Done -- 391 tests, 93% coverage |
+| No business repositories or tables | Confirmed -- `schema_metadata` only |
+
 **Carried forward**
 
-1. **TDLib binary acquisition and verification** (ADR-012 §3). The largest
+1. **TDLib binary acquisition and verification** (ADR-012 section 3). The largest
    unretired technical risk in the project; confronting it now rather than at
    packaging time is the whole point of placing it in Milestone 0.
 2. **`pre-commit install`** on the developer machine (the configuration is
@@ -155,6 +167,12 @@ flowchart LR
 3. **Startup enforcement of `security.require_secret_store`.**
    `Container.verify_secret_store()` exists and `doctor` calls it; wiring it into
    application startup waits for a long-running process to start.
+4. **Pre-upgrade backup hook.** The migration runner accepts one and refuses to
+   migrate if it fails; no provider is registered until Milestone 11, and the
+   report says so rather than implying a safety net that does not exist.
+5. **Read-concurrency measurement** (ADR-034). Reads currently serialize behind
+   writes; the measurements required before adopting a reader pool are specified
+   and scheduled for Milestone 13.
 
 ---
 

@@ -22,6 +22,27 @@ app:
   # Interface language. "system" follows the operating system.
   locale: system
 
+database:
+  # Database file. Null uses <data_dir>/tgassist.db.
+  path: null
+
+  # WAL lets readers proceed during a write, keeping the interface responsive
+  # while a sync runs. DELETE | TRUNCATE | PERSIST | MEMORY are also accepted.
+  journal_mode: WAL
+
+  # NORMAL is durable against application crashes under WAL and only risks the
+  # last transaction on power loss. FULL is slower; OFF is not recommended.
+  synchronous: NORMAL
+
+  # How long a statement waits for a lock before failing.
+  busy_timeout_ms: 5000
+
+  # Apply pending migrations at startup, after taking a backup.
+  auto_migrate: true
+
+  # Archived message databases. Null uses <data_dir>/archives.
+  archive_dir: null
+
 logging:
   # DEBUG | INFO | WARNING | ERROR | CRITICAL
   level: INFO

@@ -20,11 +20,13 @@ classifiers = [
 # AI providers, embeddings, UI) are added by the milestone that introduces them,
 # so an unused subsystem is never installed.
 dependencies = [
+    "alembic>=1.13",
     "keyring>=25.0",
     "platformdirs>=4.2",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "pyyaml>=6.0",
+    "sqlalchemy>=2.0",
     "structlog>=24.1",
     "typer>=0.12",
 ]
@@ -107,6 +109,12 @@ ignore = [
     # under test, not an oversight.
     "ARG002",
     "D100", "D101", "D102", "D103", "D104", "D105", "D107",
+]
+"src/tgassist/application/container.py" = [
+    # A composition root has one keyword-only injection point per port, and that
+    # count grows with every milestone. Collapsing them into a parameter object
+    # would hide exactly the wiring this module exists to make explicit.
+    "PLR0913",
 ]
 "scripts/**" = ["T201"]
 

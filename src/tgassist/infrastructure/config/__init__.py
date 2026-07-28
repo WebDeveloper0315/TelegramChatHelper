@@ -13,6 +13,7 @@ from tgassist.infrastructure.config.paths import AppPaths, default_data_dir, is_
 from tgassist.infrastructure.config.settings import (
     AppConfig,
     AppSection,
+    DatabaseSection,
     LoggingSection,
     LogLevel,
     Profile,
@@ -23,6 +24,7 @@ __all__ = [
     "AppConfig",
     "AppPaths",
     "AppSection",
+    "DatabaseSection",
     "LoadedConfig",
     "LogLevel",
     "LoggingSection",

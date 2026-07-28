@@ -118,7 +118,6 @@ class TestCli:
         result = runner.invoke(app, ["doctor", "--config-dir", str(tmp_path / "absent")])
 
         assert result.exit_code == 0
-        assert "Database: not implemented yet" in result.stdout
         assert "Telegram library: not implemented yet" in result.stdout
 
     def test_doctor_checks_the_secret_store(

@@ -39,7 +39,7 @@ Each decision must have one of the following statuses:
 - Rejected
 
 **ADR-001 through ADR-010 are Accepted.**
-**ADR-011 through ADR-033 are Proposed and require explicit approval.** ADR-011 through ADR-030 were approved for implementation at the close of the architecture stabilization session; ADR-031 through ADR-033 arose during implementation and await review.
+**ADR-011 through ADR-034 are Proposed and require explicit approval.** ADR-011 through ADR-030 were approved for implementation at the close of the architecture stabilization session; ADR-031 through ADR-033 arose during implementation and await review.
 
 ---
 
@@ -80,6 +80,7 @@ Each decision must have one of the following statuses:
 | 031 | Synchronous Event Delivery | Proposed |
 | 032 | Secrets as a Domain Value Object | Proposed |
 | 033 | Identifier Generation Strategy | Proposed |
+| 034 | Single Connection and Serialized Transactions | Proposed |
 
 ---
 
@@ -2212,6 +2213,100 @@ Cons
 ### Related Decisions
 
 ADR-013 (concurrency), ADR-015 (database access layer).
+
+---
+
+# ADR-034
+
+## Title
+
+Single Connection and Serialized Transactions
+
+Status
+
+Proposed
+
+Date
+
+2026-07-28
+
+---
+
+### Context
+
+ADR-013 established that SQLite work runs on one dedicated worker thread, so that SQLite's single-writer rule is structural rather than aspirational and `SQLITE_BUSY` cannot occur.
+
+Implementing the persistence layer showed that the threading decision implies a connection decision, and that the connection decision has consequences the original ADR did not state.
+
+**One thread implies one connection.** A pool would hand different connections to the same thread at different times, and an in-memory database — used by every test — lives *inside* its connection, so a second connection is a second, empty database. The implementation therefore holds exactly one connection for the process lifetime, via `StaticPool`.
+
+**One connection implies serialized transactions.** A SQLAlchemy connection holds at most one transaction. Two concurrent use cases each opening a unit of work would find a transaction already open, and the second would fail with an error that has nothing to do with what the caller did wrong. This was not hypothetical: it was the failure that the concurrency test produced on first run.
+
+**A long-lived connection also changes how SQLAlchemy behaves.** SQLAlchemy 2.0 "autobegins" — any statement on a connection without an explicit transaction opens one. On a short-lived connection this is invisible, because the transaction ends with the connection. On a connection held for the process lifetime, an autobegun transaction from a pragma read or a health check persists and blocks the next explicit `begin()`.
+
+---
+
+### Decision
+
+1. **Exactly one connection**, held for the process lifetime, using `StaticPool`. This expresses the design directly. A sized pool would express "a pool that happens to hold one", and its second checkout would block permanently rather than fail clearly.
+2. **`check_same_thread` is disabled.** SQLite's own thread guard is redundant here and would reject the executor's worker thread. Thread affinity is instead guaranteed structurally, because every statement runs through `DatabaseExecutor`, which owns exactly one thread.
+3. **Units of work serialize on an `asyncio.Lock`.** A second concurrent transaction waits rather than failing. Queuing is what the single-writer model already implies for statements; this extends it to whole transactions.
+4. **Lock acquisition is bounded** (30 seconds, configurable). The pathological case — two overlapping transactions in the same task — becomes a diagnosable `TransactionFailedError` naming the cause, rather than a silent hang.
+5. **Every read outside a unit of work releases its autobegun transaction.** Only reads happen outside a unit of work, so rolling back is safe by construction, and the alternative is that the next real transaction cannot start.
+
+---
+
+### Consequences
+
+Pros
+
+- `SQLITE_BUSY` cannot occur; there is no retry loop and no intermittent lock failure
+- Transaction semantics are simple: one transaction at a time, in a defined order
+- In-memory databases work identically to file databases, so tests exercise the real code path
+- Overlapping-transaction defects surface as a named error rather than a hang
+
+Cons
+
+- **Reads serialize behind writes.** A long backfill transaction delays interface queries. This is the significant limitation and the reason for the measurement plan below.
+- Throughput is bounded by one thread. Adequate for a single-user desktop application; it would not be for a server.
+- A held connection makes SQLAlchemy's autobegin behaviour something every read path must account for.
+
+---
+
+### The read-concurrency question, deliberately left open
+
+WAL mode permits one writer *and many concurrent readers*. This design forfeits that: everything goes through one connection on one thread, so a reader waits behind a writer even though SQLite would not require it.
+
+The natural remedy is a **reader pool** — one writer connection plus several read-only connections, with the unit of work taking the writer and read-only queries taking a reader. WAL makes this safe without additional locking.
+
+It is not being implemented now, for two reasons. It roughly doubles the persistence layer's concurrency surface, adding read-your-own-writes questions that do not exist today. And there is no evidence yet that it is needed: the cost only matters if a backfill is long enough, and interface queries frequent enough, for the delay to be perceptible.
+
+**Evidence required before adopting it**, to be gathered at Milestone 13 against a database seeded with 500,000 messages:
+
+1. Measured p95 latency of an interface query issued *during* a sustained backfill.
+2. Comparison against the `PROJECT_SPEC.md` section 5 target of under 100 ms for a history page.
+3. Confirmation that the delay is attributable to transaction serialization rather than to the query itself.
+
+If p95 exceeds the target and serialization is the cause, the reader pool is the remedy and warrants its own ADR. If not, this design stands and the simplicity is kept.
+
+The seam already exists: `DatabaseExecutor` and the connection accessor are the only two places that would change.
+
+---
+
+### Alternatives Considered
+
+| Option | Pros | Cons |
+|---|---|---|
+| One connection, serialized transactions (chosen) | Simplest correct model; no lock contention; no retry logic | Reads wait behind writes |
+| Connection pool, several writers | Parallel writes | SQLite serializes writes anyway; produces `SQLITE_BUSY` and a retry loop for no throughput gain |
+| Writer connection plus reader pool | Uses WAL as intended; reads never wait | Doubles the concurrency surface; unjustified without measurement |
+| Fail rather than queue on a busy transaction | Surfaces contention immediately | Turns ordinary concurrency into an error the caller cannot act on |
+
+---
+
+### Related Decisions
+
+ADR-013 (concurrency model), ADR-015 (database access layer), ADR-016 (PostgreSQL path — where a real pool becomes both possible and necessary).
 
 ---
 

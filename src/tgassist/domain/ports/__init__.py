@@ -6,15 +6,34 @@ database, a network or a model. See ``docs/API.md``.
 """
 
 from tgassist.domain.ports.clock import Clock
+from tgassist.domain.ports.database import Database, HealthReport, PragmaState
 from tgassist.domain.ports.event_bus import EventBus, EventHandler, Subscription
 from tgassist.domain.ports.id_generator import IdGenerator
+from tgassist.domain.ports.migration_runner import (
+    MigrationInfo,
+    MigrationReport,
+    MigrationRunner,
+    SchemaState,
+    SchemaStatus,
+)
 from tgassist.domain.ports.secret_store import SecretStore
+from tgassist.domain.ports.unit_of_work import UnitOfWork, UnitOfWorkFactory
 
 __all__ = [
     "Clock",
+    "Database",
     "EventBus",
     "EventHandler",
+    "HealthReport",
     "IdGenerator",
+    "MigrationInfo",
+    "MigrationReport",
+    "MigrationRunner",
+    "PragmaState",
+    "SchemaState",
+    "SchemaStatus",
     "SecretStore",
     "Subscription",
+    "UnitOfWork",
+    "UnitOfWorkFactory",
 ]
