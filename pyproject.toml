@@ -20,6 +20,7 @@ classifiers = [
 # AI providers, embeddings, UI) are added by the milestone that introduces them,
 # so an unused subsystem is never installed.
 dependencies = [
+    "keyring>=25.0",
     "platformdirs>=4.2",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
@@ -41,6 +42,7 @@ dev = [
     "poethepoet>=0.26",
     "pre-commit>=3.7",
     "pytest>=8.2",
+    "pytest-asyncio>=0.24",
     "pytest-cov>=5.0",
     "ruff>=0.5",
     "types-pyyaml>=6.0",
@@ -96,9 +98,15 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = [
-    "D100", "D101", "D102", "D103", "D104",
+    "D100", "D101", "D102", "D103", "D104", "D105", "D107",
     "PLR2004", # magic values are the point of a test
     "S101",   # assert is how tests assert
+]
+"tests/fakes/**" = [
+    # A null-object fake ignores arguments by design; that is the behaviour
+    # under test, not an oversight.
+    "ARG002",
+    "D100", "D101", "D102", "D103", "D104", "D105", "D107",
 ]
 "scripts/**" = ["T201"]
 
@@ -154,6 +162,11 @@ markers = [
     "slow: takes more than a second",
 ]
 filterwarnings = ["error"]
+
+# Async tests are the norm here: every I/O port is async (ADR-013). Auto mode
+# avoids a marker on every coroutine test without weakening marker strictness.
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 # ---------------------------------------------------------------------------
 # Coverage

@@ -93,20 +93,29 @@ AppError                                  (base; carries code, context, retryabl
 │   ├── IncompatibleApiVersionError
 │   ├── PluginCrashedError
 │   └── PluginDisabledError
-└── OperationError
-    ├── OperationCancelledError
-    ├── OperationTimeoutError             [retryable]
-    ├── BudgetExceededError
-    └── ResourceExhaustedError
+├── OperationError
+│   ├── OperationCancelledError
+│   ├── OperationTimeoutError             [retryable]
+│   ├── BudgetExceededError
+│   └── ResourceExhaustedError
+└── EventDispatchError                    — the bus refused, not a handler failing
 ```
 
 ## Implementation status
 
-Only the branches with a live consumer exist in code. As of Milestone 0 that is
-`AppError`, `DomainError` (with `InvariantViolationError` and
-`InvalidStateTransitionError`) and the full `ConfigurationError` family. The
-remaining families arrive with the milestone that raises them; defining them
-earlier would be a placeholder, not a contract.
+Only the branches with a live consumer exist in code. As of Milestone 0.1 that
+is `AppError`; `DomainError` (with `InvariantViolationError` and
+`InvalidStateTransitionError`); the full `ConfigurationError` family;
+`SecurityError` (with `SecretStoreUnavailableError` and
+`ReadOnlySecretStoreError`); and `EventDispatchError`. The remaining families
+arrive with the milestone that raises them; defining them earlier would be a
+placeholder, not a contract.
+
+`EventDispatchError` sits outside the `SecurityError` and `OperationError`
+families deliberately. It signals that the *bus itself* refused — currently only
+when publishing from a handler exceeds the recursion bound — and it is therefore
+the one error the event bus does **not** isolate. A handler failing is contained;
+an event cycle is a defect that must reach the publisher.
 
 ## Base structure
 

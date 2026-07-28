@@ -88,7 +88,9 @@ class Clock(Protocol):
     def monotonic(self) -> float: ...       # for durations, never wall clock
 ```
 
-Implementations: `SystemClock`, `FixedClock(instant)`, `AdvanceableClock`.
+Implementations: `SystemClock` (`infrastructure/clock.py`); `FixedClock` and
+`AdvanceableClock` (`tests/fakes/clock.py`, per `TESTING.md` section 14 -- test
+doubles are not shipped in the distributed package).
 
 ## 5.2 `IdGenerator`
 
@@ -96,9 +98,18 @@ Implementations: `SystemClock`, `FixedClock(instant)`, `AdvanceableClock`.
 
 ```python
 class IdGenerator(Protocol):
-    def new_id(self) -> int: ...
+    def new_id(self) -> int: ...              # positive, time-ordered, 64-bit safe
+    def new_uuid(self) -> str: ...            # canonical, time-ordered UUID string
     def new_correlation_id(self) -> str: ...
 ```
+
+Identifiers are **time-ordered** (UUID version 7, ADR-033) so that inserts append
+to the end of a database index rather than scattering through it. They therefore
+encode their creation time and must never be used where guessing one would be a
+security problem.
+
+Implementations: `UuidV7IdGenerator` (`infrastructure/ids.py`);
+`SequentialIdGenerator` (`tests/fakes/id_generator.py`).
 
 ## 5.3 `EventBus`
 
@@ -114,13 +125,18 @@ class EventBus(Protocol):
 
 **Delivery semantics — binding, because plugins depend on them:**
 
-1. Delivery is **asynchronous and in-process**. `publish()` returns once handlers are scheduled, not once they complete.
-2. Events from a single publisher are delivered to a given handler **in publication order**.
+1. Delivery is **synchronous and in-process**. `publish()` returns only once every matching handler has completed; a caller that awaits it can rely on the handlers having run. The method is `async` because handlers perform I/O, not because delivery is deferred (ADR-031).
+2. Events from a single publisher are delivered to a given handler **in publication order**, and handlers for one event type run in **registration order**. A handler registered for a base class also receives subclasses, after the exact-type handlers.
 3. **Handler exceptions are isolated.** A raising handler is logged with its name, its failure count is incremented, and the exception never propagates to the publisher or to other handlers. This is what makes ADR-025's "a faulty plugin must not crash the application" true.
 4. A handler that fails repeatedly (default 5 consecutive) is **automatically unsubscribed** and a `NotificationRaised` event is emitted.
 5. Delivery is **at-most-once and non-durable**. Events are not persisted and do not survive restart. Anything requiring durability is a database write, not an event.
 6. Handlers must be idempotent; no ordering is guaranteed *between* different publishers.
 7. Events are **immutable**; a handler cannot modify an event observed by another handler.
+8. **Handlers may be plain functions or coroutine functions.** Forcing every handler to be `async` would add ceremony without adding capability.
+9. **A handler may publish**, up to a bounded depth. Beyond it the bus raises `EventDispatchError` rather than recursing without limit; that error is *not* isolated, because silently swallowing an event cycle would hide a serious defect.
+
+Implementations: `InProcessEventBus` (`infrastructure/events/bus.py`);
+`RecordingEventBus` (`tests/fakes/event_bus.py`).
 
 ## 5.4 `Cache`
 
@@ -163,14 +179,20 @@ Rules: every job is cancellable and reports progress; a job never overlaps itsel
 
 ```python
 class SecretStore(Protocol):
-    async def get(self, name: str) -> str | None: ...
-    async def set(self, name: str, value: str) -> None: ...
+    async def get(self, name: str) -> SecretValue | None: ...
+    async def set(self, name: str, value: SecretValue) -> None: ...
     async def delete(self, name: str) -> None: ...
     async def list_names(self) -> list[str]: ...
     async def is_available(self) -> bool: ...
 ```
 
-Rules: names may be logged, values never; resolution order is environment variable → OS keyring → not configured; `__repr__` of any object holding a secret must not include it.
+Rules: names may be logged, values never; resolution order is environment variable → OS credential store → not configured.
+
+`get()` returns a `SecretValue` rather than a `str` (ADR-032). A bare string cannot satisfy the rule that a secret must not appear in a `repr`, because its `repr` *is* the value. `SecretValue` masks itself in `repr`, `str` and `format`, refuses to pickle, and requires an explicit `reveal()` — which makes every disclosure point searchable.
+
+Further rules: an unknown name returns `None` rather than raising, because "not configured" is an ordinary state; `delete()` is idempotent; a read-only backend raises `ReadOnlySecretStoreError` rather than silently discarding a write; a backend that cannot enumerate returns an empty list from `list_names()` rather than raising.
+
+Implementations: `KeyringSecretStore`, `EnvironmentSecretStore`, `ChainedSecretStore` (`infrastructure/security/secret_store.py`); `InMemorySecretStore`, `UnavailableSecretStore` (`tests/fakes/secret_store.py`).
 
 ## 5.7 `FileStore`
 

@@ -39,7 +39,7 @@ Each decision must have one of the following statuses:
 - Rejected
 
 **ADR-001 through ADR-010 are Accepted.**
-**ADR-011 through ADR-030 are Proposed and require explicit approval before implementation begins.**
+**ADR-011 through ADR-033 are Proposed and require explicit approval.** ADR-011 through ADR-030 were approved for implementation at the close of the architecture stabilization session; ADR-031 through ADR-033 arose during implementation and await review.
 
 ---
 
@@ -77,6 +77,9 @@ Each decision must have one of the following statuses:
 | 028 | Configuration and Settings Ownership | Proposed |
 | 029 | Composite AI Execution Behind Separate Ports | Proposed |
 | 030 | Developer CLI as a First-Class Adapter | Proposed |
+| 031 | Synchronous Event Delivery | Proposed |
+| 032 | Secrets as a Domain Value Object | Proposed |
+| 033 | Identifier Generation Strategy | Proposed |
 
 ---
 
@@ -1961,6 +1964,254 @@ Cons
 ### Related Decisions
 
 ADR-011, ADR-014.
+
+---
+
+# ADR-031
+
+## Title
+
+Synchronous Event Delivery
+
+Status
+
+Proposed
+
+Date
+
+2026-07-28
+
+---
+
+### Context
+
+`API.md` version 2.0 section 5.3 specified asynchronous delivery: "`publish()` returns once handlers are scheduled, not once they complete." Implementing the bus made three consequences of that concrete.
+
+**Tests become nondeterministic.** A test that publishes and then asserts on the result of a handler has to wait for something it cannot observe. The usual remedies — sleeping, polling, or draining an internal queue — are either flaky or leak the bus's internals into every test that touches it.
+
+**Events are lost at shutdown.** Scheduled-but-unrun handlers are discarded when the loop stops. For `MessageIngested` that means a message persisted but never analysed, with nothing recording that the analysis was skipped.
+
+**Latency becomes invisible.** A publisher that returns immediately cannot know that its handlers took four seconds, so the one component positioned to react — by deferring work, by reporting progress — never learns.
+
+---
+
+### Decision
+
+`EventBus.publish` is `async` and **awaits every matching handler to completion** before returning. A caller that awaits `publish` can rely on the handlers having run.
+
+The method remains `async` because handlers perform I/O (ADR-013), not because delivery is deferred. Handlers may be plain functions or coroutine functions; the bus awaits the result only when it is awaitable.
+
+Everything else in the section 5.3 contract is unchanged: registration order, failure isolation, automatic disabling, at-most-once, non-durable, immutable events.
+
+`API.md` section 5.3 clause 1 is amended accordingly.
+
+---
+
+### Alternatives Considered
+
+| Option | Pros | Cons |
+|---|---|---|
+| Synchronous await (chosen) | Deterministic; no lost events; publisher sees latency; trivial to test | A slow handler delays the publisher |
+| Fire-and-forget scheduling (original) | Publisher never waits | Nondeterministic tests; events lost at shutdown; unbounded task growth; latency invisible |
+| Queue with a background drain | Decoupled within a run | A queue that is neither persisted nor acknowledged has the failure modes of a durable queue without the benefits |
+| Synchronous `def publish` | Simplest possible | Excludes async handlers, and every interesting handler performs I/O |
+
+---
+
+### Reasoning
+
+The argument for fire-and-forget is that a publisher should not wait on subscribers. That argument is strong for a distributed bus, where a subscriber may be slow, remote or absent. It is weak for an in-process bus in a desktop application, where the handlers are the application's own code and their latency is the operation's real latency, merely hidden.
+
+Determinism is the decisive factor. An event bus is infrastructure that practically every later use case will depend on, and a nondeterministic foundation makes every test built on it intermittently unreliable — the kind of defect that trains a team to re-run failing tests rather than read them.
+
+If a genuinely long-running handler appears, the correct answer is for that handler to schedule its own background work explicitly, where the decision and its failure handling are visible.
+
+---
+
+### Consequences
+
+Pros
+
+- Deterministic tests without sleeping or polling
+- No events lost at shutdown
+- Handler latency attributable to the publisher
+- Simpler implementation, with no task lifecycle to manage
+
+Cons
+
+- A slow handler delays its publisher; handlers must stay quick or defer explicitly
+- Requires `pytest-asyncio` for tests, since publishing is awaited
+
+---
+
+### Related Decisions
+
+ADR-013 (asyncio-first), ADR-025 (plugin fault isolation).
+
+---
+
+# ADR-032
+
+## Title
+
+Secrets as a Domain Value Object
+
+Status
+
+Proposed
+
+Date
+
+2026-07-28
+
+---
+
+### Context
+
+`API.md` version 2.0 section 5.6 specified `SecretStore.get()` returning `str | None`, alongside the rule that "`__repr__` of any object holding a secret must not include it". A bare `str` cannot satisfy that rule: its `repr` is the value.
+
+Two existing defences already cover most disclosure paths — the logging processor strips fields whose *name* looks sensitive, and strips values whose *shape* matches a known credential format. Neither catches a secret passed under an innocuous name in an unrecognised format:
+
+```python
+logger.info("provider_configured", value=api_key)
+```
+
+Nor does either cover exception tracebacks, debugger output, f-strings or pytest assertion messages, none of which pass through the logging pipeline at all.
+
+---
+
+### Decision
+
+Introduce `SecretValue`, a domain value object wrapping a secret string:
+
+1. `__repr__`, `__str__` and `__format__` return a mask, so the value stays hidden on every incidental rendering path.
+2. `reveal()` returns the real value. The deliberately conspicuous name makes every disclosure point greppable and reviewable.
+3. Equality uses a constant-time comparison, so comparing secrets does not leak content through timing.
+4. Pickling raises. Serialising a secret is nearly always an accident — a cached object, a multiprocessing argument, a persisted session — and failing loudly beats writing the value somewhere durable.
+5. `len()` and truthiness are available without revealing, so an empty credential can be rejected before a request is attempted.
+
+`SecretStore.get()` returns `SecretValue | None`; `set()` takes a `SecretValue`. `API.md` section 5.6 is amended accordingly.
+
+---
+
+### Alternatives Considered
+
+| Option | Pros | Cons |
+|---|---|---|
+| `SecretValue` wrapper (chosen) | Covers tracebacks, debuggers and f-strings, not only logging; disclosure points are greppable | One more type at every boundary; `reveal()` at each use |
+| Bare `str` with redaction only | Nothing new to learn | Cannot satisfy the documented `__repr__` rule; misses tracebacks and debuggers entirely |
+| A `NewType` alias | Zero runtime cost, some static signal | No runtime behaviour at all, so `repr` still discloses |
+| Encrypted in memory | Defeats a memory-reading attacker | That attacker can read the decryption key too; real cost, illusory benefit |
+
+---
+
+### Reasoning
+
+This is a safety net against accident, not a boundary against an attacker. Anything able to read process memory can read the value regardless. What the wrapper prevents is the far more likely failure: a credential reaching a log file, a crash report, a screenshot or a pasted stack trace.
+
+The cost is one `reveal()` call at each genuine use — perhaps a dozen sites across the application — and that call is exactly the marker a security review wants to be able to find.
+
+---
+
+### Consequences
+
+Pros
+
+- Secrets stay masked in tracebacks, debuggers, f-strings and assertions
+- Disclosure points are explicit and searchable
+- Constant-time comparison for free
+
+Cons
+
+- `SecretStore.get()` no longer returns a plain string
+- Callers must call `reveal()`, which is the point but is still ceremony
+
+---
+
+### Related Decisions
+
+ADR-021 (secret management), ADR-027 (logging and redaction).
+
+---
+
+# ADR-033
+
+## Title
+
+Identifier Generation Strategy
+
+Status
+
+Proposed
+
+Date
+
+2026-07-28
+
+---
+
+### Context
+
+`API.md` specified an `IdGenerator` port without saying what the identifiers look like. The choice matters more than it appears, because identifiers become database keys and the `messages` table is expected to reach hundreds of thousands of rows.
+
+A random key scatters inserts across the whole index. Every write dirties a different page, the working set grows with the table, and insert throughput degrades over months — which for this application means a sync that starts fast and gets slower the longer someone uses it. A time-ordered key appends to the end of the index, so inserts touch one page and stay fast at any size.
+
+---
+
+### Decision
+
+Use **UUID version 7** (RFC 9562) as the generation strategy:
+
+1. `new_uuid()` returns a canonical UUID version 7 string: a 48-bit millisecond timestamp, a 12-bit counter, and 62 random bits.
+2. `new_id()` returns a 60-bit integer using the same timestamp and counter, so integer and UUID identifiers from one generator share an ordering.
+3. `new_correlation_id()` returns a UUID version 7 string, so log records sort into request order.
+4. The counter occupies the `rand_a` field, which RFC 9562 permits. This makes identifiers **strictly** increasing rather than merely increasing per millisecond — "sortable" is only useful if two identifiers created in the same millisecond still sort in creation order.
+5. When the clock moves backwards (an NTP correction, a virtual machine resuming), the generator holds its previous timestamp until wall time catches up. Uniqueness is preserved by the counter.
+6. When more than 4096 identifiers are generated in one millisecond, the generator advances its logical millisecond rather than blocking or colliding.
+7. Time comes from the injected `Clock`, so fixing the clock fixes the identifiers and any test involving generated identifiers stays deterministic.
+8. `uuid.uuid7` is used when the standard library provides it (Python 3.14 and later); otherwise this project implements the same layout.
+
+---
+
+### Alternatives Considered
+
+| Option | Pros | Cons |
+|---|---|---|
+| UUID version 7 (chosen) | Time-ordered, standardised, no coordination, index-friendly | Encodes creation time, so unsuitable where that is sensitive |
+| UUID version 4 | Maximum unpredictability | Scatters index inserts; the exact problem being avoided |
+| Database autoincrement only | Simplest; perfectly ordered | No identity before insert, so an entity cannot be assembled and validated before saving |
+| ULID | Same ordering properties | Not a standard UUID; needs a dependency and a custom column type |
+| Snowflake | Compact, time-ordered | Requires machine-identifier coordination, which a single-user desktop application does not have and does not need |
+
+---
+
+### Reasoning
+
+UUID version 7 gives the index locality of a sequential key without requiring the database to assign it, which is what allows an entity to be constructed and validated before it is persisted. It is a published standard rather than a project invention, and it is arriving in the standard library, so the local implementation is a bridge rather than a permanent obligation.
+
+The counter and backwards-clock handling are the parts most easily got wrong, and both are covered by tests that run the generator against a frozen clock and against a clock that jumps backwards.
+
+---
+
+### Consequences
+
+Pros
+
+- Insert performance stays flat as tables grow
+- Identifiers sort into creation order, which makes logs and exports readable
+- Deterministic under a fixed clock
+
+Cons
+
+- Identifiers **encode their creation time**. They must never be used where guessing one, or learning when it was created, would be a security problem; that is what the secret store is for.
+- Sustained generation above 4096 per millisecond would drift the logical clock ahead of wall time. This is far beyond any expected rate, and drifting is preferable to colliding.
+- A local implementation to remove once Python 3.14 is the floor.
+
+---
+
+### Related Decisions
+
+ADR-013 (concurrency), ADR-015 (database access layer).
 
 ---
 

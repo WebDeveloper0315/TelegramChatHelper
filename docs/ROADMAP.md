@@ -133,19 +133,28 @@ flowchart LR
 | `pip-audit` clean | ✅ configured in CI security job |
 | The chosen Telegram library loads on a clean Windows machine | ⬜ **carried forward** |
 
-**Carried forward to the next task**
+### Milestone 0.1 — Core Domain Ports (complete, 2026-07-28)
 
-These are Milestone 0 scope that was deliberately not attempted in the same
-session as the foundation, to keep the change reviewable:
+| Deliverable | Status |
+|---|---|
+| `Clock`, `IdGenerator`, `EventBus`, `SecretStore` ports in the domain layer | ✅ |
+| Production implementations for all four | ✅ |
+| Behaviourally correct fakes for all four | ✅ |
+| Shared contract suite parametrized over production and fake | ✅ 288 tests, 93% coverage |
+| Registered in the composition root by constructor injection | ✅ |
+| `doctor` checks the credential backend | ✅ |
+| ADRs raised for architecture changes rather than changing silently | ✅ ADR-031, ADR-032, ADR-033 |
 
-1. **Domain ports** — `Clock`, `IdGenerator`, `EventBus`, `SecretStore`, with real
-   and fake implementations and contract tests. The container and `doctor` have
-   placeholders where these will attach.
-2. **TDLib binary acquisition and verification** (ADR-012 §3). The largest
+**Carried forward**
+
+1. **TDLib binary acquisition and verification** (ADR-012 §3). The largest
    unretired technical risk in the project; confronting it now rather than at
    packaging time is the whole point of placing it in Milestone 0.
-3. **`pre-commit install`** on the developer machine (the configuration is
+2. **`pre-commit install`** on the developer machine (the configuration is
    committed and validates; installing the git hook is a local action).
+3. **Startup enforcement of `security.require_secret_store`.**
+   `Container.verify_secret_store()` exists and `doctor` calls it; wiring it into
+   application startup waits for a long-running process to start.
 
 ---
 

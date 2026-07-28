@@ -291,11 +291,13 @@ Single SQLite database (ADR-007), accessed exclusively through repositories (ADR
 
 Internal communication uses domain events. Semantics are specified because plugins depend on them (`API.md` §5.3):
 
-1. Asynchronous, in-process delivery.
+1. Synchronous, in-process delivery: `publish` returns only once every handler has run (ADR-031).
 2. Ordered per publisher, per handler.
 3. **Handler exceptions are isolated** — logged, counted, never propagated.
 4. Repeatedly failing handlers are unsubscribed automatically and a notification is raised.
 5. At-most-once, non-durable. Events do not survive restart; anything requiring durability is a database write.
+5a. Handlers may be plain functions or coroutine functions.
+5b. A handler may publish, up to a bounded depth; beyond it the bus raises rather than recursing without limit.
 6. Handlers must be idempotent.
 7. Events are immutable and are published only **after** the originating transaction commits.
 

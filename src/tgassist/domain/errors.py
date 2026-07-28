@@ -114,3 +114,44 @@ class UnknownConfigurationKeyError(ConfigurationError):
     """
 
     code = "CONFIG_UNKNOWN_KEY"
+
+
+class SecurityError(AppError):
+    """A security control could not be applied.
+
+    These fail closed: an unavailable control denies the operation rather than
+    letting it proceed unprotected.
+    """
+
+    code = "SECURITY_ERROR"
+
+
+class SecretStoreUnavailableError(SecurityError):
+    """The credential backend cannot be reached.
+
+    Fatal at startup when ``security.require_secret_store`` is set, because
+    continuing would mean storing a Telegram session without encryption.
+    """
+
+    code = "SECURITY_SECRET_STORE_UNAVAILABLE"
+
+
+class ReadOnlySecretStoreError(SecurityError):
+    """A write was attempted against a backend that cannot store secrets.
+
+    Raised rather than silently discarding the write, so that a secret the
+    caller believes is saved is never quietly lost.
+    """
+
+    code = "SECURITY_SECRET_STORE_READ_ONLY"
+
+
+class EventDispatchError(AppError):
+    """An event could not be dispatched.
+
+    Handler failures are isolated and never surface as this error. It is raised
+    only when the bus itself refuses -- currently when publishing from a handler
+    exceeds the recursion bound, which indicates an event cycle.
+    """
+
+    code = "EVENT_DISPATCH_ERROR"

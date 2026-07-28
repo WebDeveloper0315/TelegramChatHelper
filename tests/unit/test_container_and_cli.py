@@ -118,8 +118,18 @@ class TestCli:
         result = runner.invoke(app, ["doctor", "--config-dir", str(tmp_path / "absent")])
 
         assert result.exit_code == 0
-        assert "Secret store: not implemented yet" in result.stdout
         assert "Database: not implemented yet" in result.stdout
+        assert "Telegram library: not implemented yet" in result.stdout
+
+    def test_doctor_checks_the_secret_store(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TGASSIST_APP__DATA_DIR", str(tmp_path / "data"))
+
+        result = runner.invoke(app, ["doctor", "--config-dir", str(tmp_path / "absent")])
+
+        assert "Secret store:" in result.stdout
+        assert "not implemented yet" not in result.stdout.split("Secret store:")[1][:40]
 
     def test_doctor_fails_loudly_on_bad_configuration(self, write_config: Any) -> None:
         config_dir = write_config({"default.yaml": "logging:\n  level: LOUD\n"})

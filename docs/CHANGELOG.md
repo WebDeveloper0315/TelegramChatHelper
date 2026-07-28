@@ -36,6 +36,63 @@ Not every release requires every category.
 
 ## Added
 
+### Milestone 0.1 — Core Domain Ports
+
+**Ports (domain layer)**
+
+- `Clock` — UTC-only, timezone-aware wall time, plus a separate monotonic source for durations. Nothing else in the application calls `datetime.now()`.
+- `IdGenerator` — time-ordered integer, UUID and correlation identifiers.
+- `EventBus` — synchronous publish and subscribe with isolated handler failures.
+- `SecretStore` — the only component permitted to hold credential material.
+- `DomainEvent` base class. The concrete event catalogue still arrives with the milestones that raise those events.
+- `SecretValue` value object: masked in `repr`, `str` and `format`, refuses to pickle, constant-time equality, explicit `reveal()`.
+
+**Implementations (infrastructure)**
+
+- `SystemClock`.
+- `UuidV7IdGenerator` — RFC 9562 UUID version 7 with a monotonic counter, strictly increasing even under a frozen or backwards-moving clock, thread-safe, driven by the injected clock.
+- `InProcessEventBus` — registration-order delivery, subclass delivery after exact-type handlers, per-handler failure isolation, automatic disabling after repeated failures, bounded publish depth.
+- `KeyringSecretStore` (operating system credential store), `EnvironmentSecretStore` (read-only override) and `ChainedSecretStore`, composing the resolution order ADR-021 specifies. Blocking credential-store calls run in a worker thread.
+
+**Composition root**
+
+- All four ports constructed in `Container` and overridable through its constructor, so tests inject doubles rather than patching module globals. The identifier generator is driven by the container's clock, so fixing the clock fixes the identifiers.
+- `Container.verify_secret_store()` fails closed when `security.require_secret_store` is set.
+- `tgassist doctor` now reports credential-backend availability instead of listing it as unimplemented.
+
+**Error taxonomy**
+
+- Added `SecurityError` (with `SecretStoreUnavailableError`, `ReadOnlySecretStoreError`) and `EventDispatchError` — the branches that now have live consumers.
+
+**Tests**
+
+- New shared contract suite (`tests/contract/`) parametrized over every implementation of each port, production and fake alike. 288 tests, 93% statement coverage.
+- Fakes: `FixedClock`, `AdvanceableClock`, `SequentialIdGenerator`, `RecordingEventBus`, `InMemorySecretStore`, `UnavailableSecretStore`. `RecordingEventBus` is written as an independent implementation rather than a subclass, so the contract suite genuinely tests it.
+- Edge cases covered: naive-datetime rejection, clock correction versus monotonic time, counter exhaustion, backwards clock, thread safety, event cycles, failure-count reset, pickling refusal, chained-store precedence and deletion.
+
+**Dependencies**
+
+- Added `keyring` (mandated by ADR-021) and `pytest-asyncio` (development only).
+
+## Fixed
+
+- **The event bus swallowed its own refusal.** `EventDispatchError` raised by a nested `publish` was caught by the handler-isolation boundary, so an event cycle stopped silently instead of surfacing. The bus now re-raises its own control error while still isolating handler failures — a handler failing is contained, a cycle is a defect that must reach the publisher.
+- **A log field named `event` collided with structlog's first positional parameter**, raising `TypeError` from inside the failure-isolation path — the one place an exception is least welcome. The field is now `event_type`.
+
+## Changed
+
+- `API.md` §5.1–§5.3 and §5.6: recorded where each implementation lives, added `new_uuid()` and the time-ordering guarantee, replaced fire-and-forget delivery with synchronous delivery, and changed `SecretStore.get()` to return `SecretValue`.
+- `ARCHITECTURE.md` §8: event delivery is synchronous.
+- `ERROR_HANDLING.md` §3: added `EventDispatchError` and refreshed the implementation-status note.
+
+## Architecture Decisions
+
+Three Proposed ADRs arising from implementation:
+
+- **ADR-031 — Synchronous Event Delivery.** Supersedes the fire-and-forget semantics in `API.md` §5.3. Raised rather than changed silently, because it alters a documented contract.
+- **ADR-032 — Secrets as a Domain Value Object.** A bare `str` cannot satisfy the documented rule that a secret must not appear in a `repr`.
+- **ADR-033 — Identifier Generation Strategy.** UUID version 7, chosen for database index locality.
+
 ### Milestone 0 — Foundation & Tooling
 
 **Project structure**

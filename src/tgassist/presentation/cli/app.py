@@ -16,6 +16,7 @@ inspection and environment diagnosis.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 from typing import Annotated, Any
@@ -38,7 +39,6 @@ MIN_PYTHON = (3, 12)
 # is an honest picture of what has and has not been checked, rather than a
 # green result that quietly omits everything unimplemented.
 PENDING_SUBSYSTEMS = (
-    "Secret store",
     "Database",
     "Telegram library",
     "AI providers",
@@ -142,32 +142,7 @@ def doctor(
 ) -> None:
     """Check the environment and report anything that needs attention."""
     container = _open(profile, config_dir)
-    config = container.config
-    checks: list[tuple[str, bool | None, str]] = []
-
-    checks.append(
-        (
-            "Python version",
-            sys.version_info >= MIN_PYTHON,
-            f"{sys.version_info.major}.{sys.version_info.minor}",
-        )
-    )
-    checks.append(("Configuration", True, f"profile {config.profile.value}"))
-
-    try:
-        container.ensure_directories()
-        checks.append(("Data directories", True, str(config.paths.data_dir)))
-    except OSError as exc:
-        checks.append(("Data directories", False, str(exc)))
-
-    for name, owner_only in container.permission_report().items():
-        if owner_only is None:
-            detail = "not verified on this platform"
-        else:
-            detail = "owner only" if owner_only else "readable by others"
-        checks.append((f"Permissions: {name}", owner_only, detail))
-
-    checks.append(("Log directory", config.log_dir.is_dir(), str(config.log_dir)))
+    checks = _collect_checks(container)
 
     failures = 0
     for label, status, detail in checks:
@@ -188,6 +163,57 @@ def doctor(
         typer.echo(f"{failures} check(s) failed.")
         raise typer.Exit(code=EXIT_ERROR)
     typer.echo("All implemented checks passed.")
+
+
+def _collect_checks(container: Container) -> list[tuple[str, bool | None, str]]:
+    """Run every implemented environment check.
+
+    A ``None`` status means "not verified on this platform", which is reported
+    distinctly from a pass: an unverifiable check must not read as a green one.
+    """
+    config = container.config
+    checks: list[tuple[str, bool | None, str]] = [
+        (
+            "Python version",
+            sys.version_info >= MIN_PYTHON,
+            f"{sys.version_info.major}.{sys.version_info.minor}",
+        ),
+        ("Configuration", True, f"profile {config.profile.value}"),
+    ]
+
+    try:
+        container.ensure_directories()
+    except OSError as exc:
+        checks.append(("Data directories", False, str(exc)))
+    else:
+        checks.append(("Data directories", True, str(config.paths.data_dir)))
+
+    checks.extend(
+        (f"Permissions: {name}", owner_only, _permission_detail(owner_only))
+        for name, owner_only in container.permission_report().items()
+    )
+    checks.append(("Log directory", config.log_dir.is_dir(), str(config.log_dir)))
+    checks.append(_secret_store_check(container))
+    return checks
+
+
+def _permission_detail(owner_only: bool | None) -> str:
+    if owner_only is None:
+        return "not verified on this platform"
+    return "owner only" if owner_only else "readable by others"
+
+
+def _secret_store_check(container: Container) -> tuple[str, bool | None, str]:
+    """Report the credential backend, respecting whether it is required."""
+    available = asyncio.run(container.secrets.is_available())
+    required = container.config.security.require_secret_store
+    if available:
+        detail = "available"
+    elif required:
+        detail = "unavailable, and required by configuration"
+    else:
+        detail = "unavailable, not required by this profile"
+    return ("Secret store", available or not required, detail)
 
 
 def _open(profile: str | None, config_dir: Path | None) -> Container:
