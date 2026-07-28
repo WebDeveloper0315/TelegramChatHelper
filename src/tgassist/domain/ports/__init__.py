@@ -17,9 +17,10 @@ from tgassist.domain.ports.migration_runner import (
     SchemaState,
     SchemaStatus,
 )
-from tgassist.domain.ports.repository import RepositoryFactory
+from tgassist.domain.ports.repository import RepositoryFactory, ScopedRepositoryFactory
 from tgassist.domain.ports.secret_store import SecretStore
 from tgassist.domain.ports.unit_of_work import UnitOfWork, UnitOfWorkFactory
+from tgassist.domain.ports.user_profile_repository import UserProfileRepository
 
 __all__ = [
     "AccountRepository",
@@ -36,8 +37,10 @@ __all__ = [
     "RepositoryFactory",
     "SchemaState",
     "SchemaStatus",
+    "ScopedRepositoryFactory",
     "SecretStore",
     "Subscription",
     "UnitOfWork",
     "UnitOfWorkFactory",
+    "UserProfileRepository",
 ]

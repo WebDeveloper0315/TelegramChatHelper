@@ -17,18 +17,30 @@ from tgassist.domain.model.query import (
     TimeWindow,
 )
 from tgassist.domain.model.secret import SecretValue
+from tgassist.domain.model.user_profile import (
+    EmojiUsage,
+    MessageLength,
+    TimeRange,
+    TonePreference,
+    UserProfile,
+)
 
 __all__ = [
     "DEFAULT_PAGE_SIZE",
     "MAX_PAGE_SIZE",
     "Account",
     "AccountId",
+    "EmojiUsage",
+    "MessageLength",
     "Page",
     "PageRequest",
     "SecretValue",
     "SortDirection",
     "SortOrder",
     "TelegramUserId",
+    "TimeRange",
     "TimeWindow",
+    "TonePreference",
+    "UserProfile",
     "validate_timezone",
 ]

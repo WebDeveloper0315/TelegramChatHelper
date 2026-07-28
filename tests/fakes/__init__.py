@@ -12,15 +12,21 @@ from tests.fakes.event_bus import RecordingEventBus
 from tests.fakes.id_generator import SequentialIdGenerator
 from tests.fakes.secret_store import InMemorySecretStore, UnavailableSecretStore
 from tests.fakes.unit_of_work import InMemoryUnitOfWork, InMemoryUnitOfWorkFactory
+from tests.fakes.user_profile_repository import (
+    InMemoryProfileStore,
+    InMemoryUserProfileRepository,
+)
 
 __all__ = [
     "EPOCH",
     "AdvanceableClock",
     "FixedClock",
     "InMemoryAccountRepository",
+    "InMemoryProfileStore",
     "InMemorySecretStore",
     "InMemoryUnitOfWork",
     "InMemoryUnitOfWorkFactory",
+    "InMemoryUserProfileRepository",
     "RecordingEventBus",
     "SequentialIdGenerator",
     "UnavailableSecretStore",

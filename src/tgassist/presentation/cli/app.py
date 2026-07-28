@@ -27,8 +27,16 @@ import typer
 from tgassist import __version__
 from tgassist.application.container import Container
 from tgassist.application.use_cases.account import CreateAccountRequest
-from tgassist.domain.errors import AppError, ConfigurationError
+from tgassist.application.use_cases.user_profile import ProfileChanges
+from tgassist.domain.errors import AppError, ConfigurationError, DomainValidationError
+from tgassist.domain.model.identifiers import AccountId
 from tgassist.domain.model.query import PageRequest
+from tgassist.domain.model.user_profile import (
+    EmojiUsage,
+    MessageLength,
+    TimeRange,
+    TonePreference,
+)
 from tgassist.domain.services.sensitivity import is_sensitive_key
 
 MASKED = "********"
@@ -59,6 +67,8 @@ db_app = typer.Typer(help="Inspect and migrate the database.", no_args_is_help=T
 app.add_typer(db_app, name="db")
 account_app = typer.Typer(help="Manage Telegram accounts.", no_args_is_help=True)
 app.add_typer(account_app, name="account")
+profile_app = typer.Typer(help="Manage operator preferences.", no_args_is_help=True)
+app.add_typer(profile_app, name="profile")
 
 ProfileOption = Annotated[
     str | None,
@@ -473,6 +483,116 @@ def account_activate(
         typer.echo(f"Account {account.id} ({account.display_name}) is now active.")
 
     _run_async(container, run())
+
+
+@profile_app.command("show")
+def profile_show(
+    account_id: Annotated[
+        int | None, typer.Option("--account", help="Account. Defaults to the active one.")
+    ] = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Show the operator preferences for an account.
+
+    Creates a profile with defaults on first access, so this always succeeds for
+    an account that exists -- adding an account should not require deciding
+    preferences before anything works.
+    """
+    container = _open(profile, config_dir)
+
+    async def run() -> None:
+        await container.start_database()
+        found = await container.get_user_profile().execute(
+            AccountId(account_id) if account_id is not None else None
+        )
+        typer.echo(f"account          : {found.account_id}")
+        typer.echo(f"language         : {found.primary_language}")
+        typer.echo(f"tone             : {found.tone_preference.value}")
+        typer.echo(f"message length   : {found.preferred_message_length.value}")
+        typer.echo(f"emoji            : {found.emoji_usage.value}")
+        typer.echo(f"quiet hours      : {found.quiet_hours}")
+        typer.echo(f"created          : {found.created_at.isoformat()}")
+        typer.echo(f"updated          : {found.updated_at.isoformat()}")
+
+    _run_async(container, run())
+
+
+@profile_app.command("set")
+def profile_set(  # noqa: PLR0913 - one option per settable preference
+    *,
+    language: Annotated[
+        str | None, typer.Option("--language", "-l", help="Primary language, e.g. en or en-GB.")
+    ] = None,
+    tone: Annotated[
+        TonePreference | None, typer.Option("--tone", help="Register for suggested replies.")
+    ] = None,
+    length: Annotated[
+        MessageLength | None, typer.Option("--length", help="Preferred reply length.")
+    ] = None,
+    emoji: Annotated[
+        EmojiUsage | None, typer.Option("--emoji", help="How freely to use emoji.")
+    ] = None,
+    quiet_hours: Annotated[
+        str | None,
+        typer.Option("--quiet-hours", help="When not to prompt, as HH:MM-HH:MM."),
+    ] = None,
+    account_id: Annotated[
+        int | None, typer.Option("--account", help="Account. Defaults to the active one.")
+    ] = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Change one or more preferences. Options left out are left alone."""
+    container = _open(profile, config_dir)
+
+    async def run() -> None:
+        await container.start_database()
+        changes = ProfileChanges(
+            primary_language=language,
+            tone_preference=tone,
+            preferred_message_length=length,
+            emoji_usage=emoji,
+            quiet_hours=_parse_quiet_hours(quiet_hours),
+        )
+        if changes.is_empty:
+            typer.echo("Nothing to change. Pass at least one option; see --help.")
+            return
+
+        updated = await container.update_user_profile().execute(
+            changes, AccountId(account_id) if account_id is not None else None
+        )
+        typer.echo(f"Updated preferences for account {updated.account_id}.")
+        typer.echo(f"  language       : {updated.primary_language}")
+        typer.echo(f"  tone           : {updated.tone_preference.value}")
+        typer.echo(f"  message length : {updated.preferred_message_length.value}")
+        typer.echo(f"  emoji          : {updated.emoji_usage.value}")
+        typer.echo(f"  quiet hours    : {updated.quiet_hours}")
+
+    _run_async(container, run())
+
+
+def _parse_quiet_hours(value: str | None) -> TimeRange | None:
+    """Parse ``HH:MM-HH:MM`` into a time range.
+
+    Raises:
+        DomainValidationError: If the value is not two times separated by a
+            hyphen. Parsing here rather than in the domain keeps the entity
+            free of input formats, while still reporting the failure through
+            the same error taxonomy as any other invalid value.
+    """
+    if value is None:
+        return None
+    parts = value.split("-")
+    if len(parts) != 2:  # noqa: PLR2004 - a range has exactly two ends
+        msg = f"{value!r} is not a time range"
+        raise DomainValidationError(
+            msg,
+            user_message=(
+                f"{value!r} is not a time range. Use HH:MM-HH:MM, for example 22:00-08:00."
+            ),
+        )
+    return TimeRange.from_clock(parts[0], parts[1])
 
 
 def _open(profile: str | None, config_dir: Path | None) -> Container:

@@ -11,11 +11,19 @@ from tgassist.application.use_cases.account import (
     ListAccounts,
     SetActiveAccount,
 )
+from tgassist.application.use_cases.user_profile import (
+    GetUserProfile,
+    ProfileChanges,
+    UpdateUserProfile,
+)
 
 __all__ = [
     "CreateAccount",
     "CreateAccountRequest",
     "GetAccount",
+    "GetUserProfile",
     "ListAccounts",
+    "ProfileChanges",
     "SetActiveAccount",
+    "UpdateUserProfile",
 ]

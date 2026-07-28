@@ -158,14 +158,24 @@ Account owns only the lifecycle it genuinely has: whether the user has selected 
 
 ## 5.2 User Profile
 
-**Responsibility.** Describes the operator: how they write, what languages they use, when they are available, and what assistance they want. It is the counterpart to a Contact's Style Profile and supplies the "user preferences" section required by every prompt.
+*Implemented in Milestone 1.2. Corrected by ADR-038.*
 
-**Attributes.** `id`, `account_id`, `display_name`, `primary_language`, `additional_languages`, `timezone`, `tone_preference` (`casual` | `neutral` | `formal` | `mirror_contact`), `preferred_message_length`, `emoji_usage` (`none` | `sparing` | `frequent`), `available_hours`, `quiet_hours`, `auto_approve_memory_categories`, `confidence_thresholds`, `created_at`, `updated_at`.
+**Responsibility.** Describes how the operator wants replies written: register, length, emoji, language, and when they would rather not be disturbed. It is the counterpart to a Contact's Style Profile and supplies the "user preferences" section required by every prompt.
+
+**Identity.** `account_id` is the identity. It is simultaneously the primary key and a foreign key to `accounts(id)`; there is no surrogate key, because an account has exactly one profile and a profile cannot exist without an account (ADR-038).
+
+**Attributes.** `account_id`, `primary_language`, `tone_preference` (`casual` | `neutral` | `formal` | `mirror_contact`), `preferred_message_length` (`short` | `medium` | `long`), `emoji_usage` (`none` | `sparing` | `frequent`), `quiet_hours`, `created_at`, `updated_at`.
 
 **Invariants.**
-- Exactly one User Profile per Account.
-- `quiet_hours` must not cover the entire day.
-- `confidence_thresholds` satisfy `low < medium < high`, each within `[0,1]`.
+- Exactly one User Profile per Account, enforced by the primary key.
+- `primary_language` is a structurally well-formed BCP-47 tag, normalised to lowercase language with uppercase region (`en-GB`).
+- `quiet_hours` is a `TimeRange` of minutes past midnight, may wrap midnight, and must not cover the entire day. Equal bounds are rejected: they are ambiguous between an empty range and the whole day.
+- `updated_at >= created_at`; both are timezone-aware UTC.
+- Every invariant is restated as a `CHECK` constraint, so a row written by any route obeys them.
+
+**Lifecycle.** The profile is created with defaults on first access rather than alongside the Account, so adding an account does not require deciding preferences before the application is usable. It is deleted by cascade with its Account; there is no independent delete.
+
+**Deferred attributes.** `display_name` and `timezone` are **not** duplicated here — Account owns both. `available_hours`, `auto_approve_memory_categories`, `confidence_thresholds` and `additional_languages` are deferred until the aggregate that defines each vocabulary exists, so their values can be validated rather than merely stored (ADR-038).
 
 **Notes.** `tone_preference = mirror_contact` instructs the Reply Generator to adopt the Contact's Style Profile rather than a fixed register.
 

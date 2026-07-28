@@ -94,6 +94,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TypeVar
 
+from tgassist.domain.model.identifiers import AccountId
 from tgassist.domain.ports.unit_of_work import UnitOfWork
 
 R_co = TypeVar("R_co", covariant=True)
@@ -133,4 +134,36 @@ information a reader and a test need most.
 Declaring factories keeps the dependency list honest -- a use case that needs
 four repositories says so -- while still allowing the repository to be created
 inside the transaction it belongs to.
+"""
+
+
+ScopedRepositoryFactory = Callable[[UnitOfWork, AccountId], R_co]
+"""Builds a repository scoped to one account.
+
+Almost every aggregate in this system belongs to an Account, and a query that
+loses its scope returns another person's data -- silently, with no error and no
+obvious symptom. Passing the account to each method relies on every caller
+getting it right every time; binding it at construction means there is no value
+to get wrong.
+
+A use case therefore declares a scoped factory and supplies the account once::
+
+    class UpdateUserProfile:
+        def __init__(
+            self,
+            unit_of_work: UnitOfWorkFactory,
+            profiles: ScopedRepositoryFactory[UserProfileRepository],
+        ) -> None: ...
+
+        async def execute(self, account_id: AccountId, ...) -> UserProfile:
+            async with self._unit_of_work() as uow:
+                profiles = self._profiles(uow, account_id)
+                ...
+
+Reaching a second account's data then requires constructing a second
+repository, which is visible in the code rather than an oversight in it.
+
+``RepositoryFactory`` remains for repositories that are not account-scoped.
+There is exactly one: ``AccountRepository``, because Account is the ownership
+root and has no outer scope to be scoped to. See ADR-039.
 """

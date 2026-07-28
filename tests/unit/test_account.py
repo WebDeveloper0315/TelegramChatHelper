@@ -335,8 +335,17 @@ class TestAccountsMigration:
         await runner.upgrade()
         assert ACCOUNTS_TABLE in await _table_names(database)
 
-    async def test_head_is_the_accounts_revision(self, database: SqliteDatabase) -> None:
-        assert AlembicMigrationRunner(database).head_revision() == "0002"
+    async def test_upgrading_reaches_the_accounts_revision(self, database: SqliteDatabase) -> None:
+        # Not pinned to head: head moves with every new migration, and asserting
+        # it here would fail the next milestone for no reason. What matters is
+        # that a plain upgrade applies this table.
+        await AlembicMigrationRunner(database).upgrade()
+
+        applied = await AlembicMigrationRunner(database).current_revision()
+
+        assert ACCOUNTS_TABLE in await _table_names(database)
+        assert applied is not None
+        assert applied >= "0002"
 
     async def test_check_constraints_reject_invalid_rows(self, database: SqliteDatabase) -> None:
         # The schema restates the entity's invariants, so a row written by any

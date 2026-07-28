@@ -20,6 +20,7 @@ from sqlalchemy import (
     CheckConstraint,
     Column,
     DateTime,
+    ForeignKey,
     Index,
     Integer,
     MetaData,
@@ -96,6 +97,54 @@ Index(
     postgresql_where=text("is_active"),
 )
 
+USER_PROFILES_TABLE: Final = "user_profiles"
+
+user_profiles = Table(
+    USER_PROFILES_TABLE,
+    metadata,
+    # The account identifier is the primary key, not a surrogate alongside one.
+    # Exactly one profile exists per account, so this makes the invariant the
+    # key itself rather than a unique index that could be dropped (ADR-038).
+    Column(
+        "account_id",
+        Integer,
+        ForeignKey("accounts.id", ondelete="CASCADE", name="fk_user_profiles_account_id_accounts"),
+        primary_key=True,
+        autoincrement=False,
+    ),
+    Column("primary_language", String(32), nullable=False, server_default="en"),
+    Column("tone_preference", String(16), nullable=False, server_default="neutral"),
+    Column("preferred_message_length", String(16), nullable=False, server_default="medium"),
+    Column("emoji_usage", String(16), nullable=False, server_default="sparing"),
+    Column("quiet_hours_start_minute", Integer, nullable=False, server_default=text("1320")),
+    Column("quiet_hours_end_minute", Integer, nullable=False, server_default=text("480")),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint(
+        "tone_preference IN ('casual', 'neutral', 'formal', 'mirror_contact')",
+        name="tone_preference_known",
+    ),
+    CheckConstraint(
+        "preferred_message_length IN ('short', 'medium', 'long')",
+        name="message_length_known",
+    ),
+    CheckConstraint(
+        "emoji_usage IN ('none', 'sparing', 'frequent')",
+        name="emoji_usage_known",
+    ),
+    CheckConstraint("quiet_hours_start_minute BETWEEN 0 AND 1439", name="quiet_start_within_day"),
+    CheckConstraint("quiet_hours_end_minute BETWEEN 0 AND 1439", name="quiet_end_within_day"),
+    CheckConstraint(
+        "quiet_hours_start_minute <> quiet_hours_end_minute", name="quiet_hours_not_whole_day"
+    ),
+    CheckConstraint("updated_at >= created_at", name="updated_after_created"),
+    comment=(
+        "Operator preferences, exactly one row per account. Every column is NOT "
+        "NULL with a default: a preference that can be null forces every reader "
+        "to decide what null means, and they will not all decide the same thing."
+    ),
+)
+
 # Keys used in schema_metadata.
 KEY_CREATED_AT: Final = "created_at"
 KEY_CREATED_BY_VERSION: Final = "created_by_version"
@@ -111,7 +160,9 @@ __all__ = [
     "KEY_CREATED_BY_VERSION",
     "NAMING_CONVENTION",
     "SCHEMA_METADATA_TABLE",
+    "USER_PROFILES_TABLE",
     "accounts",
     "metadata",
     "schema_metadata",
+    "user_profiles",
 ]

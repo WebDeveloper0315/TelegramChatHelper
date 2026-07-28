@@ -203,6 +203,31 @@ flowchart LR
 | Both implementations pass the shared contract suite | Done -- 579 tests |
 | No Contact, Conversation, Message, Goal, Memory or Telegram | Confirmed |
 
+### Milestone 1.2 -- UserProfile Vertical Slice (complete, 2026-07-28)
+
+The first account-owned aggregate, establishing the pattern every later one
+follows: foreign key, cascade, and scoping that cannot be bypassed.
+
+| Deliverable | Status |
+|---|---|
+| `UserProfile` entity with `TimeRange` quiet hours and BCP-47 language validation | Done |
+| Migration `0003` -- first foreign key, `ON DELETE CASCADE`, seven check constraints | Done |
+| `UserProfileMapper` with round-trip and column-coverage tests | Done |
+| `UserProfileRepository` scoped at construction; no method takes an account | Done -- ADR-039 |
+| `ScopedRepositoryFactory` added to the repository ports | Done |
+| Use cases: get (creating a default on first access), update | Done |
+| CLI: `profile show`, `profile set` | Done |
+| Contract suite over both implementations: ownership, FK integrity, cascade, isolation | Done |
+| Surrogate key, `display_name`, `timezone`, `available_hours`, thresholds | **Omitted** -- ADR-038 |
+| No Contact, Conversation, Message, Goal, Memory or Telegram | Confirmed |
+
+**Uncovered during implementation.** The CLI never configures logging, so
+structlog falls back to its default `PrintLogger` and every record -- at every
+level, unredacted -- is written to standard output alongside command output.
+Recorded as **ADR-040 (Proposed)** with the fix deliberately not applied, since
+it changes behaviour outside this milestone. It should be settled before
+Milestone 2, when records begin carrying message content.
+
 ---
 
 ## M1 — Persistence Core

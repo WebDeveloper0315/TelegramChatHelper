@@ -36,6 +36,63 @@ Not every release requires every category.
 
 ## Added
 
+### Milestone 1.2 -- UserProfile Vertical Slice
+
+The first account-owned aggregate. Everything after this one is account-scoped
+too, so the point of the slice was to settle how ownership, cascade and scoping
+work while the aggregate is small enough to get them right.
+
+**Domain**
+
+- `UserProfile` -- frozen, self-validating, with `with_language`, `with_tone`, `with_message_length`, `with_emoji_usage` and `with_quiet_hours`. Each returns `self` when the value is unchanged, so a redundant edit does not move `updated_at`.
+- **Identity is the account.** `account_id` is the primary key; there is no surrogate key, because an account has exactly one profile and a second name for one row is how a query eventually reads by one and writes by the other (ADR-038).
+- `TimeRange` -- quiet hours as minutes past midnight, so a period crossing midnight compares correctly. A pair of naive times makes `22:00-08:00` look empty. Equal bounds are refused as ambiguous between an empty range and the whole day.
+- `TonePreference`, `MessageLength`, `EmojiUsage` as `StrEnum`s, stored as their values rather than ordinals.
+- `validate_language` -- structural BCP-47 validation with normalisation (`EN-gb` becomes `en-GB`). Structural rather than registry-based: an unregistered tag simply matches nothing, whereas a malformed one breaks parsing everywhere it is used.
+
+**Persistence**
+
+- Migration `0003`: `user_profiles`, the first table with a foreign key. `account_id` is simultaneously primary key and foreign key with `ON DELETE CASCADE`, so one profile per account and deletion of orphans are both structural. No extra index on `account_id`: the primary key already is one.
+- Seven check constraints restating the entity's invariants, each with a test proving it rejects a bad row rather than merely that the table exists.
+- Every column `NOT NULL` with a server default -- no nullable column standing in for "not decided yet".
+- `UserProfileMapper` with round-trip and column-coverage tests.
+- A test asserts `PRAGMA foreign_keys` is actually on, because SQLite ignores foreign keys without it and the cascade would otherwise be decorative.
+
+**Application**
+
+- `GetUserProfile` creates a default profile on first access, so adding an account does not require deciding preferences before the application is usable.
+- `UpdateUserProfile` with `ProfileChanges`, where `None` means "leave alone" -- a partial update without inventing a null-means-unset convention in the entity.
+
+**CLI**
+
+- `profile show` and `profile set --language --tone --length --emoji --quiet-hours --account`.
+
+**Tests**
+
+- A contract suite running both implementations against ownership, foreign-key integrity, cascade deletion and scope isolation. The in-memory fake deliberately shares one store across scoped instances, so isolation is genuinely tested rather than passing because the fake had nothing to leak.
+- One test inspects the signatures and asserts no repository method accepts an account, so a future method reintroducing the parameter fails a test rather than a review.
+
+## Changed
+
+- `ScopedRepositoryFactory` added to `domain/ports/repository.py`: account-owned repositories are scoped at construction and **no method takes an account identifier** (ADR-039). The conventional `get(account_id)` form places correctness at every call site forever, and its failure mode is silently returning another account's data.
+- `DOMAIN_MODEL.md` §5.2 corrected: identity, the reduced attribute set, and each deferred field with its reason.
+- `DATABASE.md`: `user_profiles` documented as implemented; the migration plan renumbered to one aggregate per migration.
+- `API.md`: new §7.2 on account-scoped construction, and the `UserProfileRepository` interface with the reasoning for having no `delete` and no `list`.
+
+## Fixed
+
+- Nothing in this milestone's code. One pre-existing defect was found and is **not** fixed here -- see ADR-040 below.
+
+## Architecture Decisions
+
+- **ADR-038 -- UserProfile Identity Is the Account** (Proposed). Drops the surrogate key, and defers `display_name`, `timezone`, `available_hours`, `auto_approve_memory_categories` and `confidence_thresholds` -- the first two because Account already owns them, the rest because the vocabulary each draws on does not exist yet and a column that accepts anything is worse than an absent one.
+- **ADR-039 -- Account Scope Is a Constructor Parameter** (Proposed). Establishes scoped repositories for every account-owned aggregate to come.
+- **ADR-040 -- The CLI Does Not Configure Logging** (Proposed). Found by comparing the output of two identical `profile show` runs. `_open` suppresses `configure_logging` to keep command output clean; the effect is the opposite, because unconfigured structlog defaults to a `PrintLogger` on standard output with no level filtering. The whole `logging` configuration section -- including secret redaction -- is therefore ignored for every CLI command. The fix is proposed and deliberately not applied, as it changes behaviour outside this milestone; it matters most before Milestone 2, when records begin carrying message content.
+
+## Scope note
+
+Eighteen source and test files were created or modified, within the twenty-file limit.
+
 ### Milestone 1.1 -- Account Aggregate
 
 The first real business aggregate, exercising the whole architecture end to end:

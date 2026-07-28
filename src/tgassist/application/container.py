@@ -29,6 +29,10 @@ from tgassist.application.use_cases.account import (
     ListAccounts,
     SetActiveAccount,
 )
+from tgassist.application.use_cases.user_profile import (
+    GetUserProfile,
+    UpdateUserProfile,
+)
 from tgassist.domain.errors import SchemaVersionError, SecretStoreUnavailableError
 from tgassist.domain.ports.account_repository import AccountRepository
 from tgassist.domain.ports.clock import Clock
@@ -36,9 +40,10 @@ from tgassist.domain.ports.database import HealthReport
 from tgassist.domain.ports.event_bus import EventBus
 from tgassist.domain.ports.id_generator import IdGenerator
 from tgassist.domain.ports.migration_runner import SchemaState, SchemaStatus
-from tgassist.domain.ports.repository import RepositoryFactory
+from tgassist.domain.ports.repository import RepositoryFactory, ScopedRepositoryFactory
 from tgassist.domain.ports.secret_store import SecretStore
 from tgassist.domain.ports.unit_of_work import UnitOfWork
+from tgassist.domain.ports.user_profile_repository import UserProfileRepository
 from tgassist.infrastructure.clock import SystemClock
 from tgassist.infrastructure.config import (
     AppConfig,
@@ -55,6 +60,7 @@ from tgassist.infrastructure.persistence import (
     SqliteDatabase,
     UnitOfWorkFactory,
     account_repository,
+    user_profile_repository,
 )
 from tgassist.infrastructure.security import build_default_secret_store
 
@@ -223,6 +229,15 @@ class Container:
         """
         return account_repository
 
+    @property
+    def user_profiles(self) -> ScopedRepositoryFactory[UserProfileRepository]:
+        """Return the user profile repository factory.
+
+        Scoped: the account is supplied at construction, so no method can be
+        called without one and no caller can pass the wrong one (ADR-039).
+        """
+        return user_profile_repository
+
     # -- Use cases --------------------------------------------------------
     #
     # Built on demand rather than held, because a use case is a small object
@@ -245,6 +260,16 @@ class Container:
     def set_active_account(self) -> SetActiveAccount:
         """Build the account activation use case."""
         return SetActiveAccount(self._uow_factory, self.accounts, self._clock)
+
+    def get_user_profile(self) -> GetUserProfile:
+        """Build the profile retrieval use case."""
+        return GetUserProfile(self._uow_factory, self.user_profiles, self.accounts, self._clock)
+
+    def update_user_profile(self) -> UpdateUserProfile:
+        """Build the profile update use case."""
+        return UpdateUserProfile(
+            self._uow_factory, self.user_profiles, self.get_user_profile(), self._clock
+        )
 
     def repository[R](self, factory: RepositoryFactory[R], uow: UnitOfWork) -> R:
         """Build a repository bound to an open unit of work.

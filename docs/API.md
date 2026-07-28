@@ -356,6 +356,41 @@ touches. Passing the container and asking it for repositories is a service
 locator: the real dependencies vanish from the signature, which is exactly the
 information a reader and a test need most.
 
+## 7.2 Account-scoped repositories
+
+Nearly every aggregate after Account belongs to one account. Those repositories
+take `ScopedRepositoryFactory[R]` instead -- a callable taking a `UnitOfWork`
+**and** an `AccountId`:
+
+```python
+ScopedRepositoryFactory = Callable[[UnitOfWork, AccountId], R_co]
+
+class GetUserProfile:
+    def __init__(
+        self,
+        unit_of_work: UnitOfWorkFactory,
+        profiles: ScopedRepositoryFactory[UserProfileRepository],
+        accounts: RepositoryFactory[AccountRepository],
+        clock: Clock,
+    ) -> None: ...
+```
+
+The scope is supplied once, inside the transaction, and **no repository method
+accepts an account identifier** (ADR-039). The conventional alternative --
+`get(account_id)` on every method -- puts correctness in the hands of every
+call site forever, and its failure mode is silently returning or overwriting
+another account's data. Removing the parameter removes the mistake: there is no
+value left to get wrong.
+
+Writes are checked as well as reads. The scope makes a cross-account read
+impossible, but a caller could still hand over an entity built for another
+account, which would overwrite the wrong row; every write verifies the entity's
+`account_id` against the scope and raises `DomainValidationError` otherwise.
+
+The contract suite asserts this structurally, by inspecting the signatures, so a
+future method that reintroduces an account parameter fails a test rather than a
+review.
+
 ---
 
 # 8. Core Repository Ports
@@ -538,6 +573,35 @@ Account is the ownership root, so unlike every other repository this one is
 permits only one active row and the reverse order would violate it
 mid-statement. Both writes happen in the caller's transaction, so the invariant
 is never briefly broken and never left broken by a failure between them.
+
+## `UserProfileRepository`
+
+```python
+class UserProfileRepository(Protocol):
+    @property
+    def account_id() -> AccountId
+    async def get() -> UserProfile | None
+    async def add(profile: UserProfile) -> None
+    async def update(profile: UserProfile) -> None
+```
+
+Scoped at construction (§7.2), so no method takes an account.
+
+Three operations. There is no `delete`: the profile is removed by cascade when
+its account is, and a second route to deletion could leave the two disagreeing
+about whether the row exists. There is no `list` or pagination: the repository
+holds exactly one row, so a collection interface would describe something that
+cannot happen.
+
+`get` returns `None` for an account with no profile yet. That is an ordinary
+state rather than an error -- the profile is created with defaults on first
+access, so adding an account does not require deciding preferences before the
+application is usable.
+
+`update` raises `RecordNotFoundError` when no row was affected rather than
+silently succeeding, which is what an `UPDATE` matching nothing otherwise does.
+It never rewrites `created_at`: a profile that appeared to have been created
+when it was last edited would make its own history unreadable.
 
 ## `MessageSearchPort`
 

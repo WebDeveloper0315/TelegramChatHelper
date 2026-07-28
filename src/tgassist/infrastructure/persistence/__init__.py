@@ -24,6 +24,11 @@ from tgassist.infrastructure.persistence.unit_of_work import (
     UnitOfWorkFactory,
     translate_database_error,
 )
+from tgassist.infrastructure.persistence.user_profiles import (
+    SqlUserProfileRepository,
+    UserProfileMapper,
+    user_profile_repository,
+)
 
 __all__ = [
     "MEMORY_URL",
@@ -35,12 +40,15 @@ __all__ = [
     "Repository",
     "SqlAccountRepository",
     "SqlAlchemyUnitOfWork",
+    "SqlUserProfileRepository",
     "SqliteDatabase",
     "UnitOfWorkFactory",
+    "UserProfileMapper",
     "account_repository",
     "build_alembic_config",
     "build_url",
     "metadata",
     "schema_metadata",
     "translate_database_error",
+    "user_profile_repository",
 ]

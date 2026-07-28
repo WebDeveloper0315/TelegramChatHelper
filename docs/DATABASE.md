@@ -133,17 +133,15 @@ erDiagram
     }
 
     user_profiles {
-        int id PK
-        int account_id FK
+        int account_id PK
         text primary_language
-        text additional_languages
         text tone_preference
         text preferred_message_length
         text emoji_usage
-        text available_hours
-        text quiet_hours
-        text auto_approve_memory_categories
-        text confidence_thresholds
+        int quiet_hours_start_minute
+        int quiet_hours_end_minute
+        timestamp created_at
+        timestamp updated_at
     }
 
     telegram_sessions {
@@ -527,9 +525,17 @@ Columns: `id`, `telegram_user_id`, `display_name`, `timezone`, `is_active`, `cre
 
 ### `user_profiles`
 
-- Unique: `account_id` (one profile per account)
-- FK: `account_id → accounts(id) ON DELETE CASCADE`
-- Check: `tone_preference IN ('casual','neutral','formal','mirror_contact')`
+The operator's reply preferences, one row per account. Created by migration `0003`.
+
+Columns: `account_id`, `primary_language`, `tone_preference`, `preferred_message_length`, `emoji_usage`, `quiet_hours_start_minute`, `quiet_hours_end_minute`, `created_at`, `updated_at`.
+
+- **`account_id` is both the primary key and the foreign key** (ADR-038). One profile per account is therefore structural rather than a separate unique index, and no additional index on `account_id` exists — the primary key already serves every lookup this table has.
+- FK: `account_id → accounts(id) ON DELETE CASCADE`. Deleting an account removes its profile without application code having to remember. SQLite enforces this only with `PRAGMA foreign_keys = ON`, which the engine applies per connection; a test asserts the pragma is on, because without it the cascade would be decorative.
+- Every column is `NOT NULL` with a server default, so the table has no nullable column standing in for "not decided yet". A preference always has a value; a default is a value.
+- Quiet hours are stored as **two integer minute offsets** rather than as times or text. A quiet period normally wraps midnight, and `22:00–08:00` compared as a pair of naive times looks empty. Integers compare correctly and need no parsing.
+- Enumerations are stored as their **string values**, not ordinals: an ordinal silently changes meaning if a member is inserted mid-enum, and it makes the file unreadable to anyone opening it.
+- Check constraints: `account_id > 0`; `tone_preference IN ('casual','neutral','formal','mirror_contact')`; `preferred_message_length IN ('short','medium','long')`; `emoji_usage IN ('none','sparing','frequent')`; both minute columns within `[0, 1440)`; `quiet_hours_start_minute <> quiet_hours_end_minute`; `updated_at >= created_at`.
+- Access is through a repository **scoped at construction** (ADR-039): no method accepts an account identifier, so no query can be issued without its scope.
 
 ### `telegram_sessions`
 
@@ -797,16 +803,19 @@ Initial migration sequence:
 |---|---|---|
 | `0001` | `schema_metadata` -- infrastructure baseline | **Applied** |
 | `0002` | `accounts` — the ownership root | **Applied** |
-| `0003` | `user_profiles`, `telegram_sessions`, `settings`, `audit_log` | Milestone 1 |
-| `0004` | `contacts`, `chats`, `conversations`, `messages`, `attachments`, `sync_cursors` | Milestone 1 |
-| `0005` | `messages_fts` and synchronisation triggers | Milestone 1 |
-| `0006` | `memories`, `memory_proposals`, `memory_revisions`, `goals` | Milestone 1 |
-| `0007` | `relationship_profiles`, `style_profiles` | Milestone 1 |
-| `0008` | `embedding_models`, `embeddings` | Milestone 1 |
-| `0009` | `analyses`, `conversation_summaries`, `conversation_plans`, `reply_suggestions`, `behavior_recommendations` | Milestone 1 |
-| `0010` | `ai_providers`, `ai_calls` | Milestone 1 |
-| `0011` | `notifications`, `retention_policies` | Milestone 1 |
-| `0012` | `plugins`, `plugin_data` | Milestone 1 |
+| `0003` | `user_profiles` — the first account-scoped table | **Applied** |
+| `0004` | `telegram_sessions`, `settings`, `audit_log` | Milestone 2 |
+| `0005` | `contacts`, `chats`, `conversations`, `messages`, `attachments`, `sync_cursors` | Milestone 3 |
+| `0006` | `messages_fts` and synchronisation triggers | Milestone 3 |
+| `0007` | `memories`, `memory_proposals`, `memory_revisions`, `goals` | Milestone 5 |
+| `0008` | `relationship_profiles`, `style_profiles` | Milestone 6 |
+| `0009` | `embedding_models`, `embeddings` | Milestone 7 |
+| `0010` | `analyses`, `conversation_summaries`, `conversation_plans`, `reply_suggestions`, `behavior_recommendations` | Milestone 8 |
+| `0011` | `ai_providers`, `ai_calls` | Milestone 8 |
+| `0012` | `notifications`, `retention_policies` | Milestone 10 |
+| `0013` | `plugins`, `plugin_data` | Milestone 12 |
+
+One migration adds one aggregate's table rather than a milestone's worth at once, so each is reviewable on its own and a failure has one cause to look for.
 
 Business tables begin at `0002`: `0001` is the infrastructure baseline described above.
 

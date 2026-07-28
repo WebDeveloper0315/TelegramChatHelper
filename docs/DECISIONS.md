@@ -39,7 +39,7 @@ Each decision must have one of the following statuses:
 - Rejected
 
 **ADR-001 through ADR-010 are Accepted.**
-**ADR-011 through ADR-037 are Proposed and require explicit approval.** ADR-011 through ADR-030 were approved for implementation at the close of the architecture stabilization session; ADR-031 through ADR-033 arose during implementation and await review.
+**ADR-011 through ADR-040 are Proposed and require explicit approval.** ADR-011 through ADR-030 were approved for implementation at the close of the architecture stabilization session; ADR-031 through ADR-040 arose during implementation and await review. ADR-040 records a defect whose fix has deliberately not been applied.
 
 ---
 
@@ -84,6 +84,9 @@ Each decision must have one of the following statuses:
 | 035 | No Generic Repository Base | Proposed |
 | 036 | No Optimistic Locking | Proposed |
 | 037 | Account Lifecycle Separated from Session Lifecycle | Proposed |
+| 038 | UserProfile Identity Is the Account | Proposed |
+| 039 | Account Scope Is a Constructor Parameter, Not a Method Argument | Proposed |
+| 040 | The CLI Does Not Configure Logging, So Log Records Reach Standard Output | Proposed |
 
 ---
 
@@ -2560,6 +2563,302 @@ Cons
 ### Related Decisions
 
 ADR-012 (Telegram adapter), ADR-035 (no generic repository base). Milestone 2 implements Session against this division.
+
+---
+
+# ADR-038
+
+## Title
+
+UserProfile Identity Is the Account
+
+Status
+
+Proposed
+
+Date
+
+2026-07-28
+
+---
+
+### Context
+
+`DOMAIN_MODEL.md` version 1.0 listed UserProfile with a `user_profile_id` surrogate key alongside `account_id`, and with fields including `display_name`, `timezone`, `available_hours`, `auto_approve_memory_categories` and `confidence_thresholds`.
+
+Implementing it raised two questions the document did not answer.
+
+**First: what does the surrogate key buy?** An account has exactly one profile, and a profile cannot exist without an account. A separate identifier would therefore always be in one-to-one correspondence with `account_id`, and would introduce a second way to name the same row. Two names for one row is how a query eventually reads by one and writes by the other.
+
+**Second: several fields already have an owner, or have no owner yet.**
+
+| Field (v1.0) | Problem |
+|---|---|
+| `display_name` | Account already has one, and it is Telegram's own name for the user |
+| `timezone` | Account already has one, validated against the IANA database |
+| `available_hours` | Can contradict `quiet_hours`; no rule says which wins |
+| `auto_approve_memory_categories` | The category vocabulary belongs to the Memory aggregate (Milestone 5) |
+| `confidence_thresholds` | The confidence scale is defined by the suggestion pipeline (Milestone 8) |
+
+---
+
+### Decision
+
+**The account identifier is the profile identity.** `account_id` is simultaneously the primary key and a foreign key to `accounts(id)` with `ON DELETE CASCADE`. There is no surrogate key.
+
+`UserProfile` carries only the preferences that shape generated replies:
+
+```
+account_id, primary_language, tone_preference,
+preferred_message_length, emoji_usage, quiet_hours,
+created_at, updated_at
+```
+
+`display_name` and `timezone` remain on Account; the profile does not restate them.
+
+`available_hours`, `auto_approve_memory_categories` and `confidence_thresholds` are **deferred**, not rejected. Each is added when the aggregate that defines its meaning exists, so that its values can be validated rather than merely stored.
+
+`quiet_hours` is a `TimeRange` in minutes past midnight rather than two times, because a quiet period normally wraps midnight and a pair of naive time values makes 22:00-08:00 look empty.
+
+---
+
+### Alternatives Considered
+
+**Keep the surrogate key.** Uniform with aggregates that genuinely need one, and would allow more than one profile per account later. But "later" is speculative, and until then the key is a second name for a row that already has one. Reintroducing it is a migration; removing it after code depends on it is a larger one.
+
+**Fold the preferences into Account.** Removes a table and a join. Rejected because Account is identity - who the user is on Telegram - and the profile is preference - how they want replies written. They change for different reasons and at different rates, and merging them would put a settings screen worth of columns in the row every other aggregate references.
+
+**Implement every v1.0 field now.** Rejected: three of them cannot be validated, because the vocabulary each draws on does not exist yet. A column that accepts anything is worse than an absent column, because data accumulates in it before the rules are known.
+
+---
+
+### Consequences
+
+Pros
+
+- One identity per profile, so no query can read by one name and write by another
+- The primary key is already the index needed for every lookup, so no additional index exists
+- Cascade deletion is expressed by the schema, not by application code that must remember to run
+- Every column has a validated domain, checked in the entity and restated as a CHECK constraint
+
+Cons
+
+- If a future requirement genuinely needs several profiles per account - for example per-contact overrides - a surrogate key must be introduced by migration
+- Callers wanting the user display name must read Account, not the profile
+
+The second is intended: it keeps one owner for that fact.
+
+---
+
+### Future Considerations
+
+Per-contact preference overrides are the likeliest reason to revisit this. They would most naturally live on the Contact relationship rather than as additional UserProfile rows, which would leave this decision intact.
+
+---
+
+### Related Decisions
+
+ADR-037 (Account lifecycle), ADR-039 (account scoping), ADR-004 (repository pattern). `DOMAIN_MODEL.md` section 5.2 is corrected accordingly.
+
+---
+
+# ADR-039
+
+## Title
+
+Account Scope Is a Constructor Parameter, Not a Method Argument
+
+Status
+
+Proposed
+
+Date
+
+2026-07-28
+
+---
+
+### Context
+
+Nearly every aggregate after Account belongs to one account: profiles, contacts, conversations, messages, memories. Each therefore needs its queries filtered by account, and a filter that is applied by convention is applied incorrectly eventually.
+
+The conventional interface takes the account per call:
+
+```python
+async def get(self, account_id: AccountId) -> UserProfile | None: ...
+async def update(self, account_id: AccountId, profile: UserProfile) -> None: ...
+```
+
+Every call site must then supply the right value, every time, for the life of the project. One omission or one stale variable returns - or overwrites - another account data. Nothing in the type system objects, and a test only catches it if it happens to exercise two accounts at once.
+
+---
+
+### Decision
+
+**A repository over account-owned data is scoped when it is constructed, and no method accepts an account identifier.**
+
+```python
+class UserProfileRepository(Protocol):
+    @property
+    def account_id(self) -> AccountId: ...
+    async def get(self) -> UserProfile | None: ...
+    async def add(self, profile: UserProfile) -> None: ...
+    async def update(self, profile: UserProfile) -> None: ...
+```
+
+Construction goes through a factory type added to `domain/ports/repository.py`:
+
+```python
+ScopedRepositoryFactory = Callable[[UnitOfWork, AccountId], R_co]
+```
+
+A use case declares the factory as a dependency and supplies the account once, inside its transaction. There is no value left for a caller to get wrong, because there is no parameter to pass.
+
+Writes are checked as well as reads. The scope makes a cross-account *read* impossible, but a caller could still hand the repository an entity built for another account, which would overwrite the wrong row. Every write therefore verifies that the entity `account_id` matches the scope, and raises `DomainValidationError` otherwise.
+
+---
+
+### Alternatives Considered
+
+**Account identifier per method.** Familiar, and one object serves every account. Rejected: correctness rests on every call site, forever, and the failure mode is silent cross-account data exposure - the single worst outcome for an application holding private conversations.
+
+**A row-level security predicate applied by the unit of work.** Attractive because it is enforced centrally and cannot be bypassed. Rejected for now: SQLite has no row-level security, so it would have to be implemented by rewriting statements, which is considerably more machinery than a constructor parameter and fails open if the rewriting misses a query shape. It becomes worth revisiting if PostgreSQL is adopted (ADR-007).
+
+**Passing the account to the unit of work.** Would scope every repository at once. Rejected: not all data is account-owned - schema metadata and the account table itself are not - so the unit of work would carry a value most of its users must ignore.
+
+---
+
+### Consequences
+
+Pros
+
+- Cross-account access is structurally impossible for reads, and rejected explicitly for writes
+- The guarantee is testable directly: the contract suite asserts, by inspecting the signatures, that no method accepts an account
+- Two scoped repositories over the same storage are the normal test setup, so isolation is exercised rather than assumed
+- The pattern extends unchanged to Contact, Conversation, Message and Memory
+
+Cons
+
+- A repository instance serves one account, so code operating across accounts constructs one per account
+- One more type (`ScopedRepositoryFactory`) alongside `RepositoryFactory`
+
+The first is a fair price: work spanning accounts is rare, and making it explicit is the point.
+
+---
+
+### Future Considerations
+
+If PostgreSQL is adopted, row-level security can be added *underneath* this decision as defence in depth. The interface would not change.
+
+---
+
+### Related Decisions
+
+ADR-004 (repository pattern), ADR-035 (no generic repository base), ADR-038 (UserProfile identity), ADR-007 (SQLite for MVP).
+
+---
+
+# ADR-040
+
+## Title
+
+The CLI Does Not Configure Logging, So Log Records Reach Standard Output
+
+Status
+
+Proposed
+
+Date
+
+2026-07-28
+
+---
+
+### Context
+
+Found while testing the `profile` commands, not by reading the code: comparing the output of two identical `profile show` invocations showed a stray line in the first.
+
+```
+2026-07-28 06:12:03 [debug    ] transaction_committed  duration_ms=12.74 events=0
+account          : 7312346003582976
+language         : en
+```
+
+`Container.create` is called from `_open` in `presentation/cli/app.py` with `configure_logging_on_start=False`, carrying this comment:
+
+> Logging is deliberately not configured here: these commands report on the application rather than run it, and reconfiguring global logging would interleave log records with their output.
+
+The intent is right; the effect is the opposite of the intent. `configure_logging` is what installs the structlog configuration. Without it, structlog falls back to its **default** configuration - a `PrintLogger` writing to standard output with no level filtering. Every record any layer emits is printed, at every level, mixed into the command own output.
+
+Confirmed directly:
+
+```
+structlog configured: False   root handlers: []
+
+$ tgassist account create 100 P
+[warning  ] migration_without_backup  detail=No backup provider is registered...
+[info     ] migration_applied         from_revision=None to_revision=0003
+[debug    ] transaction_committed     duration_ms=12.71 events=1
+Created account 7312346355339264 (P).
+```
+
+Two consequences follow. Output is polluted, which matters for any command a user might pipe or parse. And the entire `logging` configuration section - `console_enabled`, `file_enabled`, `level`, `component_levels`, the rotating file handler, the secret-redaction processors - **is ignored for every CLI command**. The redaction point is the serious one: `mask_secret_values` is installed by `configure_logging`, so records printed on this path have never passed through it.
+
+The defect predates this milestone; it was invisible until a command emitted a record. The Milestone 1.1 CLI tests assert with substrings and so did not notice.
+
+---
+
+### Decision
+
+Proposed, and **not implemented** in Milestone 1.2, because it changes behaviour outside this milestone scope.
+
+**`_open` should configure logging** using the loaded configuration - that is, call `Container.create` without suppressing it - and the CLI should default to console logging **off** rather than to no configuration at all. The original goal (clean command output) is then reached by configuration rather than by omission, and the configuration a user writes is honoured.
+
+Concretely:
+
+1. Remove `configure_logging_on_start=False` from `_open`.
+2. Have the CLI presentation layer apply an output-preserving default: console logging disabled unless the user enables it, so diagnostics are opt-in.
+3. Keep records flowing to the file handler when the user has enabled it, so operations remain diagnosable.
+
+Until this is approved, `tests/unit/test_user_profile_application.py` compares the profile fields a command prints rather than its whole output stream, with a comment pointing here. No test asserts the current behaviour is correct.
+
+---
+
+### Alternatives Considered
+
+**Leave it and filter in tests only.** Rejected: it leaves secret redaction disabled on the CLI path and leaves user configuration silently ignored. A test workaround does not fix either.
+
+**Call `structlog.configure` with a null logger in `_open`.** Suppresses the output with a smaller change. Rejected: it also discards file logging, so a user who asked for a log file would not get one, and the configuration would still be ignored - the same defect with quieter symptoms.
+
+**Send all records to standard error instead.** Fixes the pollution of standard output. Rejected as insufficient on its own: redaction and level filtering are still absent. It is a reasonable addition *after* the configuration is applied.
+
+---
+
+### Consequences
+
+If accepted
+
+- Configuration is honoured on every path, including redaction
+- Command output contains only what the command printed
+- Users can turn diagnostics on deliberately
+
+If deferred
+
+- Log records, including any containing message content once Milestone 2 begins, are printed unredacted to standard output by every CLI command
+
+The second is why this is worth deciding before Telegram integration, rather than after.
+
+---
+
+### Future Considerations
+
+A `--verbose` flag mapping to a console log level is the natural way to expose this once the configuration is applied.
+
+---
+
+### Related Decisions
+
+ADR-018 (logging and observability), ADR-024 (secret handling), ADR-011 (dependency direction). Affects `presentation/cli/app.py` only.
 
 ---
 
