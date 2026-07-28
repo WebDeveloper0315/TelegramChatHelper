@@ -2,663 +2,475 @@
 
 # Telegram AI Conversation Assistant
 
-Architecture Version: 1.0
+Architecture Version: 2.0
 
-Status: Planning
+Status: Active
+
+Last Updated: 2026-07-28
+
+---
+
+# 0. Changes in Version 2.0
+
+| Change | Reason |
+|---|---|
+| **Dependency rule corrected** (§9) | v1.0 documented the rule inverted, which would have placed infrastructure imports inside the domain layer (ADR-011) |
+| High-level diagram corrected (§2) | v1.0 showed replies flowing automatically to Telegram, contradicting ADR-010 |
+| Folder structure corrected (§10) | v1.0 nested `tests/` and `docs/` inside `src/` |
+| Concurrency model defined (§6) | Previously unspecified; determines every port signature (ADR-013) |
+| Event semantics defined (§8) | Previously unspecified; plugins depend on them |
+| Trigger policy added (§5) | The pipeline previously implied AI processing of every message |
+| Layer table added (§3) | Distinguishes layers from components, which v1.0 conflated |
 
 ---
 
 # 1. Architecture Philosophy
 
-The project follows the principles of:
+The project follows:
 
 - Clean Architecture
-- Domain-Driven Design (DDD)
-- SOLID Principles
-- Dependency Injection
-- Repository Pattern
-- Event-Driven Communication
-- Plugin-Oriented Design
+- Domain-Driven Design
+- SOLID principles
+- Dependency injection
+- Repository pattern
+- Event-driven communication
+- Plugin-oriented design
 
-Business logic must never depend directly on Telegram, AI providers, databases, or the user interface.
+**Business logic never depends on Telegram, AI providers, databases, or the user interface.** Everything outside the core business logic is replaceable.
 
-Everything outside the core business logic should be replaceable.
+The domain layer is the centre. Dependencies point inward. Nothing in the domain knows that Telegram, SQLite or any model provider exists.
 
 ---
 
 # 2. High-Level Architecture
 
-                        +----------------------+
-                        |   Desktop UI         |
-                        +----------+-----------+
-                                   |
-                                   |
-                        +----------v-----------+
-                        |  Application Layer   |
-                        +----------+-----------+
-                                   |
-        ------------------------------------------------------------
-        |            |             |            |                  |
-        |            |             |            |                  |
-+-------v----+ +------v------+ +----v-----+ +----v-----+ +---------v--------+
-| Goal       | | Memory      | | Planner  | | Analyzer | | Relationship     |
-| Manager    | | Engine      | | Engine   | | Engine   | | Engine           |
-+-------+----+ +------+------+-+----------+ +----+-----+ +---------+--------+
-        |             |                      |                     |
-        ------------------------------------------------------------
-                                   |
-                         +---------v----------+
-                         | Reply Generator    |
-                         +---------+----------+
-                                   |
-                         +---------v----------+
-                         | Human Behavior     |
-                         | Simulator          |
-                         +---------+----------+
-                                   |
-                        +----------v-----------+
-                        | Telegram Gateway     |
-                        +----------+-----------+
-                                   |
-                           Telegram Network
+```mermaid
+flowchart TB
+    subgraph PRES["Presentation Layer"]
+        UI["Desktop UI (PySide6)"]
+        CLI["Command Line Adapter"]
+    end
+
+    subgraph APP["Application Layer"]
+        UC["Use Cases"]
+        ORCH["Orchestration & Policies"]
+        CR["Composition Root"]
+    end
+
+    subgraph DOM["Domain Layer — no external dependencies"]
+        ENT["Entities & Value Objects"]
+        PORTS["Ports (Interfaces)"]
+        DS["Pure Domain Services"]
+        EV["Domain Events"]
+    end
+
+    subgraph INFRA["Infrastructure Layer — implements ports"]
+        TG["Telegram Adapter"]
+        DB["Persistence (SQLite)"]
+        AI["AI Providers"]
+        EMB["Embeddings & Vector Store"]
+        SEC["Secret Store"]
+        CFG["Configuration"]
+        LOG["Logging"]
+        SCH["Scheduler"]
+        PLG["Plugin Host"]
+    end
+
+    UI --> UC
+    CLI --> UC
+    UC --> PORTS
+    ORCH --> PORTS
+    UC --> ENT
+    UC --> DS
+    CR -.constructs.-> INFRA
+    CR -.injects.-> UC
+
+    TG -.implements.-> PORTS
+    DB -.implements.-> PORTS
+    AI -.implements.-> PORTS
+    EMB -.implements.-> PORTS
+    SEC -.implements.-> PORTS
+    CFG -.implements.-> PORTS
+    LOG -.implements.-> PORTS
+    SCH -.implements.-> PORTS
+    PLG -.implements.-> PORTS
+
+    TG <--> TN(["Telegram Network"])
+    AI <--> EXT(["AI Provider (local or cloud)"])
+```
+
+**Reading the diagram.** Solid arrows are compile-time dependencies. Dotted arrows are implementation and injection. Note that no arrow points from the domain outward, and that the Telegram adapter is reached only through ports — never directly from a use case.
 
 ---
 
-# 3. Layer Responsibilities
+# 3. Layers versus Components
 
-## Presentation Layer
+These are different axes and v1.0 conflated them.
 
-Responsible for:
+**Layers** are the dependency structure. There are exactly four, plus a composition root.
 
-- Desktop interface
-- User interaction
-- Settings
-- Notifications
-- Conversation viewer
-- Goal editor
+| Layer | Contains | May depend on |
+|---|---|---|
+| Presentation | Qt UI, CLI, view models | Application, Domain |
+| Application | Use cases, policies, event handlers, composition root | Domain (+ infrastructure, in the composition root only) |
+| Domain | Entities, value objects, ports, pure services, events, errors | Nothing |
+| Infrastructure | Adapters for every port | Domain |
 
-Never contains business logic.
+**Components** are functional units that live *within* layers. The Memory Engine, for example, has a domain part (`MemoryRanker`, `MemoryConflictDetector`), an application part (`ExtractMemoryProposals`, `ReviewMemoryProposal`) and an infrastructure part (`MemoryRepository`, `VectorStore` implementations).
 
----
-
-## Application Layer
-
-Coordinates all services.
-
-Responsible for:
-
-- Use cases
-- Dependency injection
-- Workflow orchestration
-- Command handling
-- Event handling
+Components are peers coordinated by the application layer. **The Memory Engine does not "sit below" the Conversation Engine**; both are orchestrated by use cases.
 
 ---
 
-## Domain Layer
+# 4. Core Components
 
-Contains all business rules.
+## 4.1 Telegram Gateway
 
-Includes:
+**Layer:** infrastructure, behind a domain port.
 
-- Conversation
-- Contact
-- Goal
-- Memory
-- Relationship
-- Reply
-- Summary
+Responsibilities: connect, authenticate, receive updates, read history, send messages, download media, manage reconnection and rate limits.
 
-The Domain Layer must not depend on external libraries.
+Constraints: no business logic; no database access; streams history rather than materialising it; exposes **no typing-indicator method** (ADR-023).
 
----
+Output: `TelegramUpdate` values and domain-mapped structures.
 
-## Infrastructure Layer
+## 4.2 Conversation Engine
 
-Responsible for:
+**Layers:** domain (`ConversationSegmenter`, `ContextAssembler`) + application (`AnalyzeConversation`) + infrastructure (`ConversationAnalyzer` adapter).
 
-- Telegram communication
-- AI providers
-- SQLite
-- File system
-- Logging
-- Configuration
-- Local AI models
-- Cloud AI providers
+Responsibilities: segment chats into conversations deterministically; detect topic, intent, stage and open questions; assemble token-budgeted context.
 
-Everything here can be replaced independently.
+Output: `Conversation`, `ConversationContext`, `ConversationAnalysis`.
 
----
+## 4.3 Memory Engine
 
-# 4. Core Modules
+Responsibilities: extract memory **proposals**; detect conflicts; merge duplicates; rank and retrieve; manage embeddings; apply decay to ranking.
 
-## Telegram Gateway
+Constraint: **the memory engine never writes a `Memory` directly from AI output.** It writes `MemoryProposal` records; only `ReviewMemoryProposal` promotes them (ADR-019).
 
-Responsibilities:
+Output: `MemoryProposal`, ranked `Memory` sets.
 
-- Login
-- Receive messages
-- Send messages
-- Read history
-- Detect edits
-- Typing status
-- Connection management
+## 4.4 Goal Manager
 
-No business logic.
+Responsibilities: store and activate per-contact goals; enforce one active goal per contact; supply the active goal to planning.
 
----
+Constraint: goals are always user-authored. AI may suggest a change; it never makes one.
 
-## Conversation Engine
+## 4.5 Relationship Engine
 
-Responsibilities:
+Responsibilities: compute interaction frequency, reciprocity, response times, conversation depth, topic breadth, initiation balance and engagement trend.
 
-- Parse conversation
-- Maintain context
-- Detect active topic
-- Detect conversation stage
-- Build conversation state
+Constraint: **deterministic, no LLM** (ADR-029 §3). Every metric is a published formula (`DOMAIN_MODEL.md` §10) with a minimum sample size, below which it reports `insufficient_data` rather than a number.
 
-Outputs:
+## 4.6 Emotion Analyzer
 
-ConversationContext
+Responsibilities: detect emotional state with confidence and cited evidence.
 
----
+Constraint: an assessment without evidence is invalid. Emotion informs suggestions; it never triggers an action.
 
-## Memory Engine
+## 4.7 Planner Engine
 
-Responsibilities:
+Input: `ConversationContext`, `RelationshipProfile`, active `Goal`, retrieved memories.
+Output: `ConversationPlan` — objective, direction, topics to introduce, topics to avoid, reasoning, confidence.
 
-- Extract memories
-- Update memories
-- Forget outdated information
-- Merge duplicated memories
-- Store embeddings
+Constraint: advisory; becomes stale on any new message; optional in the pipeline behind a feature flag so its value can be measured against direct generation.
 
-Outputs:
+## 4.8 Reply Generator
 
-MemoryProfile
+Output: `ReplySuggestion` — primary text, alternatives, reasoning, confidence, recommended action.
 
----
+Constraints: **no dependency on `TelegramGateway`.** It cannot send. Confidence below the low threshold forces `recommended_action ∈ {clarify, write_manually}`.
 
-## Goal Manager
+## 4.9 Human Behavior Engine
 
-Stores independent goals for every contact.
+Output: `BehaviorRecommendation` — suggested delay, send time, length, split hint, rationale.
 
-Example:
+Constraints: deterministic rules; **no gateway dependency**; never recommends sending during quiet hours unless urgent; produces recommendations only, never actions (ADR-023).
 
-Contact A
+## 4.10 Uncertainty Estimator
 
-Goal:
-Practice English
+Combines the model's self-reported confidence with verifiable signals — missing required memory, unresolved open question, ambiguous or very short message, weak retrieval scores, truncated context — into a calibrated `Confidence` whose inputs are recorded, so a low score is explainable.
 
-Contact B
+## 4.11 Plugin Host
 
-Goal:
-Professional networking
-
-Contact C
-
-Goal:
-Friendship
-
-Goals influence planning but do not force responses.
-
----
-
-## Relationship Engine
-
-Calculates:
-
-- Trust score
-- Familiarity
-- Interaction frequency
-- Conversation depth
-- Response quality
-- Engagement trend
-
-Produces:
-
-RelationshipProfile
-
----
-
-## Emotion Analyzer
-
-Detects:
-
-- Happiness
-- Sadness
-- Anger
-- Excitement
-- Stress
-- Curiosity
-- Neutral
-
-Provides confidence scores.
-
----
-
-## Planner Engine
-
-Receives:
-
-ConversationContext
-
-RelationshipProfile
-
-Goal
-
-Memory
-
-Produces:
-
-ConversationPlan
-
-Example:
-
-Current objective
-
-↓
-
-Answer question
-
-↓
-
-Ask follow-up
-
-↓
-
-Introduce new topic
-
-↓
-
-End naturally
-
----
-
-## Reply Generator
-
-Generates:
-
-- Primary reply
-- Alternative replies
-- Confidence
-- Explanation
-
-Never sends messages directly.
-
----
-
-## Human Behavior Simulator
-
-Determines:
-
-- Response timing
-- Typing duration
-- Message splitting
-- Follow-up timing
-- Conversation pacing
-
-Produces recommendations rather than directly controlling messaging.
+Discovers, loads and isolates plugins; enforces API version compatibility; wraps every hook invocation so a failing plugin is disabled rather than fatal (ADR-025).
 
 ---
 
 # 5. Data Flow
 
-Incoming Telegram Message
+## 5.1 Inbound
 
-↓
+```mermaid
+sequenceDiagram
+    participant TG as Telegram
+    participant GW as Telegram Gateway
+    participant IN as IngestMessage
+    participant UOW as UnitOfWork
+    participant BUS as EventBus
+    participant AN as Analysis Pipeline
 
-Telegram Gateway
+    TG->>GW: update
+    GW->>IN: TelegramUpdate
+    IN->>UOW: begin
+    IN->>UOW: persist message, segment conversation, advance cursor
+    UOW-->>IN: commit
+    IN->>BUS: MessageIngested (after commit)
+    BUS->>AN: deliver
+    AN->>AN: SuggestionTriggerPolicy.should_suggest()
+    Note over AN: Most messages stop here
+```
 
-↓
+Persisting a message, assigning it to a conversation and advancing the sync cursor happen in **one transaction**. Events are published only after commit, so no handler observes a fact that is later rolled back.
 
-Conversation Engine
+## 5.2 Suggestion generation — user-initiated or policy-triggered
 
-↓
-
-Memory Update
-
-↓
-
-Relationship Update
-
-↓
-
-Goal Manager
-
-↓
-
-Planner Engine
-
-↓
-
+```
+ConversationContext assembly
+   ↓  (memories retrieved, summary loaded, budget applied)
+Analysis (cached where possible)
+   ↓
+Planner (optional)
+   ↓
 Reply Generator
+   ↓
+Uncertainty calibration
+   ↓
+Behavior recommendation
+   ↓
+Persisted ReplySuggestion
+   ↓
+Presented to the user
+   ↓
+User reviews, edits, approves — or discards
+   ↓
+SendMessage use case          ← the only path that reaches Telegram
+```
 
-↓
+The step "user reviews and approves" is not a courtesy. It is the only edge in the graph that connects generated text to the network.
 
-Human Behavior Simulator
+## 5.3 Trigger policy
 
-↓
-
-UI Suggestion
-
-↓
-
-User Review
-
-↓
-
-Message Sent
-
----
-
-# 6. Storage Architecture
-
-SQLite
-
-Stores:
-
-Contacts
-
-Conversation History
-
-Goals
-
-Settings
-
-Summaries
-
-Memory Profiles
-
-Configuration
-
-Embeddings should be stored separately.
+The pipeline does **not** run for every incoming message. `SuggestionTriggerPolicy` evaluates: is the chat sync- and AI-enabled; is a reply plausibly expected; did the user request a suggestion; is the cost budget within limits; is the contact soft-deleted or blocked. Absent an explicit user request, most messages are ingested and analysed cheaply, and no model call is made.
 
 ---
 
-# 7. AI Layer
+# 6. Concurrency Model
 
-AI should be abstracted.
+Defined by ADR-013.
 
-Never call an AI model directly from business logic.
+1. **Asyncio-first.** Every I/O-performing port method is `async`.
+2. **Telegram, AI providers, embeddings and background jobs** run natively on the event loop.
+3. **SQLite runs on a single dedicated worker thread.** Async repository methods delegate to it. This makes the single-writer invariant structural and eliminates lock contention by construction.
+4. **The Qt event loop is bridged via `qasync`.** No I/O ever runs on the UI thread; the UI communicates with use cases through view models.
+5. **Pure domain services are synchronous** and free of side effects, including clock reads — time is injected (`Clock`).
+6. Long-running operations are batched and cancellable, so interruption never leaves inconsistent state.
 
-Create interfaces.
+---
 
-Example:
+# 7. Storage Architecture
 
-LLMProvider
+Single SQLite database (ADR-007), accessed exclusively through repositories (ADR-004) using SQLAlchemy Core (ADR-015). Schema in `DATABASE.md`.
 
-EmbeddingProvider
-
-EmotionClassifier
-
-SummaryGenerator
-
-Future providers should plug in without changing core logic.
+| Data | Location | Rationale |
+|---|---|---|
+| Application data | SQLite database file | One consistency domain, one backup, one encryption decision |
+| Embeddings | `embeddings` table (BLOB) | Same file: one backup, one encryption boundary (`VECTOR_SEARCH.md`) |
+| Secrets | OS credential store | Never in files or the database (ADR-021) |
+| Telegram session | TDLib encrypted store | Highest-value asset; always encrypted (ADR-022) |
+| Application logs | Rotating JSONL files | No write contention with the database (ADR-027) |
+| Audit events | `audit_log` table | Durable, queryable, append-only |
+| Attachments | Filesystem, referenced by path | Blobs do not belong in the database |
+| Archives | Separate SQLite files per year | Keeps the working set small (`DATABASE.md` §9) |
+| Configuration | YAML + environment | Deployment-scoped, reviewable (ADR-028) |
+| User settings | `settings` table | User-scoped, backed up with user data |
 
 ---
 
 # 8. Event System
 
-Internal communication should use events.
+Internal communication uses domain events. Semantics are specified because plugins depend on them (`API.md` §5.3):
 
-Examples:
+1. Asynchronous, in-process delivery.
+2. Ordered per publisher, per handler.
+3. **Handler exceptions are isolated** — logged, counted, never propagated.
+4. Repeatedly failing handlers are unsubscribed automatically and a notification is raised.
+5. At-most-once, non-durable. Events do not survive restart; anything requiring durability is a database write.
+6. Handlers must be idempotent.
+7. Events are immutable and are published only **after** the originating transaction commits.
 
-MessageReceived
-
-MemoryUpdated
-
-GoalChanged
-
-ReplyGenerated
-
-SummaryCreated
-
-RelationshipUpdated
-
-Advantages:
-
-Loose coupling
-
-Easy plugin integration
-
-Better testing
+The event catalogue is in `DOMAIN_MODEL.md` §7.
 
 ---
 
 # 9. Dependency Rules
 
-Allowed
+> **This section was inverted in version 1.0 and is corrected here per ADR-011.**
 
-UI
+## Allowed
 
-↓
+```
+presentation   → application → domain
+infrastructure → domain                       (implements ports)
+composition root → all layers                 (construction only)
+```
 
-Application
+## Forbidden
 
-↓
+```
+domain         → application | infrastructure | presentation
+domain         → any third-party library
+application    → infrastructure concrete classes
+presentation   → infrastructure
+infrastructure → application | presentation
+any module     → circular import
+```
 
-Domain
+## Rationale
 
-↓
+Dependencies point **inward**, toward the domain. Infrastructure depends on the domain because it implements interfaces the domain declares. The domain depends on nothing, which is precisely what makes it testable without Telegram, a database or a model.
 
-Infrastructure
+## Enforcement
 
-Forbidden
+The rule is checked in CI by `import-linter` contracts, not by convention. Additional architectural tests assert:
 
-Infrastructure
+- No module under `domain/` imports any third-party package.
+- `ReplyGenerator`, `ConversationPlanner` and `BehaviorRuleEngine` have no reference to `TelegramGateway` (ADR-023).
+- `AuditRepository` exposes no update or delete method.
+- Only `application/container.py` imports from `infrastructure/`.
 
-↓
-
-Domain
-
-UI
-
-↓
-
-Infrastructure
-
-Telegram
-
-↓
-
-Business Logic
+A violation fails the build.
 
 ---
 
 # 10. Folder Structure
 
-src/
+`tests/`, `docs/`, `prompts/`, `config/` and `migrations/` are **outside** `src/`. Third-party plugins are outside `src/`; the plugin *host* is inside it.
 
-    app/
-        use_cases/
-        services/
-        commands/
-        events/
-
-    domain/
-        conversation/
-        contact/
-        memory/
-        goals/
-        planner/
-        relationship/
-
-    infrastructure/
-        telegram/
-        database/
-        ai/
-        logging/
-        config/
-
-    presentation/
-        desktop/
-        widgets/
-        dialogs/
-
-    plugins/
-
-    tests/
-
-    docs/
+```
+TelegramChatHelper/
+├── pyproject.toml         .importlinter        .pre-commit-config.yaml
+├── README.md              LICENSE              CHANGELOG.md
+├── config/                prompts/             migrations/
+├── resources/             scripts/             docs/
+├── plugins/                                    # third-party plugins
+├── tests/
+│   ├── unit/ integration/ e2e/ evals/ architecture/ fakes/ data/
+└── src/tgassist/
+    ├── domain/
+    │   ├── model/         # entities, value objects
+    │   ├── ports/         # ALL interfaces
+    │   ├── services/      # pure domain services
+    │   ├── events.py      errors.py
+    ├── application/
+    │   ├── container.py   # composition root
+    │   ├── use_cases/     policies/  event_handlers/  dto.py
+    ├── infrastructure/
+    │   ├── telegram/      persistence/  ai/  embeddings/
+    │   ├── config/        logging/      security/
+    │   ├── events/        tasks/        plugins/
+    └── presentation/
+        ├── cli/           desktop/
+```
 
 ---
 
-# 11. Database Design
+# 11. AI Layer
 
-Core Tables
+AI is abstracted behind ports. **No business logic ever calls a model directly.**
 
-contacts
+- `LLMProvider` — text generation with capability negotiation (ADR-020)
+- `EmbeddingProvider` — vector computation
+- `VectorStore` — vector storage and search, deliberately separate from embedding computation
+- `PromptRepository` — versioned, registry-backed prompt loading (ADR-026)
+- `StructuredOutputValidator` — schema validation applied to every response
 
-messages
+Service ports (`ConversationAnalyzer`, `MemoryExtractor`, `ReplyGenerator`, …) stay separate per ADR-006, while a composite implementation may satisfy several with one batched call per ADR-029. That optimisation is invisible above the port boundary.
 
-conversation_summary
-
-memory
-
-goals
-
-relationship
-
-settings
-
-logs
-
-Future tables
-
-embeddings
-
-plugin_data
-
-analytics
+Details in `AI_MODELS.md`.
 
 ---
 
 # 12. Plugin System
 
-Plugins may register:
+Plugins may register: AI providers, UI panels, commands, background jobs and event handlers.
 
-Commands
+Constraints: discovery via entry points and hooks via `pluggy`; **plugins are trusted code with no sandbox**, stated plainly to users; permissions are declared and displayed but advisory in v1.0; API version compatibility is checked before loading; every hook call is isolated so a failure disables the plugin rather than the application; plugins never access the database directly, only `PluginContext`.
 
-AI Providers
-
-UI Pages
-
-Background Services
-
-Memory Sources
-
-Conversation Strategies
-
-Plugins should never modify core code directly.
+Details in `PLUGIN_SYSTEM.md`.
 
 ---
 
 # 13. Error Handling
 
-Errors should be categorized.
+Errors are categorized into a domain hierarchy. Adapters normalize provider-specific exceptions at the boundary; no SDK exception escapes into the application.
 
-Recoverable
+Families: `DomainError`, `PersistenceError`, `TelegramError`, `AIProviderError`, `ConfigurationError`, `PluginError`, `SecurityError`.
 
-Retry
-
-User Input
-
-Configuration
-
-AI Provider
-
-Telegram
-
-Unexpected
-
-All errors should include structured logging.
+Each error declares whether it is retryable, its retry policy, and how it surfaces to the user. Details in `ERROR_HANDLING.md`.
 
 ---
 
 # 14. Security
 
-Store secrets in environment variables.
+- Secrets in the OS credential store, never in files or the database (ADR-021)
+- Telegram session data always encrypted (ADR-022)
+- Database file created with owner-only permissions, verified at startup
+- Parameterized queries only
+- Central log redaction; message content excluded unless diagnostic mode is explicitly enabled
+- Untrusted conversation content is structurally delimited before entering any prompt
+- External AI providers receive data only from chats explicitly set to `cloud_allowed`
+- Append-only audit log for security- and privacy-relevant actions
 
-Encrypt sensitive local data where appropriate.
-
-Never hardcode:
-
-API Keys
-
-Passwords
-
-Tokens
-
-Session files
+Details in `SECURITY.md` and `PRIVACY.md`.
 
 ---
 
 # 15. Testing Strategy
 
-Unit Tests
+| Level | Scope | Dependencies |
+|---|---|---|
+| Architectural | Layer contracts, forbidden imports, structural constraints | None |
+| Unit | Domain services, entities, value objects | None |
+| Use case | Application logic against fakes | None |
+| Contract | Every port implementation, real and fake, against one suite | Varies |
+| Integration | Adapters against real dependencies | Marked `integration` |
+| Provider conformance | Same schemas across all LLM adapters | Network, opt-in |
+| End-to-end | Full workflows driven through the CLI | Local only |
+| Evaluation | AI output quality against a benchmark corpus | Opt-in, cost-gated |
 
-Domain Layer
+Coverage targets: domain and application >90%, repositories >85%, infrastructure >70%.
 
-Application Layer
-
-Integration Tests
-
-Telegram Gateway
-
-Database
-
-AI Providers
-
-End-to-End Tests
-
-Full conversation pipeline
-
-Target coverage:
-
-Core business logic >90%
+Details in `TESTING.md`.
 
 ---
 
 # 16. Future Scalability
 
-The architecture should support:
+The architecture supports, without redesign:
 
-Multiple Telegram accounts
+- **Multiple Telegram accounts** — `account_id` is present on every entity from the first migration
+- **Additional messaging platforms** — implement one new gateway adapter; the domain names no platform
+- **PostgreSQL** — repositories, search and vectors are all behind ports (ADR-016)
+- **Web dashboard** — a third presentation adapter alongside UI and CLI
+- **Voice and image understanding** — new analysis types over existing attachment metadata
+- **Knowledge-graph memory** — the memory category/key/value shape generalises
 
-Discord integration
-
-WhatsApp integration (if supported by applicable APIs and policies)
-
-Email integration
-
-Voice assistant
-
-Cloud synchronization
-
-Web dashboard
-
-Mobile companion application
-
-Because the Domain Layer is platform-independent, new messaging platforms should only require implementing a new gateway.
+Because the domain is platform-independent, new platforms require a new gateway and nothing else.
 
 ---
 
 # 17. Architectural Rules
 
-Never place AI logic inside the UI.
-
-Never place database code inside business logic.
-
-Never allow Telegram code inside the Domain Layer.
-
-Every module should have a single responsibility.
-
-Every external dependency should have an interface.
-
-Every feature should be independently testable.
-
-Large features should be developed incrementally.
-
-Documentation must remain synchronized with implementation.
+1. Dependencies point inward. The domain depends on nothing.
+2. No AI logic in the presentation layer.
+3. No database code in business logic.
+4. No Telegram code in the domain.
+5. Every external dependency sits behind a port.
+6. Every module has a single responsibility.
+7. Every feature is independently testable.
+8. Only the composition root constructs infrastructure.
+9. Nothing except the `SendMessage` use case can send a message.
+10. AI output never becomes permanent state without a user decision or an explicit auto-approval rule.
+11. Large features are developed incrementally.
+12. Documentation stays synchronized with implementation.

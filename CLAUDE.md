@@ -381,3 +381,15 @@ When writing code:
 - Include documentation for every public module.
 
 Always think like a senior software architect rather than only a code generator.
+
+## Decision-Making Policy
+
+When multiple technically valid solutions exist:
+
+1. Present the recommended solution first.
+2. Explain why it is recommended.
+3. Present one or two reasonable alternatives.
+4. Explain the trade-offs.
+5. Do not implement architectural changes until I approve them.
+
+Favor long-term maintainability over short-term implementation speed.

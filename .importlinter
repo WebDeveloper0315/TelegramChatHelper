@@ -1,0 +1,62 @@
+; Architectural contracts (ADR-011).
+;
+; These encode the dependency rule mechanically. A violation fails CI rather
+; than surviving review. Run with `lint-imports` or `poe arch`.
+
+[importlinter]
+root_package = tgassist
+include_external_packages = True
+
+[importlinter:contract:layers]
+name = Clean Architecture layers: dependencies point inward
+type = layers
+layers =
+    tgassist.presentation
+    tgassist.application
+    tgassist.domain
+exhaustive = False
+
+[importlinter:contract:domain-independence]
+name = Domain imports no other layer
+type = forbidden
+source_modules =
+    tgassist.domain
+forbidden_modules =
+    tgassist.application
+    tgassist.infrastructure
+    tgassist.presentation
+
+[importlinter:contract:domain-has-no-third-party]
+name = Domain imports no third-party package
+type = forbidden
+source_modules =
+    tgassist.domain
+forbidden_modules =
+    pydantic
+    pydantic_settings
+    structlog
+    typer
+    yaml
+    platformdirs
+
+[importlinter:contract:infrastructure-isolation]
+name = Infrastructure depends only on the domain
+type = forbidden
+source_modules =
+    tgassist.infrastructure
+forbidden_modules =
+    tgassist.application
+    tgassist.presentation
+
+[importlinter:contract:presentation-not-infrastructure]
+name = Presentation never imports infrastructure directly
+type = forbidden
+source_modules =
+    tgassist.presentation.cli
+    tgassist.presentation.desktop
+forbidden_modules =
+    tgassist.infrastructure
+; Presentation reaches adapters through the composition root, which is exactly
+; the intended path, so only a direct import is a violation. The other contracts
+; stay transitive because the domain must not reach infrastructure by any route.
+allow_indirect_imports = True

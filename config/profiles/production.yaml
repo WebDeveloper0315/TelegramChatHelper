@@ -1,0 +1,14 @@
+# Production profile.
+#
+# The shipped configuration. Structured file logging, full security enforcement.
+# logging.diagnostic_mode is rejected by validation in this profile: it writes
+# message content to disk, and that must be a deliberate runtime action rather
+# than a configuration-file decision.
+
+logging:
+  level: INFO
+  format: json
+
+security:
+  enforce_file_permissions: true
+  require_secret_store: true

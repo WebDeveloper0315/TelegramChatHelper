@@ -1,0 +1,209 @@
+[project]
+name = "tgassist"
+version = "0.1.0"
+description = "Privacy-first AI conversation assistant for Telegram"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "UNLICENSED" }
+authors = [{ name = "Telegram AI Conversation Assistant contributors" }]
+keywords = ["telegram", "assistant", "ai", "privacy", "desktop"]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Chat",
+]
+
+# Milestone 0 dependencies only. Subsystem dependencies (Telegram, database,
+# AI providers, embeddings, UI) are added by the milestone that introduces them,
+# so an unused subsystem is never installed.
+dependencies = [
+    "platformdirs>=4.2",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "pyyaml>=6.0",
+    "structlog>=24.1",
+    "typer>=0.12",
+]
+
+[project.scripts]
+tgassist = "tgassist.presentation.cli.app:main"
+
+[project.urls]
+Documentation = "https://github.com/example/tgassist/tree/main/docs"
+
+[dependency-groups]
+dev = [
+    "import-linter>=2.0",
+    "mypy>=1.10",
+    "poethepoet>=0.26",
+    "pre-commit>=3.7",
+    "pytest>=8.2",
+    "pytest-cov>=5.0",
+    "ruff>=0.5",
+    "types-pyyaml>=6.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tgassist"]
+
+# ---------------------------------------------------------------------------
+# Ruff — linting and formatting. Replaces Black, isort and flake8 (one tool).
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+extend-exclude = ["migrations/versions"]
+
+[tool.ruff.lint]
+select = [
+    "A",    # builtin shadowing
+    "ANN",  # missing type annotations
+    "ARG",  # unused arguments
+    "B",    # bugbear
+    "C4",   # comprehensions
+    "D",    # docstrings
+    "DTZ",  # naive datetimes -- UTC discipline (DOMAIN_MODEL.md section 4)
+    "E",    # pycodestyle errors
+    "ERA",  # commented-out code
+    "F",    # pyflakes
+    "I",    # import sorting
+    "N",    # naming
+    "PL",   # pylint
+    "PT",   # pytest style
+    "PTH",  # use pathlib
+    "RET",  # return simplification
+    "RUF",  # ruff-specific
+    "S",    # bandit security
+    "SIM",  # simplification
+    "T20",  # no print()
+    "TID",  # tidy imports
+    "UP",   # pyupgrade
+    "W",    # pycodestyle warnings
+]
+ignore = [
+    "ANN401", # Any is occasionally correct at adapter boundaries
+    "D203",   # incompatible with D211
+    "D213",   # incompatible with D212
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "D100", "D101", "D102", "D103", "D104",
+    "PLR2004", # magic values are the point of a test
+    "S101",   # assert is how tests assert
+]
+"scripts/**" = ["T201"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+docstring-code-format = true
+
+# ---------------------------------------------------------------------------
+# mypy — strict for domain and application, relaxed at adapter boundaries.
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+files = ["src", "tests"]
+strict = true
+warn_unreachable = true
+show_error_codes = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+# Third-party surfaces are often untyped; require annotations in our own code
+# without demanding perfect inference through library boundaries.
+module = "tgassist.infrastructure.*"
+warn_return_any = false
+disallow_untyped_decorators = false
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+    "-ra",
+    "-m", "not integration and not eval and not slow",
+]
+markers = [
+    "integration: requires a real external dependency (database, network, provider)",
+    "e2e: end-to-end workflow driven through the CLI",
+    "eval: live AI evaluation -- nondeterministic and costs money, never gates a commit",
+    "slow: takes more than a second",
+]
+filterwarnings = ["error"]
+
+# ---------------------------------------------------------------------------
+# Coverage
+# ---------------------------------------------------------------------------
+[tool.coverage.run]
+source = ["src/tgassist"]
+branch = true
+omit = ["*/__main__.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@overload",
+]
+
+# ---------------------------------------------------------------------------
+# Task runner (poethepoet) -- cross-platform, no extra binary, pyproject-native.
+# ---------------------------------------------------------------------------
+[tool.poe.tasks.lint]
+help = "Run ruff lint checks"
+cmd = "ruff check src tests"
+
+[tool.poe.tasks.format]
+help = "Format the codebase"
+cmd = "ruff format src tests"
+
+[tool.poe.tasks.format-check]
+help = "Verify formatting without writing"
+cmd = "ruff format --check src tests"
+
+[tool.poe.tasks.typecheck]
+help = "Run mypy"
+cmd = "mypy"
+
+[tool.poe.tasks.arch]
+help = "Verify architectural import contracts"
+cmd = "lint-imports"
+
+[tool.poe.tasks.test]
+help = "Run the default test suite"
+cmd = "pytest"
+
+[tool.poe.tasks.cov]
+help = "Run tests with coverage"
+cmd = "pytest --cov --cov-report=term-missing"
+
+[tool.poe.tasks.check]
+help = "Run every gate the CI pipeline runs"
+sequence = ["format-check", "lint", "typecheck", "arch", "test"]

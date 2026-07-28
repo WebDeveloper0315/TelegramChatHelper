@@ -1,1 +1,58 @@
+# ---------------------------------------------------------------------------
+# Secrets and user data. Nothing here may ever reach version control.
+# ---------------------------------------------------------------------------
 *.env
+.env
+.env.*
+!.env.example
+config/local.yaml
+sessions/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+backups/
+archives/
+attachments/
+exports/
+logs/
+*.log
+models/
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+
+# ---------------------------------------------------------------------------
+# Tooling caches and reports
+# ---------------------------------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# ---------------------------------------------------------------------------
+# Editors and operating systems
+# ---------------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

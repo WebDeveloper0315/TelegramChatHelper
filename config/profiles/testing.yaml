@@ -1,0 +1,14 @@
+# Testing profile.
+#
+# Used by the automated test suite. Logging is quiet and file output is disabled
+# so tests neither write to the developer's data directory nor slow down on I/O.
+
+logging:
+  level: WARNING
+  console_enabled: false
+  file_enabled: false
+  format: console
+
+security:
+  enforce_file_permissions: false
+  require_secret_store: false

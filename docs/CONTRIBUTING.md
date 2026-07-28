@@ -40,13 +40,23 @@ Avoid unnecessary complexity.
 
 Before implementing a feature:
 
-1. Read `PROJECT_SPEC.md`.
-2. Review `ARCHITECTURE.md`.
-3. Check `DECISIONS.md` for relevant architectural decisions.
-4. Verify the current milestone in `ROADMAP.md`.
-5. Ensure the proposed work aligns with project goals.
+1. Read `PROJECT_SPEC.md` for the requirement.
+2. Review `ARCHITECTURE.md` for structure and the dependency rules.
+3. Review `DOMAIN_MODEL.md` for the entities and invariants involved.
+4. Check `DECISIONS.md` for relevant architectural decisions.
+5. Verify the current milestone in `ROADMAP.md` — the authoritative sequencing.
+6. Ensure the proposed work aligns with project goals.
 
 If a change affects architecture, create or update an ADR in `DECISIONS.md`.
+
+**Non-negotiable constraints.** Some rules are enforced by architectural tests and cannot be worked around without an ADR superseding the decision behind them:
+
+- Dependencies point inward; the domain layer imports nothing (ADR-011).
+- Nothing except the `SendMessage` use case can send a Telegram message (ADR-023).
+- No component may emit synthetic typing indicators (ADR-023).
+- AI-derived memories are proposals, never direct writes (ADR-019).
+- Secret values never enter the database, logs or backups (ADR-021).
+- No external AI provider is called for a chat that is not `cloud_allowed` (ADR-024).
 
 ---
 
@@ -206,19 +216,30 @@ DEFAULT_TIMEOUT
 
 # Documentation Requirements
 
-Every significant feature should update any affected documentation.
+Every significant feature should update any affected documentation, **in the same commit as the code**.
 
-Potential updates include:
+| If you change… | Update |
+|---|---|
+| A requirement | `PROJECT_SPEC.md` |
+| Layers, components or dependency rules | `ARCHITECTURE.md`, `MASTER_ARCHITECTURE.md` |
+| An entity, invariant or domain term | `DOMAIN_MODEL.md` **first**, then `DATABASE.md` |
+| The schema | `DATABASE.md` + a reversible Alembic migration |
+| A port or contract | `API.md` |
+| AI behaviour, retrieval or providers | `AI_MODELS.md` |
+| A prompt | `PROMPTS.md` + registry version + evaluation run |
+| Embeddings or retrieval scoring | `VECTOR_SEARCH.md` |
+| A security control | `SECURITY.md` |
+| A data flow or retention default | `PRIVACY.md` |
+| An error type or retry policy | `ERROR_HANDLING.md` |
+| A configuration key | `CONFIGURATION.md` |
+| A plugin hook | `PLUGIN_SYSTEM.md` |
+| Sequencing | `ROADMAP.md` |
+| An architectural decision | `DECISIONS.md` (new ADR; never overwrite an old one) |
+| Anything user-visible | `CHANGELOG.md` |
 
-- PROJECT_SPEC.md
-- ARCHITECTURE.md
-- DATABASE.md
-- API.md
-- ROADMAP.md
-- DECISIONS.md
-- TESTING.md
+The domain model is the source from which the schema is derived, not the reverse. Changing a table without first changing `DOMAIN_MODEL.md` is backwards.
 
-Documentation should evolve with the code.
+Documentation should evolve with the code, never after it.
 
 ---
 

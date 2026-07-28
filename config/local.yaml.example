@@ -1,0 +1,14 @@
+# Copy to config/local.yaml and edit. This file is gitignored.
+#
+# Local overrides sit above the profile and below environment variables.
+#
+# NEVER put secret values in this file. Configuration holds secret *names*;
+# the values belong in the operating system credential store.
+
+# app:
+#   data_dir: D:/tgassist-data
+
+# logging:
+#   level: DEBUG
+#   component_levels:
+#     tgassist.infrastructure.config: INFO

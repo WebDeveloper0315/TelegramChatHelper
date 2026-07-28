@@ -1,0 +1,62 @@
+# Committed baseline configuration.
+#
+# Every key the application understands appears here with its default value, so
+# this file doubles as the documented reference. Built-in defaults are complete,
+# so deleting this file changes nothing; it exists to make the defaults visible
+# and diffable.
+#
+# Do NOT put secret values here. Configuration holds secret *names*; the values
+# live in the operating system credential store. See docs/CONFIGURATION.md.
+#
+# Sections arrive with the milestone that implements their subsystem. Unknown
+# keys are rejected at startup, so adding `database:` or `ai:` before Milestone 1
+# or 3 will stop the application rather than being ignored.
+
+app:
+  # Root directory for generated data. Null uses the platform data directory:
+  #   Windows  %LOCALAPPDATA%\tgassist
+  #   macOS    ~/Library/Application Support/tgassist
+  #   Linux    ~/.local/share/tgassist
+  data_dir: null
+
+  # Interface language. "system" follows the operating system.
+  locale: system
+
+logging:
+  # DEBUG | INFO | WARNING | ERROR | CRITICAL
+  level: INFO
+
+  console_enabled: true
+  file_enabled: true
+
+  # Log directory. Null uses <data_dir>/logs.
+  dir: null
+
+  # Renderer for file output. Console output is always human-readable.
+  # json    machine-parsable, one object per line
+  # console human-readable
+  format: json
+
+  # Rotation: each file is capped at max_file_mb, keeping backup_count old files.
+  max_file_mb: 50
+  backup_count: 5
+
+  # Age-based cleanup of rotated files, in days.
+  retention_days: 14
+
+  # Logs message content for troubleshooting. Requires deliberate opt-in and is
+  # rejected outright in the production profile. See docs/SECURITY.md section 9.
+  diagnostic_mode: false
+
+  # Per-logger level overrides, for example:
+  #   component_levels:
+  #     tgassist.infrastructure.telegram: DEBUG
+  component_levels: {}
+
+security:
+  # Apply owner-only permissions to directories the application creates.
+  enforce_file_permissions: true
+
+  # Refuse to start when the credential store is unavailable, rather than
+  # proceeding without session encryption. Enforced once the secret store lands.
+  require_secret_store: true

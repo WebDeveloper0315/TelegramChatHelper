@@ -1,0 +1,12 @@
+# Development profile.
+#
+# Optimised for a developer at a terminal: verbose, human-readable, and tolerant
+# of a missing credential store so the application can be run before the secret
+# store subsystem exists.
+
+logging:
+  level: DEBUG
+  format: console
+
+security:
+  require_secret_store: false
