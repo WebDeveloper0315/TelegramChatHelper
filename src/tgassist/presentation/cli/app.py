@@ -36,6 +36,12 @@ from tgassist.domain.model.chat import AiProcessingMode, Chat, ChatType
 from tgassist.domain.model.identifiers import AccountId
 from tgassist.domain.model.message import MessageType, SenderKind
 from tgassist.domain.model.query import PageRequest
+from tgassist.domain.model.tdlib import (
+    Architecture,
+    DependencyVerdict,
+    TdlibRuntime,
+    VerificationOutcome,
+)
 from tgassist.domain.model.user_profile import (
     EmojiUsage,
     MessageLength,
@@ -80,6 +86,8 @@ chat_app = typer.Typer(help="Manage conversations and what may be done with them
 app.add_typer(chat_app, name="chat")
 message_app = typer.Typer(help="Ingest and read conversation history.", no_args_is_help=True)
 app.add_typer(message_app, name="message")
+tdlib_app = typer.Typer(help="Inspect the native Telegram library.", no_args_is_help=True)
+app.add_typer(tdlib_app, name="tdlib")
 
 ProfileOption = Annotated[
     str | None,
@@ -1176,6 +1184,249 @@ def _preview(text: str | None) -> str:
     if len(flattened) <= PREVIEW_LENGTH:
         return flattened
     return flattened[: PREVIEW_LENGTH - 1] + "\u2026"
+
+
+@tdlib_app.command("doctor")
+def tdlib_doctor(
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Check the Telegram library end to end and report what is wrong.
+
+    Performs real work: it searches, hashes, loads and queries the library. It
+    does not print configuration back.
+    """
+    runtime = _open(profile, config_dir).tdlib_runtime()
+
+    typer.echo(f"platform     : {runtime.platform.key}")
+    typer.echo(f"interpreter  : {runtime.expected_architecture.value}")
+    typer.echo(f"looking for  : {runtime.platform.library_filename}")
+    typer.echo(
+        f"manifest     : {runtime.manifest_entries} trusted entr"
+        f"{'y' if runtime.manifest_entries == 1 else 'ies'} for this platform"
+    )
+    typer.echo("")
+
+    typer.echo("search:")
+    for candidate in runtime.candidates:
+        marker = "found" if candidate.exists else "  -  "
+        location = str(candidate.path) if candidate.path else "(nothing)"
+        typer.echo(f"  {marker}  {candidate.source.value:<11} {location}")
+        if not candidate.exists:
+            typer.echo(f"         {candidate.detail}")
+    typer.echo("")
+
+    for label, status, detail in _tdlib_checks(runtime):
+        marker = "ok  " if status is True else ("FAIL" if status is False else "--  ")
+        typer.echo(f"{marker} {label}: {detail}")
+
+    if runtime.dependencies is not None and runtime.dependencies.system:
+        typer.echo("")
+        typer.echo("runtime dependencies:")
+        for name in runtime.dependencies.system:
+            typer.echo(f"  system         {name}")
+        for name in runtime.dependencies.redistributable:
+            typer.echo(f"  redistributable {name}")
+        for name in runtime.dependencies.forbidden:
+            typer.echo(f"  FORBIDDEN      {name}")
+        for name in runtime.dependencies.unrecognised:
+            typer.echo(f"  UNRECOGNISED   {name}")
+
+    if runtime.is_usable:
+        typer.echo("")
+        typer.echo("The Telegram library is ready.")
+        return
+
+    typer.echo("")
+    typer.echo(f"Problem: {runtime.problem}")
+    if runtime.remedy:
+        typer.echo("")
+        typer.echo("To fix:")
+        for step in runtime.remedy:
+            for line in step.splitlines():
+                typer.echo(f"  {line}")
+    raise typer.Exit(code=EXIT_ERROR)
+
+
+@tdlib_app.command("version")
+def tdlib_version(
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Print the version the library reports.
+
+    Obtained by loading it and asking, not from configuration.
+    """
+    runtime = _open(profile, config_dir).tdlib_runtime()
+
+    if runtime.version is None:
+        typer.echo(f"No version available: {runtime.problem}", err=True)
+        raise typer.Exit(code=EXIT_ERROR)
+
+    typer.echo(f"TDLib {runtime.version}")
+    typer.echo(f"minimum supported: {runtime.minimum_version}")
+    typer.echo(f"library: {runtime.library_path}")
+
+
+@tdlib_app.command("verify")
+def tdlib_verify(
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Check the library's digest against the pinned manifest.
+
+    On a digest the manifest does not hold, prints the entry to add -- after
+    establishing where the file came from. Verification is a claim about
+    provenance, and only a person can make it (ADR-047).
+    """
+    runtime = _open(profile, config_dir).tdlib_runtime()
+
+    if runtime.selected is None or runtime.library_path is None:
+        typer.echo("No library to verify.", err=True)
+        for step in runtime.remedy:
+            typer.echo(f"  {step}", err=True)
+        raise typer.Exit(code=EXIT_ERROR)
+
+    typer.echo(f"library : {runtime.library_path}")
+    typer.echo(f"platform: {runtime.platform.key}")
+    typer.echo(f"sha256  : {runtime.digest or '(unreadable)'}")
+    typer.echo("")
+
+    if runtime.verification is VerificationOutcome.VERIFIED:
+        typer.echo("Verified: this digest is in the pinned manifest.")
+        return
+
+    typer.echo("NOT VERIFIED: this digest is not in the pinned manifest.", err=True)
+    typer.echo("", err=True)
+    for step in runtime.remedy:
+        for line in step.splitlines():
+            typer.echo(f"  {line}", err=True)
+    raise typer.Exit(code=EXIT_ERROR)
+
+
+def _not_checked(*labels: str) -> list[tuple[str, bool | None, str]]:
+    """Mark stages that were never reached.
+
+    Distinct from a failure: not checked and failed send people to different
+    places, and reporting one as the other wastes their time.
+    """
+    return [(label, None, "not checked") for label in labels]
+
+
+def _architecture_check(runtime: TdlibRuntime) -> tuple[str, bool | None, str]:
+    """Describe whether the library matches the interpreter."""
+    if runtime.architecture is Architecture.UNKNOWN:
+        return ("Architecture", None, "not a format this can read")
+    if runtime.architecture_matches:
+        return ("Architecture", True, f"{runtime.architecture.value}, matches this interpreter")
+    return (
+        "Architecture",
+        False,
+        f"{runtime.architecture.value}, but this interpreter is "
+        f"{runtime.expected_architecture.value}",
+    )
+
+
+def _dependency_check(runtime: TdlibRuntime) -> tuple[str, bool | None, str]:
+    """Describe what the library loads at runtime."""
+    report = runtime.dependencies
+    if report is None or report.verdict is DependencyVerdict.NOT_CHECKED:
+        detail = report.detail if report is not None else "not read"
+        return ("Dependencies", None, detail)
+    return ("Dependencies", report.is_acceptable, report.detail)
+
+
+def _tdlib_checks(  # noqa: PLR0911 - one exit per stage, so later stages read "not checked"
+    runtime: TdlibRuntime,
+) -> list[tuple[str, bool | None, str]]:
+    """Describe each stage of the inspection, in the order it was performed.
+
+    A stage that was never reached reports ``None`` rather than a failure: not
+    checked and failed are different things, and conflating them sends people
+    to fix the wrong stage.
+    """
+    found = runtime.selected is not None
+    checks: list[tuple[str, bool | None, str]] = [
+        (
+            "Library found",
+            found,
+            str(runtime.library_path) if found else "no candidate exists",
+        )
+    ]
+
+    if not found:
+        checks.extend(
+            _not_checked(
+                "Checksum verified",
+                "Architecture",
+                "Dependencies",
+                "Loaded",
+                "Client API",
+                "Version",
+            )
+        )
+        return checks
+
+    verified = runtime.is_verified
+    checks.append(
+        (
+            "Checksum verified",
+            verified,
+            f"sha256 {runtime.digest[:16]}..."
+            if verified and runtime.digest
+            else "digest not in the manifest",
+        )
+    )
+    if not verified:
+        checks.extend(
+            _not_checked("Architecture", "Dependencies", "Loaded", "Client API", "Version")
+        )
+        return checks
+
+    checks.append(_architecture_check(runtime))
+    if runtime.architecture is not Architecture.UNKNOWN and not runtime.architecture_matches:
+        checks.extend(_not_checked("Dependencies", "Loaded", "Client API", "Version"))
+        return checks
+
+    checks.append(_dependency_check(runtime))
+    if runtime.dependencies is not None and runtime.dependencies.verdict in {
+        DependencyVerdict.FORBIDDEN,
+        DependencyVerdict.UNRECOGNISED,
+    }:
+        checks.extend(_not_checked("Loaded", "Client API", "Version"))
+        return checks
+
+    checks.append(
+        ("Loaded", runtime.loaded, "opened" if runtime.loaded else "the platform refused it")
+    )
+    if not runtime.loaded:
+        checks.extend([("Client API", None, "not checked"), ("Version", None, "not checked")])
+        return checks
+
+    complete = not runtime.missing_symbols
+    checks.append(
+        (
+            "Client API",
+            complete,
+            "all entry points present"
+            if complete
+            else f"missing {', '.join(runtime.missing_symbols)}",
+        )
+    )
+    if not complete:
+        checks.append(("Version", None, "not checked"))
+        return checks
+
+    checks.append(
+        (
+            "Version",
+            runtime.version is not None and runtime.problem is None,
+            f"{runtime.version} (minimum {runtime.minimum_version})"
+            if runtime.version
+            else "the library did not answer",
+        )
+    )
+    return checks
 
 
 def _open(profile: str | None, config_dir: Path | None) -> Container:

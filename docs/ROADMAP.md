@@ -360,6 +360,82 @@ either, because `context` contains it. Whole-key matching was added.
 - 500,000 synthetic messages insert and page within the `DATABASE.md` §20 access-pattern targets
 - Repository account-scoping tests show no cross-account leakage
 
+### Milestone 2.0 -- Telegram Architecture Review (complete, 2026-07-28)
+
+Design only; no production code. Produced `docs/TELEGRAM_ARCHITECTURE.md` and
+ADR-047 through ADR-050.
+
+| Deliverable | Status |
+|---|---|
+| Component, sequence and state diagrams; ports; flows; threading and async model | Done |
+| Seven inconsistencies found in existing documentation, listed not worked around | Done |
+| Implementation split into nine reviewable slices, risky work front-loaded | Done |
+| Risk register with mitigations | Done |
+| No production code, no placeholders, no speculative abstractions | Confirmed |
+
+**Blocking:** ADR-047 (TDLib binary acquisition and verification). ADR-012 §3
+required this in Milestone 0; it has been carried unresolved through eight
+milestones and no Telegram slice can start without it.
+
+**Scope corrections proposed.** `sync_cursors` moves into the M2 migration;
+`conversations`, `attachments` and media download move out of M2's deliverables
+and stay in M3, matching `DATABASE.md`'s migration plan.
+
+### Milestone 2.1 -- TDLib Foundation (complete, 2026-07-28)
+
+Slice 0 of `TELEGRAM_ARCHITECTURE.md`. Retires the largest remaining technical
+risk before any Telegram functionality is written.
+
+| Deliverable | Status |
+|---|---|
+| `TdjsonLoader`: resolve, verify, load, probe -- in that order | Done |
+| Pinned checksum manifest, shipped empty; nothing trusted by default | Done |
+| Never falls back: an existing but unverified candidate is a refusal | Done -- asserted by test |
+| Entry-point check (`td_create_client_id`, `td_send`, `td_receive`, `td_execute`) | Done |
+| Version from `td_execute`, compared against `telegram.minimum_version` | Done |
+| Manifest cross-check: a recorded version must match what the library reports | Done |
+| TDLib's own logging silenced immediately after load | Done |
+| `telegram` configuration section | Done |
+| CLI: `tdlib doctor | version | verify`, performing real validation | Done |
+| Error taxonomy: not found, unverified (a `SecurityError`), load failed, incompatible | Done |
+| Fake libraries, failing openers, corrupt/old/silent/hostile scenarios | Done -- 91 tests |
+| Windows and Linux search paths, both exercised from one machine | Done |
+| Installation, troubleshooting and limitations documented | Done -- `DEVELOPMENT_WORKFLOW.md` §26 |
+| No authentication, session, sync, updates, contacts, chats, messages, media | Confirmed |
+
+**ADR-047 is Accepted.** ADR-012 §3 required this in Milestone 0; it had been
+carried unresolved through eight milestones and blocked every Telegram slice.
+
+**The manifest ships empty and there is no escape hatch.** A fresh checkout
+trusts no binary. `tgassist tdlib verify` prints the entry to add once a library
+has been obtained and its provenance established.
+
+**Closed in Milestone 2.2.** A `tdjson` was built from source at a pinned
+commit, verified self-contained, recorded in the manifest, and `tdlib doctor`
+passes every stage against it. The loader's success path is now proven against
+real native code, not only fakes.
+
+---
+
+### Milestone 2.2 -- TDLib Foundation Verified (complete, 2026-07-28)
+
+| Deliverable | Status |
+|---|---|
+| `tdjson.dll` built from source, TDLib `022d602` (1.8.66) | Done |
+| Build procedure committed as `scripts/build-tdjson.bat` | Done |
+| Build metadata recorded: compiler, CMake, commit, config, runtime, arch | Done |
+| Architecture check, from headers, before loading | Done |
+| Dependency check, from headers, before loading | Done -- rejects OpenSSL/zlib/unknown |
+| `dumpbin /dependents` agrees with this project's own PE parser | Done -- 19 imports, 0 forbidden |
+| Manifest entry recorded with full provenance | Done |
+| `tdlib doctor` green against real native code | Done -- all seven stages |
+| Version cross-check validated (library reports 1.8.66) | Done |
+| Tamper detection: one flipped byte refuses the load | Done |
+| No authentication, session, sync, or Telegram API calls | Confirmed |
+
+**Open:** only `windows-amd64` has a recorded binary. Linux and macOS have no
+build script and no entry; their recipes are documented but unverified.
+
 ---
 
 ## M2 — Telegram Connectivity & Sync

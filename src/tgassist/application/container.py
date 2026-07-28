@@ -52,6 +52,7 @@ from tgassist.application.use_cases.user_profile import (
     UpdateUserProfile,
 )
 from tgassist.domain.errors import SchemaVersionError, SecretStoreUnavailableError
+from tgassist.domain.model.tdlib import TdlibRuntime
 from tgassist.domain.ports.account_repository import AccountRepository
 from tgassist.domain.ports.chat_repository import ChatRepository
 from tgassist.domain.ports.clock import Clock
@@ -87,6 +88,7 @@ from tgassist.infrastructure.persistence import (
     user_profile_repository,
 )
 from tgassist.infrastructure.security import build_default_secret_store
+from tgassist.infrastructure.telegram import LoaderSettings, TdjsonLoader
 
 
 class Container:
@@ -461,6 +463,26 @@ class Container:
     def ensure_directories(self) -> None:
         """Create the application's directory layout."""
         self.config.paths.ensure(restrict_permissions=self.config.security.enforce_file_permissions)
+
+    def tdlib_runtime(self) -> TdlibRuntime:
+        """Inspect the native Telegram runtime without raising.
+
+        Presentation reaches the loader through here rather than importing
+        infrastructure directly (ADR-011). Returns a report even when the
+        runtime is unusable, because a diagnostic that raises tells the user
+        less than one that explains.
+        """
+        telegram = self.config.telegram
+        loader = TdjsonLoader(
+            LoaderSettings(
+                configured_path=telegram.tdjson_path,
+                data_dir=self.config.paths.data_dir,
+                minimum_version=telegram.minimum_version,
+                log_verbosity=telegram.log_verbosity,
+                search_system=telegram.search_system_library_path,
+            )
+        )
+        return loader.inspect()
 
     def permission_report(self) -> dict[str, bool | None]:
         """Report whether each existing directory is restricted to its owner.

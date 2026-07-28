@@ -242,6 +242,70 @@ class ReadOnlySecretStoreError(SecurityError):
     code = "SECURITY_SECRET_STORE_READ_ONLY"
 
 
+class TelegramRuntimeError(AppError):
+    """The Telegram native runtime is unusable.
+
+    A family rather than one error, because the remedies differ completely: an
+    absent library needs installing, an unrecognised one needs its provenance
+    established, and an old one needs upgrading. A caller that only knows "TDLib
+    failed" cannot tell the user which.
+
+    These are :class:`AppError` rather than :class:`DomainError` because nothing
+    about them is a business rule -- they describe the machine the application
+    is running on.
+    """
+
+    code = "TELEGRAM_RUNTIME_ERROR"
+
+
+class TdlibNotFoundError(TelegramRuntimeError):
+    """No candidate library exists in any searched location.
+
+    Distinct from a library that exists but is untrusted: this one is a setup
+    step the user has not performed, and the remedy is a download or a build.
+    """
+
+    code = "TELEGRAM_TDLIB_NOT_FOUND"
+
+
+class TdlibUnverifiedError(SecurityError):
+    """A library was found whose digest is not in the pinned manifest.
+
+    A :class:`SecurityError`, not merely a runtime one. ``tdjson`` is loaded
+    into this process and sees the session key, every message and the network,
+    so an unrecognised binary is a security question rather than a
+    configuration inconvenience (ADR-047).
+
+    Never resolved by searching elsewhere. Falling through to the next candidate
+    would mean an attacker who plants a library in a high-precedence location
+    gets a silent retry rather than a refusal.
+    """
+
+    code = "TELEGRAM_TDLIB_UNVERIFIED"
+
+
+class TdlibLoadFailedError(TelegramRuntimeError):
+    """A verified library could not be loaded by the platform.
+
+    Usually a missing transitive dependency -- OpenSSL or zlib on Linux, the
+    Visual C++ runtime on Windows -- or an architecture mismatch between the
+    library and the interpreter.
+    """
+
+    code = "TELEGRAM_TDLIB_LOAD_FAILED"
+
+
+class TdlibIncompatibleError(TelegramRuntimeError):
+    """The library loaded but is not one this application can use.
+
+    Either it does not export the entry points the client API requires, or it
+    reports a version below the supported minimum. Both mean the file is a real
+    TDLib but the wrong one.
+    """
+
+    code = "TELEGRAM_TDLIB_INCOMPATIBLE"
+
+
 class EventDispatchError(AppError):
     """An event could not be dispatched.
 

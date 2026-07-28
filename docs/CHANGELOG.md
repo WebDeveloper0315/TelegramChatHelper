@@ -36,6 +36,120 @@ Not every release requires every category.
 
 ## Added
 
+### Milestone 2.2 -- TDLib Foundation Verified Against Real Native Code
+
+Completes slice 0. The previous entry built the verification machinery against
+fakes; this one produced an actual `tdjson`, proved the machinery on it, and
+recorded it.
+
+**A binary was built from source**
+
+- `scripts/build-tdjson.bat` is committed and *is* the procedure. It discovers Visual Studio with `vswhere`, clones vcpkg, builds OpenSSL and zlib **statically from source**, fetches TDLib at a pinned commit **by SHA** (TDLib's newest tag is years older than its releases, so a commit is the only precise pin), and builds `tdjson`.
+- Recorded: TDLib commit `022d602…` (1.8.66), MSVC 19.51.36248, CMake 4.3.1 + Ninja, Release, vcpkg `x64-windows-static` OpenSSL 3.6.3 and zlib 1.3.2.
+
+**Verification extended beyond the checksum**
+
+- **Architecture**, read from the binary's headers *before* loading. A 32-bit library under a 64-bit interpreter otherwise fails with an `OSError` naming nothing; read first, it becomes "this is x86, we are amd64".
+- **Runtime dependencies**, likewise read before loading. This closes a hole in ADR-047 as originally written: the manifest checksums *one file*, so anything that file loads at runtime is unverified code inside the trust boundary. OpenSSL and zlib are rejected; anything unrecognised is rejected, because an allow-list that admits the unknown is not one; the Visual C++ runtime is accepted but reported.
+- PE and ELF headers are parsed directly rather than shelling out to `dumpbin` or `ldd` — those need a toolchain, differ per platform, and cannot be tested without one. Coverage is uneven and says so: PE fully, ELF architecture only, Mach-O not at all, each gap reported as *not checked* rather than passed.
+
+**Verified end to end**
+
+- `dumpbin /dependents` and this project's own PE parser **agree exactly**: 19 imports, 16 system, 3 redistributable, **zero OpenSSL, zero zlib**.
+- `tgassist tdlib doctor` passes every stage against the real library, and TDLib independently reported **1.8.66** — matching the version recorded in the manifest, so the cross-check is validated rather than merely implemented.
+- Flipping one byte fails the checksum and the library is **never loaded**: every later stage reports *not checked*.
+
+## Fixed
+
+- **The static C runtime was silently not applied.** `-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded` is governed by CMake policy `CMP0091`, which only applies to projects declaring `cmake_minimum_required(VERSION 3.15)` or later; TDLib declares 3.10, so the flag was ignored and the build stayed `/MD`. Found by reading the artefact's own imports rather than by trusting the flag. Diagnosed, reported by `doctor`, and documented with the one-line fix — deliberately not applied, because it would change the digest the committed manifest describes.
+- **A patch script silently did nothing.** An edit to the build script used `str.replace` without asserting it matched, leaving the dependency install on the dynamic triplet while CMake was configured for the static one. Caught by a monitor whose pattern included the package name, ~30 seconds before OpenSSL would have built the wrong thing.
+- **Three errors in the prose build recipe**, all found by running it: it omitted the vcpkg toolchain file, assumed a Visual Studio CMake generator the bundled CMake does not offer, and did not name `GPERF_EXECUTABLE` (vcpkg installs host tools where TDLib's `find_program` does not look).
+
+## Changed
+
+- `SECURITY.md` gains §6a, *Native Library Trust*: the seven ordered checks, why the search never falls back, why dependencies are checked at all, and the artefact verification procedure.
+- `DEVELOPMENT_WORKFLOW.md` §26 replaced with the recipe that was actually run, plus the three corrections and the static-CRT limitation.
+- `CONFIGURATION.md` §6.3 documents the full check order.
+- ADR-047's *As Implemented* section records all four added checks and the build metadata.
+
+### Milestone 2.1 -- TDLib Foundation
+
+Slice 0 of `TELEGRAM_ARCHITECTURE.md`: locating, verifying and loading the
+native Telegram library. No authentication, no session, no sync -- the objective
+was to retire the largest remaining technical risk before any Telegram
+functionality is written.
+
+**Verification**
+
+- `TdjsonLoader` performs four steps in order -- resolve, verify, load, probe -- and each failure has a distinct remedy rather than one generic "TDLib failed".
+- **A pinned checksum manifest**, shipped **empty**. Nothing is trusted until a human records a digest, having established where the file came from. `tgassist tdlib verify` prints the exact entry to add.
+- **Verification precedes loading**, so an untrusted binary is never mapped into the process. Asserted by test.
+- **The search never falls back.** A candidate that exists but fails verification is a refusal; only an *absent* candidate advances the search. Falling through would mean planting a library in a high-precedence directory earns a silent retry rather than a refusal.
+- **No escape hatch.** No configuration setting loads an unverified library. Recording an entry is one command, and an opt-out would become the documented path within a week.
+- An unverified library raises a `SecurityError`, not a configuration error: `tdjson` sees the session key, every message and the network.
+
+**Capability checks**
+
+- Required entry points: `td_create_client_id`, `td_send`, `td_receive`, `td_execute`. A build offering only the deprecated `td_json_client_*` interface is a real TDLib and the wrong one.
+- Version comes from `td_execute`, which is synchronous and needs no client, thread or network -- so ADR-048's receive loop stays in the next slice rather than being smuggled into this one.
+- **Manifest cross-check:** when an entry records a version, it is compared with what the library reports. A disagreement means a stale entry or a swapped file, and is refused.
+- TDLib's own logging is silenced immediately after loading. It defaults to verbosity 5 on standard error, which would put library chatter into command output -- the concern behind ADR-040 arriving by a different route.
+
+**CLI**
+
+- `tdlib doctor` runs the whole sequence and reports which stage failed. A stage never reached reports `not checked` rather than a failure: not checked and failed are different things, and conflating them sends people to fix the wrong stage.
+- `tdlib version` reports what the library said, not what configuration claims.
+- `tdlib verify` prints the digest and, when unrecognised, a pasteable manifest entry -- after asking for provenance.
+
+**Tests**
+
+- 91 tests, deterministic, with no binary, no compiler and no network. Fake libraries model each real failure: not a library, an old TDLib, one that loads but answers nothing, one that raises, a platform that refuses to open a file it can see.
+- Windows and Linux search paths are both exercised from whichever machine runs the suite, by injecting the platform rather than detecting it.
+
+## Fixed
+
+- **A seam that was not a seam.** `TdjsonLoader`'s opener defaulted to `open_with_ctypes` as a *default argument value*, bound at import time -- so replacing the module attribute did not reach it, and the injection point was decorative. It now resolves at construction. Found by a CLI test that could not make the success path work.
+- **`CONFIGURATION.md` §6.3 disagreed with ADR-047** on the key's name (`telegram.tdlib_library_path` against `telegram.tdjson_path`) and still offered `telegram.adapter`, which ADR-047's amendment to ADR-012 §4 withdrew. Reconciled, with implemented and specified-but-unimplemented keys now marked separately.
+
+## Changed
+
+- `DEVELOPMENT_WORKFLOW.md` §26: obtaining, installing, recording and troubleshooting `tdjson`, with supported platforms and stated operational limitations.
+- `CONFIGURATION.md`: the `telegram` section reconciled with what exists.
+
+## Architecture Decisions
+
+- **ADR-047 -- TDLib Binary Acquisition, Verification and Distribution** is now **Accepted and implemented**, with an *As Implemented* section recording three refinements: the configured path and its environment variable are one candidate rather than two (the configuration system already layers them); verification stops the search rather than falling through; and version detection uses `td_execute` rather than a client.
+
+## Scope note
+
+Thirteen source and test files were created or modified, within the twenty-file limit.
+
+### Milestone 2.0 -- Telegram Architecture Review
+
+Design only. No production code, by instruction: the objective was to minimise
+future rework by deciding the Telegram layer before building it.
+
+**Produced**
+
+- `docs/TELEGRAM_ARCHITECTURE.md` -- component and sequence diagrams, the revised gateway port, authentication and sync flows, the session state machine, threading and async model, error taxonomy, testing strategy, a risk register, and a nine-slice implementation order.
+
+**Seven inconsistencies found in existing documentation**, listed rather than worked around
+
+1. **ADR-012 §3 is overdue and blocking.** Binary acquisition was required in Milestone 0 and has been carried unresolved through eight milestones. Nothing Telegram-related can start without it.
+2. **The Session state machine conflates two independent axes.** `DOMAIN_MODEL.md` §5.3 gives one enum, but TDLib reports authorization and connection state separately and they vary independently -- so *authorized but reconnecting*, the ordinary state after any network blip, is unrepresentable.
+3. **`ROADMAP.md` M2 requires three tables `DATABASE.md` schedules for M3** (`sync_cursors`, `conversations`, `attachments`).
+4. **`API.md` §10 does not match the concurrency model**: a per-message history iterator the batch-writing engine must re-group, an unbound gateway under multi-account, and media methods with no consumer or `FileStore` behind them.
+5. **`security.require_secret_store` is still unenforced.** Harmless until now; a session key makes it real.
+6. **The Contact operator-identity invariant becomes enforceable** once `getMe` supplies the operator's own identifier.
+7. **`ARCHITECTURE.md`'s layer diagram places Telegram below Storage**, inviting the reading that the gateway depends on the database -- which `API.md` §10 forbids.
+
+## Architecture Decisions
+
+- **ADR-047 -- TDLib Binary Acquisition, Verification and Distribution** (Proposed). Resolves ADR-012 §3 at last: nothing loads unverified native code into a process holding the user's session. Checksum-pinned manifest, explicit resolution order, no automatic download, staged distribution. **Also amends ADR-012 §4**, withdrawing the planned Telethon adapter -- the fake gateway already validates the port, and Telethon is retained as a replacement path rather than a second implementation to maintain.
+- **ADR-048 -- The TDLib Update Loop Runs on a Dedicated Thread, Bridged to asyncio** (Proposed). `td_receive` is blocking and thread-affine; this applies the pattern `DatabaseExecutor` already established, with a bounded queue so backpressure is visible rather than absorbed.
+- **ADR-049 -- Session Models Authorization and Connection as Separate Axes** (Proposed). Corrects §5.3; `can_send` states the send rule once instead of leaving "ready" ambiguous.
+- **ADR-050 -- Synchronisation Cursors, Batch Boundaries and Batched Event Publication** (Proposed). Reconciles bulk ingest with ADR-031's synchronous delivery and ADR-034's single connection: the cursor advances in the same transaction as its messages, and one event is published per committed batch rather than per message.
+
 ### Milestone 1.5 -- Message Ingestion
 
 The pipeline every future source feeds: the CLI today, Telegram synchronisation

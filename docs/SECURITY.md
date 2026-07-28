@@ -123,6 +123,92 @@ Optional full-database encryption via SQLite3MultipleCiphers, per profile, key i
 
 ---
 
+# 6a. Native Library Trust
+
+`tdjson` is loaded into this process with `ctypes`. It sees the session key,
+every message, and the network. Whatever supplies it is therefore **as trusted
+as the application itself** — it is not a dependency in the ordinary sense, it
+is part of the trusted computing base.
+
+## What is checked, and in what order
+
+Each step runs only if the one before it passed, and each failure names a
+different remedy (ADR-047).
+
+| # | Check | Rejects |
+|---|---|---|
+| 1 | **Discovery** — a documented search order | Nothing found anywhere |
+| 2 | **Checksum** — SHA-256 against a pinned, committed manifest | A binary nobody recorded |
+| 3 | **Architecture** — read from the file's own headers | A library built for another machine |
+| 4 | **Dependencies** — imports read from the file's headers | Unverified code inside the trust boundary |
+| 5 | **Load** — the platform maps it | A missing transitive dependency |
+| 6 | **Entry points** — the client API is exported | A real TDLib of the wrong vintage |
+| 7 | **Version** — reported by the library, cross-checked against the manifest | Too old, or not what was recorded |
+
+Steps 3 and 4 happen **before** the library is mapped into the process. An
+untrusted or mismatched binary is never given a chance to execute.
+
+## The search never falls back
+
+The first candidate that *exists* is the one used. If it fails any check, the
+search **stops** — it does not try the next location. Falling through would mean
+that planting a library in a high-precedence directory earns a silent retry
+elsewhere rather than a refusal, and would make "which library am I actually
+running" depend on the failure mode. Only an *absent* candidate advances the
+search.
+
+There is **no configuration setting that loads an unverified library.**
+Recording an entry is one command; an opt-out would become the documented path
+within a week.
+
+## Why dependencies are checked
+
+The manifest checksums **one file**. Anything that file loads at runtime is
+inside the trust boundary and is not covered by the digest.
+
+The gap is invisible rather than noisy. CPython resolves a library path in full
+and adds its directory to the search order, so a dynamically linked `tdjson`
+with `libcrypto`, `libssl` and `zlib1` beside it **loads and works perfectly**
+while three unverified files sit inside the boundary. Nothing fails. That is why
+imports are read from the binary's headers and OpenSSL and zlib are rejected
+outright, and why the documented build links them statically — so that the
+artefact which is checksummed is the whole of what gets loaded.
+
+Imports are parsed directly rather than by shelling out to `dumpbin` or `ldd`:
+those need a toolchain present, differ per platform, and cannot be tested
+without one.
+
+## Artefact verification procedure
+
+For any `tdjson`, from any source:
+
+1. Establish **where it came from**. A checksum proves a file has not changed
+   since somebody recorded it; it proves nothing about whether they were right
+   to. This step is the one that cannot be automated.
+2. `tgassist tdlib verify` — prints the digest and, if unrecognised, the exact
+   manifest entry to add.
+3. Confirm it is **self-contained**. `tgassist tdlib doctor` lists every runtime
+   dependency and rejects OpenSSL, zlib and anything unrecognised.
+   Independently: `dumpbin /dependents` on Windows, `ldd` on Linux.
+4. Add the entry to `src/tgassist/infrastructure/telegram/tdjson_manifest.json`,
+   with `source` describing the provenance in a sentence and `version` set so
+   the cross-check in step 7 above has something to compare against.
+5. `tgassist tdlib doctor` — every stage must report `ok`.
+
+**Review a manifest change as you would any other security change.** A digest
+recorded from whatever happened to be on disk makes the whole mechanism theatre.
+
+## Limits of this
+
+- **Verified is not audited.** The checksum pins an artefact; it says nothing
+  about the code inside it.
+- **Coverage is per format.** PE is fully parsed. ELF yields architecture but
+  not imports. Mach-O is not parsed. Every gap reports *not checked* rather than
+  passing — an unverified platform must never read as a verified one.
+- **The manifest ships empty.** A fresh checkout trusts nothing, deliberately.
+
+---
+
 # 7. Session Security
 
 1. The Telegram session store is always encrypted with a key generated on first run and stored in the OS credential store.

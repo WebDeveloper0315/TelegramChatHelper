@@ -83,6 +83,23 @@ logging:
     alembic: WARNING
     sqlalchemy.engine: WARNING
 
+telegram:
+  # Path to the tdjson shared library. Null searches the documented locations:
+  # <data_dir>/tdlib/, then the platform library loader. A named file is still
+  # checksum-verified against the pinned manifest -- naming it does not trust it.
+  # See DEVELOPMENT_WORKFLOW.md, "Obtaining tdjson".
+  tdjson_path: null
+
+  # Lowest TDLib version accepted.
+  minimum_version: "1.8.0"
+
+  # TDLib's own log level, applied immediately after loading. TDLib defaults to
+  # 5 and writes to standard error; 0 keeps command output clean.
+  log_verbosity: 0
+
+  # Consider a system-installed tdjson as the last candidate.
+  search_system_library_path: true
+
 security:
   # Apply owner-only permissions to directories the application creates.
   enforce_file_permissions: true

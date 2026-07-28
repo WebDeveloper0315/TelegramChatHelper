@@ -164,6 +164,44 @@ class SecuritySection(_Section):
     )
 
 
+class TelegramSection(_Section):
+    """How the native Telegram library is located and accepted (ADR-047)."""
+
+    tdjson_path: Path | None = Field(
+        default=None,
+        description=(
+            "Explicit path to the tdjson shared library. Highest precedence, "
+            "and still checksum-verified: naming a file does not make it "
+            "trusted."
+        ),
+    )
+    minimum_version: str = Field(
+        default="1.8.0",
+        description=(
+            "Lowest TDLib version accepted. The client API this application "
+            "uses stabilised in 1.8; below it the same symbols behave "
+            "differently, which is worse than their being absent."
+        ),
+    )
+    log_verbosity: int = Field(
+        default=0,
+        ge=0,
+        le=10,
+        description=(
+            "TDLib's own log level, applied immediately after loading. It "
+            "defaults to 5 and writes to standard error, which would put "
+            "library chatter into command output."
+        ),
+    )
+    search_system_library_path: bool = Field(
+        default=True,
+        description=(
+            "Consider a system-installed tdjson as the last candidate. Turn "
+            "off to require an explicitly configured or vendored library."
+        ),
+    )
+
+
 class AppConfig(BaseSettings):
     """The complete, resolved application configuration.
 
@@ -185,6 +223,7 @@ class AppConfig(BaseSettings):
     database: DatabaseSection = Field(default_factory=DatabaseSection)
     logging: LoggingSection = Field(default_factory=LoggingSection)
     security: SecuritySection = Field(default_factory=SecuritySection)
+    telegram: TelegramSection = Field(default_factory=TelegramSection)
 
     @field_validator("profile", mode="before")
     @classmethod

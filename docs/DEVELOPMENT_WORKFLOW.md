@@ -482,3 +482,198 @@ When in doubt:
 - Prefer modularity over shortcuts.
 - Prefer documented decisions over implicit assumptions.
 - Prefer incremental progress over large, risky changes.
+---
+
+# 26. Obtaining `tdjson`
+
+Telegram connectivity needs TDLib's `tdjson` shared library. It is **not** a
+Python dependency and `uv sync` does not provide it. Everything except live
+Telegram tests runs without it, so this is only needed when working on the
+Telegram layer.
+
+`tdjson` is loaded into the application's own process and sees the session key,
+every message and the network. It is therefore checksum-verified against a
+pinned manifest before it is loaded, and nothing is trusted by default
+(ADR-047).
+
+## 26.1 Supported platforms
+
+| Platform | Manifest key | File |
+|---|---|---|
+| Windows x86-64 | `windows-amd64` | `tdjson.dll` |
+| Linux x86-64 | `linux-amd64` | `libtdjson.so` |
+| Linux ARM64 | `linux-arm64` | `libtdjson.so` |
+| macOS Apple Silicon | `darwin-arm64` | `libtdjson.dylib` |
+| macOS Intel | `darwin-amd64` | `libtdjson.dylib` |
+
+Any platform Python runs on and TDLib builds for will work; those are the ones
+the project intends to support. The application refuses a library whose reported
+TDLib version is below `telegram.minimum_version` (default `1.8.0`), because the
+client API this project uses stabilised there.
+
+## 26.2 Obtaining a library
+
+**Build it** — the highest-provenance option, and the only one where the chain
+from source to loaded library is yours. On Windows this is one command:
+
+```
+scripts\build-tdjson.bat [build-root] [tdlib-commit]
+```
+
+That script *is* the procedure. It is committed rather than described because
+an earlier prose version of this section was written without being run and was
+wrong in three places — the corrections are noted below, and a script that
+demonstrably produced the recorded binary is worth more than instructions that
+might not.
+
+It clones vcpkg, builds OpenSSL and zlib **statically** from source, fetches
+TDLib at a pinned commit, and builds the `tdjson` target. Around an hour on a
+first run, most of it OpenSSL. Requires `git` and Visual Studio 2022 or newer
+with the C++ workload; CMake and Ninja ship with Visual Studio.
+
+Three things the obvious recipe gets wrong, all found by running it:
+
+1. **`-G Ninja`, not the default generator.** The CMake bundled with Visual
+   Studio 18 offers no VS18 generator, so the IDE generator is not always
+   available even when the IDE is. Ninja ships alongside it and works.
+2. **`-DGPERF_EXECUTABLE` must be given.** vcpkg installs host tools under
+   `installed\<triplet>\tools\<port>\`, which is not on `PATH` and not
+   somewhere TDLib's `find_program` looks. Configure fails with
+   *"Could NOT find gperf"* otherwise.
+3. **The vcpkg toolchain file and triplet must both be passed**, and the
+   `install` line and the `configure` line must name the *same* triplet.
+   Mismatching them installs dynamic packages and then fails to find static
+   ones, in an error that looks like a toolchain problem rather than a typo.
+
+**On Linux and macOS**, TDLib's own build instructions apply, with OpenSSL and
+zlib linked statically. Those steps are **not scripted here and have not been
+run on this project** — a script nobody has executed is worse than none, because
+it implies a verification that did not happen.
+
+**Or obtain a prebuilt one.** TDLib publishes no binaries itself: its GitHub
+releases carry no assets. Distributions package it (`libtdjson` on several Linux
+distributions, `brew install tdlib` on macOS), and third-party builds exist on
+NuGet and PyPI. Any of these is acceptable *if* you can say where it came from —
+that sentence is what the manifest entry is *for*. Check whether it is
+dynamically linked before recording it (see the limitations below); most
+prebuilt binaries are.
+
+## 26.3 Installing it
+
+Either place it where the application looks:
+
+```
+<data_dir>/tdlib/tdjson.dll          # or libtdjson.so / .dylib
+<data_dir>/tdlib/1.8.29/tdjson.dll   # a versioned layout also works
+```
+
+or name it explicitly:
+
+```yaml
+telegram:
+  tdjson_path: D:/tools/tdlib/tdjson.dll
+```
+
+`TGASSIST_TELEGRAM__TDJSON_PATH` sets the same value from the environment.
+**Naming a file does not trust it** — a configured path is the highest
+precedence candidate, not an exemption from verification.
+
+## 26.4 Recording it in the manifest
+
+```
+tgassist tdlib verify
+```
+
+On a library that is not yet trusted this prints its digest and the exact entry
+to add. Add it to
+`src/tgassist/infrastructure/telegram/tdjson_manifest.json`, filling in `source`
+with where the file actually came from and `recorded` with today's date:
+
+```json
+{
+  "platform": "windows-amd64",
+  "sha256": "…",
+  "version": "1.8.29",
+  "source": "built from tdlib/td tag v1.8.29 with MSVC 2026",
+  "recorded": "2026-07-28"
+}
+```
+
+`version` is optional. When present it is cross-checked against what the library
+reports, which catches a stale entry pointing at a file that has been swapped.
+
+**Review a manifest change as you would any other security change.** A digest
+recorded from whatever happened to be on disk makes the whole mechanism
+theatre.
+
+Then:
+
+```
+tgassist tdlib doctor
+```
+
+## 26.5 Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `No tdjson library was found` | Nothing in any searched location | `doctor` lists every path it tried; put the file in one of them |
+| `not a binary this application trusts` | Digest not in the manifest | Establish provenance, then `tdlib verify` and add the printed entry |
+| Verification stops working after an upgrade | The bytes changed, so the digest changed | Record the new build; do **not** edit the old entry |
+| `the platform refused to load it` on Linux | Missing OpenSSL or zlib | `ldd libtdjson.so` and install what is listed as missing |
+| `the platform refused to load it` on Windows | Missing Visual C++ runtime, or a 32-bit library under 64-bit Python | Install the redistributable; check both are x64 |
+| `does not export the TDLib client API` | A pre-1.8 build with only `td_json_client_*` | Build or obtain 1.8 or newer |
+| `older than the minimum supported version` | TDLib below `telegram.minimum_version` | Upgrade, or lower the minimum if you have a reason |
+| `loaded but did not answer a version query` | The file exports the right names but is not TDLib | Check what you actually downloaded |
+| `records this digest as TDLib X, but the library reports Y` | A stale manifest entry, or a swapped file | Re-check provenance before touching the entry |
+
+`tgassist tdlib doctor` performs the whole sequence and reports which stage
+failed. A stage that was never reached reports `not checked` rather than a
+failure — not checked and failed are different things.
+
+## 26.6 Operational limitations
+
+- **The recorded Windows binary needs the Visual C++ redistributable.**
+  `scripts/build-tdjson.bat` passes `-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded`
+  to request the static C runtime, and **CMake ignores it**: that variable is
+  governed by policy `CMP0091`, which only takes effect for projects declaring
+  `cmake_minimum_required(VERSION 3.15)` or later. TDLib declares 3.10, so the
+  policy defaults to `OLD` and the runtime library stays `/MD`. The artefact
+  therefore imports `msvcp140.dll` and `vcruntime140*.dll`.
+
+  This is reported, not hidden: `tgassist tdlib doctor` lists them as
+  *redistributable* and says the target machine needs them. It is not a security
+  problem — they are Microsoft-signed components — but it is a deployment fact.
+
+  Adding `-DCMAKE_POLICY_DEFAULT_CMP0091=NEW` fixes it. The script deliberately
+  does **not** carry that flag yet, because changing it changes the artefact and
+  therefore its digest, and the committed manifest entry describes the binary
+  the script produces today. Reproducibility comes first; apply the flag and
+  re-record deliberately.
+- **The manifest ships with one entry**, for `windows-amd64`, built from source.
+  Every other platform trusts nothing and must record its own binary. This is
+  deliberate.
+- **The manifest is per-repository, not per-machine.** Two developers on
+  different platforms each add an entry; both entries are committed.
+- **A TDLib upgrade requires a manifest change**, and a stale manifest blocks
+  startup. That is the correct failure direction, but it will be inconvenient
+  at least once.
+- **There is no escape hatch.** No configuration setting loads an unverified
+  library. Recording an entry is one command, and an opt-out would become the
+  documented path within a week.
+- **Verified is not audited.** A checksum proves the file has not changed since
+  someone recorded it. It proves nothing about whether they were right to.
+- **The manifest verifies one file.** If that file loads further libraries at
+  runtime, those are inside the trust boundary and are *not* checked. This is
+  why the documented build links OpenSSL and zlib **statically**: it makes the
+  artefact that is checksummed the whole of what gets loaded.
+
+  The gap is easy to miss precisely because nothing breaks. CPython resolves a
+  library path in full and adds that directory to the search order
+  (`LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR`), so a dynamically linked `tdjson` with
+  `libcrypto`, `libssl` and `zlib1` beside it loads and works perfectly — while
+  three unverified files sit inside the trust boundary.
+
+  A `tdjson` obtained elsewhere is likely to be dynamically linked. Check before
+  recording it: `dumpbin /dependents tdjson.dll` on Windows, `ldd libtdjson.so`
+  on Linux. If it names OpenSSL or zlib, the checksum covers less than it
+  appears to, and the manifest `source` field should say so.

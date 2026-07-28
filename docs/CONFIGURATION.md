@@ -112,8 +112,8 @@ validation, unknown-key rejection, origin tracking, immutability and masking.
 
 **Sections are added by the milestone that implements their subsystem.** Unknown
 keys are rejected, so adding `database:` or `ai:` before Milestone 1 or 3 stops
-startup rather than being ignored. Implemented today: `app`, `logging`,
-`security`. The remaining sections in §6 are the specification those milestones
+startup rather than being ignored. Implemented today: `app`, `database`, `logging`,
+`security`, and the native-library keys of `telegram`. The remaining sections in §6 are the specification those milestones
 implement against.
 
 ---
@@ -144,18 +144,53 @@ Complete key reference. Types, defaults and descriptions.
 
 ## 6.3 `telegram`
 
+**Implemented** as of Milestone 2.1 — the native library only:
+
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `telegram.adapter` | enum | `tdlib` | `tdlib` \| `telethon` (ADR-012) |
-| `telegram.api_id` | int | — | From my.telegram.org; required |
+| `telegram.tdjson_path` | path | `null` | Explicit path to the `tdjson` shared library. Highest precedence, and **still checksum-verified** — naming a file does not trust it |
+| `telegram.minimum_version` | str | `1.8.0` | Lowest TDLib version accepted. The client API this project uses stabilised in 1.8 |
+| `telegram.log_verbosity` | int | `0` | TDLib's own log level, applied immediately after loading. TDLib defaults to 5 on standard error |
+| `telegram.search_system_library_path` | bool | `true` | Consider a system-installed `tdjson` as the last candidate |
+
+The library is searched for in this order, and **the first candidate that
+exists is the one used**: the configured path, then `<data_dir>/tdlib/`, then
+the platform library loader. A candidate that exists but fails verification is
+a refusal, not a reason to try the next one (ADR-047).
+
+A library that is found is then checked, in order, before it is loaded:
+checksum against the pinned manifest, architecture against this interpreter,
+and runtime dependencies against the allow-list. Only then is it mapped into
+the process, its entry points confirmed and its version queried. `tgassist
+tdlib doctor` reports each stage; a stage that was never reached says *not
+checked* rather than reporting a failure.
+
+There is no setting that loads an unverified library. See `SECURITY.md` §6a for
+why, and `DEVELOPMENT_WORKFLOW.md` §26 for obtaining, installing and recording
+one.
+
+**Specified, not yet implemented** — each arrives with the slice that reads it
+(`TELEGRAM_ARCHITECTURE.md` §14):
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `telegram.api_id` | int | — | From my.telegram.org; required for authentication |
 | `telegram.api_hash_ref` | string | `TELEGRAM_API_HASH` | **Secret store name**, not the value |
 | `telegram.session_dir` | path | `{data_dir}/sessions` | Encrypted session store |
-| `telegram.tdlib_library_path` | path | auto-detect | Path to `tdjson`; TDLib adapter only |
 | `telegram.device_model` | string | `Desktop` | Reported to Telegram |
 | `telegram.reconnect_max_attempts` | int | `10` | Before giving up |
 | `telegram.reconnect_base_delay_s` | float | `2.0` | Exponential base |
 | `telegram.flood_wait_ceiling_s` | int | `300` | Above this, raise rather than wait |
 | `telegram.request_timeout_s` | int | `30` | Per API call |
+
+`telegram.adapter` is **withdrawn**. Version 1.0 offered `tdlib | telethon`;
+ADR-047 amended ADR-012 §4 to drop the planned Telethon adapter, so a key
+selecting between two adapters would choose between one. Telethon remains a
+replacement path if TDLib packaging fails, which would be a code change rather
+than a setting.
+
+`telegram.tdlib_library_path` is **renamed** `telegram.tdjson_path`, matching
+ADR-047 and the file it actually names.
 
 ## 6.4 `sync`
 
