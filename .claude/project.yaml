@@ -1,0 +1,17 @@
+# .claude/project.yaml
+
+project:
+  name: Telegram AI Conversation Assistant
+  architecture: clean
+  language: python
+  dependency_manager: uv
+  database: sqlite
+  ai:
+    providers:
+      - anthropic
+      - openai
+      - ollama
+  testing:
+    framework: pytest
+  documentation:
+    update_required: true
