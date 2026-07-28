@@ -4,6 +4,11 @@ Uses SQLAlchemy Core rather than the ORM (ADR-015), and runs every database
 operation on one dedicated worker thread (ADR-013).
 """
 
+from tgassist.infrastructure.persistence.accounts import (
+    AccountMapper,
+    SqlAccountRepository,
+    account_repository,
+)
 from tgassist.infrastructure.persistence.cursor import Cursor
 from tgassist.infrastructure.persistence.engine import MEMORY_URL, SqliteDatabase, build_url
 from tgassist.infrastructure.persistence.executor import DatabaseExecutor
@@ -22,14 +27,17 @@ from tgassist.infrastructure.persistence.unit_of_work import (
 
 __all__ = [
     "MEMORY_URL",
+    "AccountMapper",
     "AlembicMigrationRunner",
     "Cursor",
     "DatabaseExecutor",
     "KeysetPaginator",
     "Repository",
+    "SqlAccountRepository",
     "SqlAlchemyUnitOfWork",
     "SqliteDatabase",
     "UnitOfWorkFactory",
+    "account_repository",
     "build_alembic_config",
     "build_url",
     "metadata",

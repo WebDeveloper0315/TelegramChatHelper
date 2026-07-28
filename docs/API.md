@@ -487,7 +487,7 @@ Condensed; all follow the §7 common contract.
 
 | Repository | Key methods |
 |---|---|
-| `AccountRepository` | `add`, `get`, `get_active`, `update`, `list`, `purge` |
+| `AccountRepository` | `add`, `get`, `get_by_telegram_id`, `get_active`, `list_accounts`, `set_active` — **implemented**, see below |
 | `UserProfileRepository` | `get`, `upsert`, `update_preferences` |
 | `SessionRepository` | `get`, `upsert`, `set_state`, `clear` |
 | `AttachmentRepository` | `add`, `list_by_message`, `mark_downloaded`, `delete`, `total_size` |
@@ -509,6 +509,35 @@ Condensed; all follow the §7 common contract.
 | `AuditRepository` | `append`, `list` — **no update or delete methods exist** |
 
 `AuditRepository` deliberately omits mutation methods. Append-only is expressed in the interface, not merely in policy.
+
+## `AccountRepository`
+
+```python
+class AccountRepository(Protocol):
+    async def add(account: Account) -> None
+    async def get(account_id: AccountId) -> Account | None
+    async def get_by_telegram_id(telegram_user_id: TelegramUserId) -> Account | None
+    async def get_active() -> Account | None
+    async def list_accounts(request: PageRequest) -> Page[Account]
+    async def set_active(account_id: AccountId, now: datetime) -> Account
+```
+
+Six operations, each traceable to a caller that exists. There is no `update`,
+`delete`, `exists` or `count`: a method with no caller has no test, no measured
+query and no index.
+
+Deletion is deliberately absent. Removing an Account must remove everything it
+owns, transactionally and across every table — the purge in `PRIVACY.md` §7.
+A partial version now would appear to work while leaving orphans in tables that
+do not exist yet. Milestone 11 owns it.
+
+Account is the ownership root, so unlike every other repository this one is
+**not** account-scoped: there is no outer scope to scope it to.
+
+`set_active` deactivates before activating, because the partial unique index
+permits only one active row and the reverse order would violate it
+mid-statement. Both writes happen in the caller's transaction, so the invariant
+is never briefly broken and never left broken by a failure between them.
 
 ## `MessageSearchPort`
 

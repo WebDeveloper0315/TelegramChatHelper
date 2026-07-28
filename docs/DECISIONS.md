@@ -39,7 +39,7 @@ Each decision must have one of the following statuses:
 - Rejected
 
 **ADR-001 through ADR-010 are Accepted.**
-**ADR-011 through ADR-036 are Proposed and require explicit approval.** ADR-011 through ADR-030 were approved for implementation at the close of the architecture stabilization session; ADR-031 through ADR-033 arose during implementation and await review.
+**ADR-011 through ADR-037 are Proposed and require explicit approval.** ADR-011 through ADR-030 were approved for implementation at the close of the architecture stabilization session; ADR-031 through ADR-033 arose during implementation and await review.
 
 ---
 
@@ -83,6 +83,7 @@ Each decision must have one of the following statuses:
 | 034 | Single Connection and Serialized Transactions | Proposed |
 | 035 | No Generic Repository Base | Proposed |
 | 036 | No Optimistic Locking | Proposed |
+| 037 | Account Lifecycle Separated from Session Lifecycle | Proposed |
 
 ---
 
@@ -2467,6 +2468,98 @@ Cons
 ### Related Decisions
 
 ADR-013 (concurrency), ADR-019 (memory approval and revisions), ADR-034 (serialized transactions), ADR-016 (PostgreSQL path).
+
+---
+
+# ADR-037
+
+## Title
+
+Account Lifecycle Separated from Session Lifecycle
+
+Status
+
+Proposed
+
+Date
+
+2026-07-28
+
+---
+
+### Context
+
+`DOMAIN_MODEL.md` version 1.0 gave the Account aggregate this lifecycle:
+
+```
+created → authenticating → active → suspended → logged_out → deleted
+```
+
+while giving it a single boolean, `is_active`, to represent it. A boolean cannot express six states, so implementing the aggregate forced the question of what the missing five were for.
+
+Comparing them against `Session` (section 5.3) showed the answer: they were already modelled there.
+
+| Account state (v1.0) | Also a Session state? |
+|---|---|
+| `authenticating` | Yes — `awaiting_phone`, `awaiting_code`, `awaiting_password` |
+| `logged_out` | Yes — `logged_out` |
+| `active` | Partly — Session's `ready` |
+| `created`, `suspended`, `deleted` | No |
+
+Three of the six duplicate Session's states, and Session models them properly as a state machine with defined transitions. Two entities would have owned the answer to "is this account authenticated", and two owners of one fact eventually disagree — usually at the moment a connection drops and only one of them is updated.
+
+---
+
+### Decision
+
+**Account owns only the lifecycle it genuinely has**, which is whether the user has selected it:
+
+```
+created → active ⇄ inactive → deleted
+```
+
+represented by `is_active`, with `created` and `deleted` being the presence or absence of the row.
+
+**Session owns authentication state**, unchanged from `DOMAIN_MODEL.md` section 5.3.
+
+`suspended` is dropped rather than reassigned. It described a state no code produced and no user action reached, and its meaning was never defined — a suspended account is either inactive (which `is_active` covers) or logged out (which Session covers).
+
+The single-active invariant is enforced by a **partial unique index** on `is_active`, so a second activation fails at the database rather than depending on every future caller remembering to deactivate first.
+
+`DOMAIN_MODEL.md` section 5.1 is corrected accordingly.
+
+---
+
+### Consequences
+
+Pros
+
+- One owner for authentication state, so the two cannot disagree
+- `is_active` is sufficient for the lifecycle Account actually has, so no field is speculative
+- The invariant is structural rather than conventional
+- Milestone 2 inherits an unambiguous division: Session handles the auth state machine, Account records which one the user selected
+
+Cons
+
+- Multi-account switching cannot express "this account is temporarily unavailable because its session dropped". That is a *derived* state — inactive Account plus disconnected Session — and computing it at the point of display is better than storing a third copy that can go stale.
+- `DOMAIN_MODEL.md` changes, so anyone who read the original lifecycle must re-read it
+
+---
+
+### Alternatives Considered
+
+| Option | Pros | Cons |
+|---|---|---|
+| Account owns only selection (chosen) | One owner per fact; no speculative fields | Availability must be derived at display time |
+| Full status enum on Account | Matches the documented lifecycle literally | Duplicates Session; two owners of one fact |
+| Status enum on Account, remove Session's | One state machine | Conflates "which account" with "is it connected"; multi-account would need per-account auth state anyway |
+| Leave undecided until Milestone 2 | No decision now | The Account table is written in this milestone, and adding or removing a status column later is a migration plus a rewrite of everything that reads it |
+
+---
+
+### Related Decisions
+
+ADR-012 (Telegram adapter), ADR-035 (no generic repository base). Milestone 2 implements Session against this division.
 
 ---
 

@@ -116,6 +116,30 @@ class UnknownConfigurationKeyError(ConfigurationError):
     code = "CONFIG_UNKNOWN_KEY"
 
 
+class DomainValidationError(DomainError, ValueError):
+    """A value violates a domain invariant.
+
+    Inherits from ``ValueError`` as well as ``DomainError``, because it is
+    genuinely both: an invalid argument in Python's vocabulary, and a broken
+    business rule in this application's. The dual inheritance means idiomatic
+    ``except ValueError`` still works while the error also carries a code and a
+    user-facing message, so it can reach a person without a traceback.
+    """
+
+    code = "DOMAIN_VALIDATION"
+
+
+class ConflictError(DomainError):
+    """The requested change conflicts with something that already exists.
+
+    Distinct from ConstraintViolationError, which reports a database constraint
+    after the fact. This is raised by a use case that checked first, so the
+    message can name the conflict in domain terms rather than naming a column.
+    """
+
+    code = "DOMAIN_CONFLICT"
+
+
 class PersistenceError(AppError):
     """Storage could not satisfy a request.
 

@@ -31,3 +31,23 @@ class DomainEvent:
     def event_name(cls) -> str:
         """Return the event's name, used in logs and subscriptions."""
         return cls.__name__
+
+
+@dataclass(frozen=True, slots=True)
+class AccountCreated(DomainEvent):
+    """An account was added to this installation.
+
+    Carries identifiers rather than the entity: an event is a fact about what
+    happened, and embedding a whole entity would let a handler act on a snapshot
+    that may already be stale by the time it runs.
+    """
+
+    account_id: int
+    is_active: bool
+
+
+@dataclass(frozen=True, slots=True)
+class AccountActivated(DomainEvent):
+    """The application switched to operating a different account."""
+
+    account_id: int

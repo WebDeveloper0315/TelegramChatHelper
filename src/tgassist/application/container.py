@@ -23,7 +23,14 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
 
+from tgassist.application.use_cases.account import (
+    CreateAccount,
+    GetAccount,
+    ListAccounts,
+    SetActiveAccount,
+)
 from tgassist.domain.errors import SchemaVersionError, SecretStoreUnavailableError
+from tgassist.domain.ports.account_repository import AccountRepository
 from tgassist.domain.ports.clock import Clock
 from tgassist.domain.ports.database import HealthReport
 from tgassist.domain.ports.event_bus import EventBus
@@ -47,6 +54,7 @@ from tgassist.infrastructure.persistence import (
     AlembicMigrationRunner,
     SqliteDatabase,
     UnitOfWorkFactory,
+    account_repository,
 )
 from tgassist.infrastructure.security import build_default_secret_store
 
@@ -205,6 +213,38 @@ class Container:
     def migrations(self) -> AlembicMigrationRunner:
         """Return the migration runner."""
         return self._migrations
+
+    @property
+    def accounts(self) -> RepositoryFactory[AccountRepository]:
+        """Return the account repository factory.
+
+        A factory, not a repository: a repository belongs to one transaction,
+        and handing out a long-lived one would keep a closed transaction alive.
+        """
+        return account_repository
+
+    # -- Use cases --------------------------------------------------------
+    #
+    # Built on demand rather than held, because a use case is a small object
+    # over injected collaborators and caching one would only add lifetime
+    # questions. Each receives exactly the dependencies it needs, which is what
+    # keeps the container from becoming a service locator.
+
+    def create_account(self) -> CreateAccount:
+        """Build the account creation use case."""
+        return CreateAccount(self._uow_factory, self.accounts, self._clock, self._ids)
+
+    def get_account(self) -> GetAccount:
+        """Build the account lookup use case."""
+        return GetAccount(self._uow_factory, self.accounts)
+
+    def list_accounts(self) -> ListAccounts:
+        """Build the account listing use case."""
+        return ListAccounts(self._uow_factory, self.accounts)
+
+    def set_active_account(self) -> SetActiveAccount:
+        """Build the account activation use case."""
+        return SetActiveAccount(self._uow_factory, self.accounts, self._clock)
 
     def repository[R](self, factory: RepositoryFactory[R], uow: UnitOfWork) -> R:
         """Build a repository bound to an open unit of work.

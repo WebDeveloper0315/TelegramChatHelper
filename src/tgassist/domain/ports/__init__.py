@@ -5,6 +5,7 @@ their implementations -- is what allows the domain to be exercised without a
 database, a network or a model. See ``docs/API.md``.
 """
 
+from tgassist.domain.ports.account_repository import AccountRepository
 from tgassist.domain.ports.clock import Clock
 from tgassist.domain.ports.database import Database, HealthReport, PragmaState
 from tgassist.domain.ports.event_bus import EventBus, EventHandler, Subscription
@@ -21,6 +22,7 @@ from tgassist.domain.ports.secret_store import SecretStore
 from tgassist.domain.ports.unit_of_work import UnitOfWork, UnitOfWorkFactory
 
 __all__ = [
+    "AccountRepository",
     "Clock",
     "Database",
     "EventBus",

@@ -36,6 +36,64 @@ Not every release requires every category.
 
 ## Added
 
+### Milestone 1.1 -- Account Aggregate
+
+The first real business aggregate, exercising the whole architecture end to end:
+domain, repository, mapper, migration, unit of work, dependency injection, CLI,
+tests and documentation -- with no Telegram or AI involved.
+
+**Domain**
+
+- `Account` -- frozen, self-validating, with `activated`, `deactivated` and `renamed` returning new instances. Each returns `self` when the change is a no-op, so a redundant call does not move `updated_at` and make nothing look like something.
+- `AccountId` and `TelegramUserId` as `NewType` aliases: statically non-interchangeable under `mypy --strict`, with no wrapping noise at call sites.
+- `validate_timezone` -- IANA identifiers only, resolved through `zoneinfo`. A fixed offset is refused because it cannot express daylight saving, and reply-timing advice is computed against local hours.
+- `DomainValidationError`, inheriting both `DomainError` and `ValueError`, so idiomatic `except ValueError` still works while the error carries a code and a user-facing message.
+- `ConflictError` for a conflict detected before writing, so the message names the conflict rather than a column.
+- `AccountCreated` and `AccountActivated` events.
+
+**Persistence**
+
+- Migration `0002`: the `accounts` table with four check constraints and two unique indexes.
+- A **partial unique index** on `is_active` makes the single-active invariant structural: a second activation fails at the database rather than depending on every caller remembering to deactivate first. Declared for both SQLite and PostgreSQL.
+- `AccountMapper` with a round-trip test and a column-coverage test that fails the moment a migration adds a column the mapper does not write.
+- `SqlAccountRepository` -- six operations, each traceable to a caller that exists.
+
+**Application**
+
+- `CreateAccount`, `GetAccount`, `ListAccounts`, `SetActiveAccount`. Separate classes rather than one service, because a class states its dependencies in its constructor and a shared service would demand everything for everyone.
+- The first account created becomes active automatically, so a fresh installation is not left in a state where nothing works for no visible reason.
+
+**CLI**
+
+- `account create`, `account show`, `account list`, `account activate`.
+
+**Tests**
+
+- 579 passing. Both repository implementations run the Milestone 1.0 contract suite plus account-specific obligations, and a further suite asserts they agree with each other.
+- Migration tests assert the check constraints and the partial index actually reject bad rows, rather than merely that the table exists.
+
+**Dependencies**
+
+- Added `tzdata`, required for IANA timezone resolution on Windows, which has no system timezone database.
+
+## Fixed
+
+- **Domain validation escaped as an unhandled traceback.** Invariant failures raised bare `ValueError`, which is not in the taxonomy the CLI catches, so an invalid timezone showed a stack trace instead of a message. Found by exercising the CLI rather than by a test, which is the argument for the CLI existing.
+
+## Changed
+
+- `DOMAIN_MODEL.md` §5.1: Account's lifecycle corrected, invariants stated in full, deferred fields named with reasons, and the identifier implementation note added.
+- `DATABASE.md`: the `accounts` table documented as implemented; business migrations renumbered from `0002` to `0003` onward.
+- `API.md` §9: the implemented `AccountRepository` interface, and why it has no `delete`.
+
+## Architecture Decisions
+
+- **ADR-037 -- Account Lifecycle Separated from Session Lifecycle** (Proposed). The documented lifecycle named six states while providing one boolean, and three of the six duplicated Session's. Two entities would have owned "is this account authenticated" and would eventually have disagreed. Account now owns only whether the user selected it.
+
+## Scope note
+
+Sixteen source files were modified or created, within the twenty-file limit.
+
 ### Milestone 1.0 -- Repository Contracts
 
 **Domain**

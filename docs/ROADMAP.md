@@ -190,6 +190,21 @@ flowchart LR
 
 ---
 
+### Milestone 1.1 -- Account Aggregate (complete, 2026-07-28)
+
+| Deliverable | Status |
+|---|---|
+| `Account` entity: identity, lifecycle, invariants, validation | Done |
+| Migration `0002` with check constraints and a partial unique index | Done |
+| `AccountMapper` with round-trip and column-coverage tests | Done |
+| `AccountRepository`: six operations, each with a caller | Done |
+| Use cases: create, get, list, set active | Done |
+| CLI: `account create | show | list | activate` | Done |
+| Both implementations pass the shared contract suite | Done -- 579 tests |
+| No Contact, Conversation, Message, Goal, Memory or Telegram | Confirmed |
+
+---
+
 ## M1 — Persistence Core
 
 **Complexity:** L · **Depends on:** M0

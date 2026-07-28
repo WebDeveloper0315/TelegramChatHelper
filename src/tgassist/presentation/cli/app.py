@@ -26,7 +26,9 @@ import typer
 
 from tgassist import __version__
 from tgassist.application.container import Container
+from tgassist.application.use_cases.account import CreateAccountRequest
 from tgassist.domain.errors import AppError, ConfigurationError
+from tgassist.domain.model.query import PageRequest
 from tgassist.domain.services.sensitivity import is_sensitive_key
 
 MASKED = "********"
@@ -55,6 +57,8 @@ config_app = typer.Typer(help="Inspect and validate configuration.", no_args_is_
 app.add_typer(config_app, name="config")
 db_app = typer.Typer(help="Inspect and migrate the database.", no_args_is_help=True)
 app.add_typer(db_app, name="db")
+account_app = typer.Typer(help="Manage Telegram accounts.", no_args_is_help=True)
+app.add_typer(account_app, name="account")
 
 ProfileOption = Annotated[
     str | None,
@@ -358,6 +362,117 @@ def _run_async(container: Container, coro: Coroutine[Any, Any, None]) -> None:
         typer.echo(f"Error: {exc.user_message}", err=True)
         typer.echo(f"  {exc.code}: {exc.message}", err=True)
         raise typer.Exit(code=EXIT_ERROR) from exc
+
+
+@account_app.command("create")
+def account_create(
+    telegram_user_id: Annotated[
+        int, typer.Argument(help="The Telegram user id this account belongs to.")
+    ],
+    display_name: Annotated[str, typer.Argument(help="A label for this account.")],
+    timezone: Annotated[
+        str, typer.Option("--timezone", "-t", help="IANA timezone identifier.")
+    ] = "UTC",
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Add an account. The first account created becomes the active one.
+
+    Telegram authentication does not exist yet, so the identifier is supplied
+    rather than discovered. From Milestone 2 it comes from the logged-in
+    session, and this command becomes a development affordance.
+    """
+    container = _open(profile, config_dir)
+
+    async def run() -> None:
+        await container.start_database()
+        account = await container.create_account().execute(
+            CreateAccountRequest(
+                telegram_user_id=telegram_user_id,
+                display_name=display_name,
+                timezone=timezone,
+            )
+        )
+        typer.echo(f"Created account {account.id} ({account.display_name}).")
+        if account.is_active:
+            typer.echo("It is now the active account.")
+
+    _run_async(container, run())
+
+
+@account_app.command("show")
+def account_show(
+    account_id: Annotated[
+        int | None,
+        typer.Argument(help="Account to show. Omit for the active account."),
+    ] = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Show one account."""
+    container = _open(profile, config_dir)
+
+    async def run() -> None:
+        await container.start_database()
+        account = await container.get_account().execute(account_id)
+        if account is None:
+            typer.echo("No account found." if account_id else "No account is active.")
+            raise typer.Exit(code=EXIT_ERROR)
+        typer.echo(f"id               : {account.id}")
+        typer.echo(f"telegram user id : {account.telegram_user_id}")
+        typer.echo(f"display name     : {account.display_name}")
+        typer.echo(f"timezone         : {account.timezone}")
+        typer.echo(f"active           : {account.is_active}")
+        typer.echo(f"created          : {account.created_at.isoformat()}")
+        typer.echo(f"updated          : {account.updated_at.isoformat()}")
+
+    _run_async(container, run())
+
+
+@account_app.command("list")
+def account_list(
+    limit: Annotated[int, typer.Option("--limit", "-n", help="Rows per page.")] = 20,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """List accounts, newest first."""
+    container = _open(profile, config_dir)
+
+    async def run() -> None:
+        await container.start_database()
+        page = await container.list_accounts().execute(PageRequest(limit=limit))
+        if not page:
+            typer.echo("No accounts.")
+            return
+        for account in page:
+            marker = "*" if account.is_active else " "
+            typer.echo(
+                f"{marker} {account.id:>6}  {account.display_name:<24} "
+                f"{account.timezone:<20} telegram:{account.telegram_user_id}"
+            )
+        typer.echo("")
+        typer.echo("* = active account")
+        if page.has_more:
+            typer.echo("More accounts available; raise --limit to see them.")
+
+    _run_async(container, run())
+
+
+@account_app.command("activate")
+def account_activate(
+    account_id: Annotated[int, typer.Argument(help="Account to make active.")],
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Switch which account the application operates."""
+    container = _open(profile, config_dir)
+
+    async def run() -> None:
+        await container.start_database()
+        account = await container.set_active_account().execute(account_id)
+        typer.echo(f"Account {account.id} ({account.display_name}) is now active.")
+
+    _run_async(container, run())
 
 
 def _open(profile: str | None, config_dir: Path | None) -> Container:

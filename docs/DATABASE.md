@@ -515,12 +515,15 @@ Tables are grouped by concern. For each: purpose, notable columns, constraints a
 
 ### `accounts`
 
-Ownership root for every other account-scoped table. Present from migration `0001` so multi-account support (`PROJECT_SPEC.md` §4.11) never requires a breaking migration.
+Ownership root for every other account-scoped table. Created by migration `0002` so multi-account support (`PROJECT_SPEC.md` §4.11) never requires a breaking migration.
 
-- Unique: `telegram_user_id`
-- Check: `is_active IN (0,1)`
-- Partial unique: at most one row with `is_active = 1`
-- `phone_number_hash` stores a salted hash. The plaintext number is never stored.
+Columns: `id`, `telegram_user_id`, `display_name`, `timezone`, `is_active`, `created_at`, `updated_at`.
+
+- Primary key `id` is **not autoincrement**: identifiers come from the application's generator, so an account can be fully constructed and validated before it is saved rather than acquiring its identity as a side effect of insert.
+- Unique index: `telegram_user_id`
+- **Partial unique index** `uq_accounts_single_active` on `is_active WHERE is_active = 1`. This is what makes the single-active invariant structural: many inactive rows are permitted and at most one active one, so a second activation fails at the database rather than depending on every caller remembering to deactivate first. Declared with both `sqlite_where` and `postgresql_where` so the same index exists on either dialect (ADR-016).
+- Check constraints: `id > 0`, `telegram_user_id > 0`, `length(trim(display_name)) > 0`, `updated_at >= created_at`. These restate the entity's invariants so a row written by any other route cannot violate them.
+- `phone_number_hash` and `last_authenticated_at` arrive with Milestone 2 (ADR-037).
 
 ### `user_profiles`
 
@@ -793,16 +796,17 @@ Initial migration sequence:
 | Revision | Contents | Status |
 |---|---|---|
 | `0001` | `schema_metadata` -- infrastructure baseline | **Applied** |
-| `0002` | `accounts`, `user_profiles`, `telegram_sessions`, `settings`, `audit_log` | Milestone 1 |
-| `0003` | `contacts`, `chats`, `conversations`, `messages`, `attachments`, `sync_cursors` | Milestone 1 |
-| `0004` | `messages_fts` and synchronisation triggers | Milestone 1 |
-| `0005` | `memories`, `memory_proposals`, `memory_revisions`, `goals` | Milestone 1 |
-| `0006` | `relationship_profiles`, `style_profiles` | Milestone 1 |
-| `0007` | `embedding_models`, `embeddings` | Milestone 1 |
-| `0008` | `analyses`, `conversation_summaries`, `conversation_plans`, `reply_suggestions`, `behavior_recommendations` | Milestone 1 |
-| `0009` | `ai_providers`, `ai_calls` | Milestone 1 |
-| `0010` | `notifications`, `retention_policies` | Milestone 1 |
-| `0011` | `plugins`, `plugin_data` | Milestone 1 |
+| `0002` | `accounts` — the ownership root | **Applied** |
+| `0003` | `user_profiles`, `telegram_sessions`, `settings`, `audit_log` | Milestone 1 |
+| `0004` | `contacts`, `chats`, `conversations`, `messages`, `attachments`, `sync_cursors` | Milestone 1 |
+| `0005` | `messages_fts` and synchronisation triggers | Milestone 1 |
+| `0006` | `memories`, `memory_proposals`, `memory_revisions`, `goals` | Milestone 1 |
+| `0007` | `relationship_profiles`, `style_profiles` | Milestone 1 |
+| `0008` | `embedding_models`, `embeddings` | Milestone 1 |
+| `0009` | `analyses`, `conversation_summaries`, `conversation_plans`, `reply_suggestions`, `behavior_recommendations` | Milestone 1 |
+| `0010` | `ai_providers`, `ai_calls` | Milestone 1 |
+| `0011` | `notifications`, `retention_policies` | Milestone 1 |
+| `0012` | `plugins`, `plugin_data` | Milestone 1 |
 
 Business tables begin at `0002`: `0001` is the infrastructure baseline described above.
 

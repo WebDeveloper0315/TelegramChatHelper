@@ -108,7 +108,7 @@ Value objects are immutable, compared by value, and carry their own validation. 
 
 | Value Object | Definition | Invariants |
 |---|---|---|
-| `AccountId`, `ContactId`, `ChatId`, `MessageId`, `ConversationId`, `MemoryId`, `GoalId` | Typed 64-bit identifiers | Positive; not interchangeable across types |
+| `AccountId`, `ContactId`, `ChatId`, `MessageId`, `ConversationId`, `MemoryId`, `GoalId` | Typed 64-bit identifiers | Positive; not interchangeable across types. Implemented as `NewType` aliases: the distinction is enforced statically by `mypy --strict` across the domain and application layers, which avoids wrapping and unwrapping at every call site. Range validation lives in the entities that hold them, where an invalid value has a meaning worth reporting. |
 | `TelegramUserId`, `TelegramChatId`, `TelegramMessageId` | External identifiers assigned by Telegram | Never used as local primary keys |
 | `Confidence` | A model or system confidence value | `0.0 ≤ value ≤ 1.0`; exposes `band()` → `LOW`/`MEDIUM`/`HIGH` using configured thresholds |
 | `Score` | A normalised metric (trust, engagement, depth) | `0.0 ≤ value ≤ 1.0`; carries `sample_size` and `computed_at`; a score with `sample_size` below the minimum is `Score.insufficient()` and never displayed as a number |
@@ -132,14 +132,25 @@ Value objects are immutable, compared by value, and carry their own validation. 
 
 **Responsibility.** Represents an authorised Telegram account and forms the ownership root for all stored data. Present from the first release even though multi-account is a future feature, because retrofitting an ownership root is a breaking migration (`PROJECT_SPEC.md` §4.11).
 
-**Attributes.** `id`, `telegram_user_id`, `phone_number_hash`, `display_name`, `is_active`, `timezone`, `created_at`, `updated_at`, `last_authenticated_at`.
+**Attributes (implemented).** `id`, `telegram_user_id`, `display_name`, `timezone`, `is_active`, `created_at`, `updated_at`.
+
+**Attributes (deferred to Milestone 2).** `phone_number_hash` and `last_authenticated_at`. Both are written only by authentication, and the first also requires choosing a salt strategy — per-account random and global secret have different security properties, and that choice belongs with the code that first receives a phone number. Both are one additive migration away.
 
 **Invariants.**
-- Exactly one Account is `is_active` at a time in v1.0.
-- `phone_number_hash` stores a salted hash, never the number itself.
-- Deleting an Account deletes every record owned by it, with no orphans.
+- Exactly one Account is `is_active` at a time in v1.0, enforced by a **partial unique index** on `is_active` rather than by convention.
+- `telegram_user_id` is unique: two local accounts for one Telegram user would make "which account is this message for" unanswerable.
+- `display_name` is non-blank and at most 128 characters; surrounding whitespace is trimmed, because a name differing only by whitespace is the same name.
+- `timezone` is a resolvable **IANA identifier**, never a fixed offset. An offset cannot express daylight saving, so it is wrong for half of every subsequent year — and reply-timing advice is computed against local hours.
+- `created_at` and `updated_at` are timezone-aware UTC, and `updated_at` is never earlier than `created_at`.
+- Deleting an Account deletes every record owned by it, with no orphans. Implemented as the purge operation in Milestone 11; the repository deliberately exposes no partial deletion, which would appear to work while leaving orphans.
 
-**Lifecycle.** `created → authenticating → active → suspended → logged_out → deleted`
+**Lifecycle.** `created → active ⇄ inactive → deleted`
+
+Account owns only the lifecycle it genuinely has: whether the user has selected it. **Authentication state belongs to Session** (§5.3), which models it as an explicit state machine. Version 1.0 of this document gave Account a lifecycle including `authenticating` and `logged_out`, which duplicated Session's states while providing only a boolean to express them; two entities would have owned "is this account authenticated" and would eventually have disagreed. See ADR-037.
+
+**Validation.** Every invariant above is checked in the entity's constructor, so an invalid Account cannot exist in memory — not merely cannot be saved. The schema restates them as check constraints, so a row written by any other route cannot violate them either.
+
+**Immutability.** State changes return a new instance. `activated`, `deactivated` and `renamed` return `self` unchanged when the change is a no-op, so a redundant call does not move `updated_at` and make nothing look like something.
 
 **Relationships.** Owns Chats, Contacts, Notifications, Audit Events; has one User Profile and at most one live Session.
 
@@ -589,6 +600,8 @@ Events are immutable facts about something that has happened. Naming is past ten
 
 | Event | Payload | Raised by |
 |---|---|---|
+| `AccountCreated` | account_id, is_active | Account creation |
+| `AccountActivated` | account_id | Account activation |
 | `MessageIngested` | message_id, chat_id, is_outgoing | Ingest use case |
 | `ConversationStarted` / `ConversationEnded` | conversation_id, chat_id | Segmenter |
 | `ConversationAnalyzed` | conversation_id, analysis_ids | Analysis use case |
