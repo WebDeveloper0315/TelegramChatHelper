@@ -164,13 +164,19 @@ flowchart LR
    packaging time is the whole point of placing it in Milestone 0.
 2. **`pre-commit install`** on the developer machine (the configuration is
    committed and validates; installing the git hook is a local action).
-3. **Startup enforcement of `security.require_secret_store`.**
-   `Container.verify_secret_store()` exists and `doctor` calls it; wiring it into
-   application startup waits for a long-running process to start.
-4. **Pre-upgrade backup hook.** The migration runner accepts one and refuses to
+3. ~~**Startup enforcement of `security.require_secret_store`.**~~ **Closed in
+   Milestone 2.4.** `Container.start()` verifies the credential store before
+   opening the database, and every CLI command that touches user data goes
+   through it. `doctor` deliberately does not, so it can still explain a
+   refusal.
+4. **A `tgassist secrets` command.** `SecretStore` has had `set`, `get`,
+   `delete` and `list_names` since M0.1, and nothing in the CLI reaches them.
+   The Telegram application hash is the first secret a user must supply by hand,
+   and today that means an environment variable or a `keyring` one-liner.
+5. **Pre-upgrade backup hook.** The migration runner accepts one and refuses to
    migrate if it fails; no provider is registered until Milestone 11, and the
    report says so rather than implying a safety net that does not exist.
-5. **Read-concurrency measurement** (ADR-034). Reads currently serialize behind
+6. **Read-concurrency measurement** (ADR-034). Reads currently serialize behind
    writes; the measurements required before adopting a reader pool are specified
    and scheduled for Milestone 13.
 
@@ -435,6 +441,138 @@ real native code, not only fakes.
 
 **Open:** only `windows-amd64` has a recorded binary. Linux and macOS have no
 build script and no entry; their recipes are documented but unverified.
+
+---
+
+### Milestone 2.3 -- TDLib Receive Bridge (complete, 2026-07-28)
+
+Slice 1. The runtime boundary between the verified library and the application.
+
+| Deliverable | Status |
+|---|---|
+| `TdjsonClient`: start, send, request, receive, close, health | Done |
+| Dedicated `tgassist-td` thread owning `td_receive` | Done -- ADR-048 |
+| **Single-caller constraint asserted by test** | Done -- one file, one method |
+| Request/response correlation by generated `@extra` | Done |
+| Bounded queue with real backpressure | Done -- thread blocks, TDLib buffers |
+| End-of-stream by event, not a queued sentinel | Done -- see ADR-048 |
+| Deterministic, idempotent shutdown | Done |
+| Thread-death detection, `FAILED` state, waiters released | Done |
+| Malformed frames counted, never fatal | Done |
+| Scriptable fake TDLib with a blocking receive | Done |
+| Round trip through the **real** library | Done -- `getOption` -> 1.8.66 |
+| No authentication, session, sync, or Telegram vocabulary | Confirmed |
+
+**Restart is not supported**, deliberately: a closed client's TDLib identifier is
+dead, and nothing needs the edge.
+
+**Open:** the client moves JSON objects and knows nothing of Telegram. Turning
+those into domain types is the gateway's job (slice 4).
+
+---
+
+### Milestone 2.4 -- Session Storage (complete, 2026-07-28)
+
+Slice 2. The first slice that touches the database, and where the
+credential-store rule carried since Milestone 0 finally becomes real.
+
+| Deliverable | Status |
+|---|---|
+| `Session` aggregate on two independent state axes | Done -- ADR-049 accepted |
+| `SessionRepository` port, SQL implementation, in-memory fake | Done |
+| `telegram_sessions` table, migration `0007` | Done |
+| Contract suite over both implementations | Done -- 46 tests |
+| Session key generated and written to the `SecretStore` | Done -- `PrepareSession` |
+| Row holds the key's **name**, never its value | Done -- asserted structurally |
+| `security.require_secret_store` enforced at startup | Done -- closes §2.5 |
+| No authentication flow, gateway or sync | Confirmed |
+
+**`DOMAIN_MODEL.md` §5.3 and `DATABASE.md` were both corrected**, not worked
+around: version 1.0 specified one `state` column, and TDLib reports two states
+that vary independently.
+
+**`connected` begins at `updating`, not `ready`** -- the socket is up from that
+state onwards. `can_send` stays stricter and requires `ready` on both axes,
+because a session still replaying its backlog may not know the conversation has
+moved on.
+
+**Open:** nothing calls `PrepareSession` yet, and nothing reads a session back.
+Both arrive with the login command (slice 3), rather than being written now
+against a guess at what that command will want.
+
+---
+
+### Milestone 2.5 -- Authentication (complete, 2026-07-28)
+
+Slice 3. The first slice that could talk to Telegram, and the first with a
+`TelegramGateway`.
+
+| Deliverable | Status |
+|---|---|
+| `TelegramGateway` port -- lifecycle, authorization, `get_me` | Done -- declared one slice at a time, ADR-051 |
+| `AuthorizationHandler` port | Done |
+| `TdlibGateway`: dispatch loop, submissions, retries | Done |
+| TDLib JSON <-> domain mapping, error taxonomy | Done -- `mapping.py`, `errors.py` |
+| `AuthenticateAccount`, `LogOutAccount` | Done |
+| `tgassist login` / `logout`, console handler | Done |
+| `FakeTelegramGateway` + shared contract suite | Done -- 47 tests over both |
+| Session survives a restart | Done -- connecting is enough |
+| Single-consumer constraint asserted by test | Done |
+| No reading, updates or sending | Confirmed |
+
+**A login that authenticated as a different Telegram user is refused, not
+recorded.** The account already owns that person's chats and messages, and two
+histories cannot be unmixed afterwards.
+
+**Nothing retains a credential.** The console handler has two slots -- an
+attempt counter and its limit -- so there is nowhere one could survive, and a
+test asserts the shape.
+
+**Open:**
+
+- `telegram.api_id` and the application hash must be obtained by hand from
+  my.telegram.org before `login` runs (`DEVELOPMENT_WORKFLOW.md` §27). No test
+  needs them; a real login does.
+- **There is no `tgassist secrets` command.** The hash goes in by environment
+  variable, or into the credential store with a one-line `keyring` script.
+  A command for it belongs with secret management, not with authentication.
+- The flow has never run against real Telegram servers. Every layer below it has
+  been verified against the real library; this one is verified against a TDLib
+  that runs the real state machine.
+
+---
+
+### Milestone 2.6 -- Gateway Reads (complete, 2026-07-29)
+
+Slice 4. The first slice that gets data *out* of Telegram, and the first where
+the fake earns its place.
+
+| Deliverable | Status |
+|---|---|
+| `TelegramChatInfo`, `TelegramMessage`, `HistoryPage` | Done |
+| `list_chats`, `get_chat`, `fetch_history` on the port | Done |
+| TDLib adapter reads, chat and message mapping | Done |
+| `FakeTelegramGateway` scriptable with chats and history | Done |
+| Contract suite over both implementations | Done -- 95 tests, 48 added |
+| `tgassist telegram chats`, `tgassist telegram history` | Done |
+| Nothing is stored | Confirmed -- asserted by test |
+
+**`fetch_history` replaces the specified `iter_history`.** An iterator cannot
+express *where to continue from*, so a backfill interrupted part-way could not
+resume without re-reading. A page that carries its own boundary can.
+
+**`reached_beginning` is true only for an empty page.** A short page is not
+proof -- Telegram returns short ones for reasons of its own -- and the history
+command was corrected to say "may continue" rather than claiming otherwise.
+
+**Open:**
+
+- `get_contact` is still absent; nothing calls it, and contact synchronisation
+  (slice 5) is what will.
+- `updates()` is still absent. The dispatch loop counts what it cannot consume,
+  and slice 7 is what reads them.
+- The reads have never run against real Telegram servers, only against a TDLib
+  that answers as Telegram does.
 
 ---
 

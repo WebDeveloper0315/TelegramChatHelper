@@ -413,6 +413,62 @@ Index(
     messages.c.id,
 )
 
+TELEGRAM_SESSIONS_TABLE: Final = "telegram_sessions"
+
+telegram_sessions = Table(
+    TELEGRAM_SESSIONS_TABLE,
+    metadata,
+    # The account identifier is the primary key, not a surrogate beside one.
+    # Exactly one session per account, so this makes the invariant the key
+    # itself (the reasoning ADR-038 applied to user_profiles).
+    Column(
+        "account_id",
+        Integer,
+        ForeignKey(
+            "accounts.id", ondelete="CASCADE", name="fk_telegram_sessions_account_id_accounts"
+        ),
+        primary_key=True,
+        autoincrement=False,
+    ),
+    # Two independent axes, because TDLib reports two and they vary
+    # independently: a session can be authorized while reconnecting (ADR-049).
+    Column("authorization_state", String(24), nullable=False, server_default="unauthorized"),
+    Column("connection_state", String(24), nullable=False, server_default="offline"),
+    Column("session_path", Text, nullable=False),
+    # A NAME in the SecretStore, never key material. A key value in this column
+    # is a security defect (SECURITY.md section 7, ADR-021).
+    Column("encryption_key_ref", String(128), nullable=False),
+    Column("client_version", String(32), nullable=True),
+    Column("connected_at", DateTime(timezone=True), nullable=True),
+    Column("last_activity_at", DateTime(timezone=True), nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint("account_id > 0", name="account_id_positive"),
+    CheckConstraint(
+        "authorization_state IN ('unauthorized', 'waiting_phone', 'waiting_code', "
+        "'waiting_password', 'ready', 'logged_out')",
+        name="authorization_state_known",
+    ),
+    CheckConstraint(
+        "connection_state IN ('offline', 'connecting', 'updating', 'ready', 'waiting_for_network')",
+        name="connection_state_known",
+    ),
+    CheckConstraint("length(trim(session_path)) > 0", name="session_path_not_blank"),
+    CheckConstraint("length(trim(encryption_key_ref)) > 0", name="key_ref_not_blank"),
+    # A connection time outliving its connection would answer "how long
+    # connected" with a duration that never happened. Connected means updating
+    # or ready: TDLib's socket is up from 'updating' onwards.
+    CheckConstraint(
+        "connection_state IN ('updating', 'ready') OR connected_at IS NULL",
+        name="unconnected_has_no_connection_time",
+    ),
+    CheckConstraint("updated_at >= created_at", name="updated_after_created"),
+    comment=(
+        "Per-account Telegram session state. Holds the NAME of the store's "
+        "encryption key, never the key: that lives in the OS credential store."
+    ),
+)
+
 # Keys used in schema_metadata.
 KEY_CREATED_AT: Final = "created_at"
 KEY_CREATED_BY_VERSION: Final = "created_by_version"
@@ -431,6 +487,7 @@ __all__ = [
     "MESSAGES_TABLE",
     "NAMING_CONVENTION",
     "SCHEMA_METADATA_TABLE",
+    "TELEGRAM_SESSIONS_TABLE",
     "USER_PROFILES_TABLE",
     "accounts",
     "chats",
@@ -438,5 +495,6 @@ __all__ = [
     "messages",
     "metadata",
     "schema_metadata",
+    "telegram_sessions",
     "user_profiles",
 ]

@@ -677,3 +677,74 @@ failure — not checked and failed are different things.
   recording it: `dumpbin /dependents tdjson.dll` on Windows, `ldd libtdjson.so`
   on Linux. If it names OpenSSL or zlib, the checksum covers less than it
   appears to, and the manifest `source` field should say so.
+
+
+---
+
+# 27. Telegram Application Credentials
+
+`tgassist login` needs two values that identify **this installation** to
+Telegram — not the user, and not the account. There is no default and nothing to
+derive them from, so this is a one-off setup step rather than a failure, and it
+is reported as `TELEGRAM_NOT_CONFIGURED` rather than as a connection problem.
+
+## 27.1 Obtaining them
+
+1. Sign in at <https://my.telegram.org> with the phone number of any Telegram
+   account. It does not have to be the account this application will manage.
+2. Open **API development tools** and fill in the short form. The application
+   title and short name are labels; nothing depends on them.
+3. It gives you an **`api_id`** (a number) and an **`api_hash`** (32 hex
+   characters).
+
+Telegram issues these per person, not per user of your software. They are yours,
+and they belong in your machine's configuration rather than in this repository.
+
+## 27.2 Storing them
+
+The id is ordinary configuration:
+
+```yaml
+# config/local.yaml -- gitignored
+telegram:
+  api_id: 1234567
+```
+
+The hash is a secret, and the `SecretStore` resolves it **environment variable
+first, then the operating system credential store** (ADR-021). The environment
+is the supported route today:
+
+```bash
+export TGASSIST_TELEGRAM__API_ID=1234567
+export TELEGRAM_API_HASH=0123456789abcdef0123456789abcdef
+```
+
+**There is no `tgassist secrets` command yet**, so writing the hash into the
+credential store durably needs a one-line script:
+
+```bash
+uv run python -c "import keyring; keyring.set_password('tgassist', 'TELEGRAM_API_HASH', '...')"
+```
+
+A command for this belongs with secret management rather than with
+authentication, and is listed as an open item in `ROADMAP.md`.
+
+**Never put the hash in `config/default.yaml`, in a committed file, or in a
+`_ref` field.** `api_hash_ref` holds a *name*; a hash in that field is a
+security defect, and the value would be printed by `tgassist config show`
+unmasked, because a name is not sensitive.
+
+## 27.3 What happens without them
+
+| Missing | What you see |
+|---|---|
+| `api_id` | *No Telegram application id is configured. Obtain one from https://my.telegram.org and set telegram.api_id.* |
+| the hash | *No Telegram application hash is stored under TELEGRAM_API_HASH...* |
+| both wrong | Telegram answers `API_ID_INVALID`, reported as a configuration problem rather than as a rejected login, because no code the user types will fix it |
+
+## 27.4 What the tests need
+
+Nothing. The whole authentication flow is exercised against a scripted TDLib
+that runs the real state machine, so no test needs credentials, an account or a
+network. What credentials buy you is a login against the real Telegram, which is
+worth doing once by hand before trusting the flow.

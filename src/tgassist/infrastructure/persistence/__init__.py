@@ -34,6 +34,11 @@ from tgassist.infrastructure.persistence.migrations import (
 from tgassist.infrastructure.persistence.pagination import KeysetPaginator
 from tgassist.infrastructure.persistence.repository import Repository
 from tgassist.infrastructure.persistence.schema import metadata, schema_metadata
+from tgassist.infrastructure.persistence.sessions import (
+    SessionMapper,
+    SqlSessionRepository,
+    session_repository,
+)
 from tgassist.infrastructure.persistence.unit_of_work import (
     SqlAlchemyUnitOfWork,
     UnitOfWorkFactory,
@@ -56,11 +61,13 @@ __all__ = [
     "KeysetPaginator",
     "MessageMapper",
     "Repository",
+    "SessionMapper",
     "SqlAccountRepository",
     "SqlAlchemyUnitOfWork",
     "SqlChatRepository",
     "SqlContactRepository",
     "SqlMessageRepository",
+    "SqlSessionRepository",
     "SqlUserProfileRepository",
     "SqliteDatabase",
     "UnitOfWorkFactory",
@@ -73,6 +80,7 @@ __all__ = [
     "message_repository",
     "metadata",
     "schema_metadata",
+    "session_repository",
     "translate_database_error",
     "user_profile_repository",
 ]

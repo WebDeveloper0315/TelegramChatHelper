@@ -198,6 +198,21 @@ For any `tdjson`, from any source:
 **Review a manifest change as you would any other security change.** A digest
 recorded from whatever happened to be on disk makes the whole mechanism theatre.
 
+## What the bridge may log
+
+TDLib frames are not log material. A single frame can carry an authorization
+code, a session encryption key, a phone number or message text -- the four
+things `section 9` forbids most strongly.
+
+The receive bridge therefore logs **only** a frame's `@type`, never its body,
+and never at any level. This is upstream of the redaction processor rather than
+relying on it: redaction is keyed on field names, and TDLib's field names are
+its own, so a frame logged wholesale could carry a key the processor has never
+heard of.
+
+Counts are safe and are reported: frames received, malformed frames, queue
+depth and high-water mark, pending requests. None of them is content.
+
 ## Limits of this
 
 - **Verified is not audited.** The checksum pins an artefact; it says nothing
@@ -217,6 +232,36 @@ recorded from whatever happened to be on disk makes the whole mechanism theatre.
 4. Logout destroys the local session store and the associated key.
 5. Sessions are excluded from every export and every backup format.
 6. If the credential store becomes unavailable, the application **refuses to start** rather than falling back to an unencrypted session. Failing securely means denying.
+
+**Enforced since Milestone 2.4**, and carried unenforced from Milestone 0 until then — there was no session to protect, so the gap was theoretical until a session key existed.
+
+`Container.start()` checks the credential store *before* opening the database, so a refusal has not already done work it promised not to do. It is the entry point every command that touches user data uses. Diagnostic commands deliberately do not: `doctor` exists to *report* an unavailable credential store, and refusing to run it would remove the tool that explains the refusal.
+
+The rule is governed by `security.require_secret_store`, which the `development` and `testing` profiles set to `false` so a developer without a credential backend is not locked out. Preparing a session refuses **regardless** of that flag: the flag governs startup, and there is nowhere else a session key may go.
+
+## Credentials during login
+
+The login flow touches three things Telegram treats as secret, and none of them
+is retained.
+
+1. **Phone number, login code and two-step password** exist for exactly one
+   submission. Each lives in a local for the duration of one request; no branch
+   in the gateway or the handler puts one in an attribute, a log, an error or a
+   retry cache. `ConsoleAuthorizationHandler` has two slots — an attempt counter
+   and its limit — so there is nowhere for one to survive, and a test asserts
+   that shape rather than trusting it.
+2. **The password is read with `getpass`**, so it never reaches the screen, the
+   terminal's scrollback or the shell's history. The login code is not: it is
+   short-lived, useless once submitted, and a user who cannot see what they
+   typed will mistype it.
+3. **A rejection reports Telegram's reason, never the value.** The mapped error
+   carries `operation`, `telegram_code` and `telegram_message` and nothing else
+   — an error object is exactly the thing that ends up in a log or a crash
+   report.
+
+The application's own credentials follow §8: `telegram.api_id` is ordinary
+configuration, and the application hash is a **name** in the credential store
+(`telegram.api_hash_ref`), never a value in a file.
 
 ---
 

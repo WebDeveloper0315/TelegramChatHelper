@@ -644,7 +644,7 @@ Condensed; all follow the §7 common contract.
 |---|---|
 | `AccountRepository` | `add`, `get`, `get_by_telegram_id`, `get_active`, `list_accounts`, `set_active` — **implemented**, see below |
 | `UserProfileRepository` | `get`, `upsert`, `update_preferences` |
-| `SessionRepository` | `get`, `upsert`, `set_state`, `clear` |
+| `SessionRepository` | `get`, `add`, `update` — **implemented**, see below |
 | `AttachmentRepository` | `add`, `list_by_message`, `mark_downloaded`, `delete`, `total_size` |
 | `RelationshipRepository` | `get`, `upsert`, `list_stale` |
 | `StyleProfileRepository` | `get`, `upsert`, `list_stale` |
@@ -769,30 +769,150 @@ Rules: `connect()` and `close()` are idempotent; connection settings are **verif
 
 ---
 
-# 10. `TelegramGateway`
+## 9.1 `SessionRepository`
+
+*Implemented in Milestone 2.4.*
+
+Scoped to one account at construction (ADR-039), like every repository over
+account-owned data. One row per account, so there is nothing to page and nothing
+to look up by.
+
+```python
+class SessionRepository(Protocol):
+    @property
+    def account_id(self) -> AccountId: ...
+
+    async def get(self) -> Session | None
+    async def add(self, session: Session) -> None
+    async def update(self, session: Session) -> None
+```
+
+**Constraints:**
+
+1. **No `delete`.** A session goes with its account, by cascade. Logging out is
+   a *transition* — it destroys the local store and the key and leaves a record
+   saying so — because "this account was signed out" is a fact a deleted row
+   cannot express.
+2. **It never holds key material.** `Session.encryption_key_ref` is a name in
+   the `SecretStore`; the key lives in the operating system credential store
+   (`SECURITY.md` §7).
+3. `get()` returning `None` is an ordinary state, not an error: a session record
+   is written when a login is first prepared, not when the account is created.
+4. `add` and `update` take the whole entity, so the invariants checked at
+   construction are the invariants written. Handing over a session belonging to
+   another account raises rather than overwriting the wrong row.
+
+## 9.2 `PrepareSession`
+
+*Implemented in Milestone 2.4. Application layer, not a port.*
+
+Gives an account the storage and key a login will need, and the only thing that
+puts a session key into the credential store.
+
+```python
+async def execute(self, account_id: AccountId | None = None) -> Session
+```
+
+**Constraints:**
+
+1. **Idempotent.** An account that already has a session gets the existing one
+   back. Generating a second key would make the store the first key encrypted
+   permanently unreadable.
+2. The key is written to the credential store **before** the row, and the
+   transaction commits after both. The other order would allow a row naming a
+   key that was never stored, which looks like a working session until the first
+   login fails. The reverse leftover costs nothing: the name is derived from the
+   account, so the next attempt overwrites it.
+3. Raises `SecretStoreUnavailableError` when no credential backend is
+   available — regardless of `security.require_secret_store`, which governs
+   startup. There is nowhere else a session key may go; an unencrypted fallback
+   does not exist (`SECURITY.md` §8).
+4. It does not create the session directory. TDLib creates its own store, under
+   a root that already carries owner-only permissions.
+
+---
+
+# 10. Telegram
+
+## 10.0 `TdjsonClient`
+
+*Implemented in Milestone 2.3. Infrastructure, not a port.*
+
+The seam between TDLib's blocking receive call and the event loop (ADR-048). It
+is **not** a domain port and has no second implementation: what varies is the
+native library beneath it, and that is where the protocol sits.
+
+```python
+class TdjsonClient:
+    def __init__(self, library: NativeLibrary, *, queue_capacity: int = 1024,
+                 receive_timeout: float = 1.0, shutdown_timeout: float = 10.0) -> None
+
+    @property
+    def state(self) -> ClientState                       # stopped/starting/running/stopping/failed
+
+    async def start(self) -> None
+    def send(self, request: dict[str, Any]) -> None      # fire and forget
+    async def request(self, payload: dict[str, Any], *,
+                      timeout: float | None = 30.0) -> dict[str, Any]
+    async def receive(self) -> dict[str, Any] | None     # None once the stream ends
+    async def close(self) -> None
+    def health(self) -> ClientHealth
+```
+
+**Thread ownership.** `tgassist-td` calls `td_receive` and nothing else ever
+does — asserted by test. The loop calls `td_send`, which TDLib guarantees is
+thread-safe, so only receipt needs a thread.
+
+**Constraints:**
+
+1. Contains no Telegram vocabulary. It moves JSON objects; what they mean is the
+   gateway's business (§10.1).
+2. `send` is synchronous because `td_send` is. Making it `async` would suggest
+   it waits for something.
+3. `request` generates its own `@extra` and replaces any the caller supplied,
+   because correlation is the client's registry to own.
+4. `receive` returning `None` is the only end-of-stream signal, and it is
+   carried by an event rather than a queued sentinel — a bounded queue that is
+   full cannot deliver one.
+5. Restart is not supported. A closed client stays closed.
+6. Only `@type` is logged, never a frame body.
+
+## 10.1 `TelegramGateway`
 
 **Responsibility.** The sole boundary to Telegram. Converts between platform structures and domain objects. Contains no business logic and no persistence.
 
+**Declared one slice at a time (ADR-051).** The signature below is the full shape; the methods marked *implemented* are the ones that exist today. A protocol listing methods no caller uses cannot be verified by a contract suite, and a fake would have to invent behaviour for them.
+
 ```python
 class TelegramGateway(Protocol):
+    @property
+    def account_id(self) -> AccountId: ...                                    # implemented
+
     # Lifecycle
-    async def connect(self) -> None: ...
-    async def disconnect(self) -> None: ...
-    async def is_connected(self) -> bool: ...
+    async def connect(self) -> None: ...                                      # implemented
+    async def disconnect(self) -> None: ...                                   # implemented
+    async def is_connected(self) -> bool: ...                                 # implemented
 
     # Authorization (drives the Session state machine)
-    async def authorization_state(self) -> AuthorizationState: ...
-    async def start_authorization(self, handler: AuthorizationHandler) -> None: ...
-    async def logout(self) -> None: ...
+    async def authorization_state(self) -> AuthorizationState: ...            # implemented
+    async def connection_state(self) -> ConnectionState: ...                  # implemented
+    async def start_authorization(self, handler: AuthorizationHandler) -> None: ...  # implemented
+    async def logout(self) -> None: ...                                       # implemented
 
     # Reading
-    async def get_me(self) -> TelegramUser: ...
-    async def list_chats(self, *, limit: int) -> list[TelegramChatInfo]: ...
-    async def get_chat(self, chat_id: TelegramChatId) -> TelegramChatInfo | None: ...
+    async def get_me(self) -> TelegramUser: ...                               # implemented
+    async def list_chats(
+        self, *, limit: int = 200
+    ) -> tuple[TelegramChatInfo, ...]: ...                                    # implemented
+    async def get_chat(
+        self, chat_id: TelegramChatId
+    ) -> TelegramChatInfo | None: ...                                         # implemented
+    async def fetch_history(
+        self, chat_id: TelegramChatId, *,
+        before_message_id: TelegramMessageId | None = None,
+        limit: int = 100,
+    ) -> HistoryPage: ...                                                     # implemented
     async def get_contact(self, user_id: TelegramUserId) -> TelegramUser | None: ...
-    async def iter_history(self, chat_id: TelegramChatId, *,
-                           before_message_id: TelegramMessageId | None,
-                           limit: int) -> AsyncIterator[TelegramMessage]: ...
 
     # Updates
     def updates(self) -> AsyncIterator[TelegramUpdate]: ...
@@ -813,17 +933,39 @@ class TelegramGateway(Protocol):
 
 **`TelegramUpdate` variants:** `NewMessage`, `MessageEdited`, `MessageDeleted`, `ChatUpdated`, `UserStatusChanged`, `ConnectionStateChanged`, `AuthorizationStateChanged`.
 
+**`fetch_history` replaces `iter_history`.** Version 1.0 specified an
+`AsyncIterator[TelegramMessage]`, which cannot express *where to continue from*:
+a caller draining an iterator has no cursor to store, so a backfill interrupted
+part-way could not resume without re-reading. A page that carries its own
+boundary can (`TELEGRAM_ARCHITECTURE.md` §2.4).
+
+**`HistoryPage`** carries `messages` (newest first) and `oldest_message_id`.
+`reached_beginning` is the single question a backfill asks, and it is true only
+for an **empty** page — a short page is not proof, because Telegram returns short
+pages for reasons of its own. That is the whole reason the boundary is returned
+rather than derived.
+
+**`get_contact` is deliberately still absent.** Telegram carries a private
+chat's counterpart on the chat itself, so nothing yet needs a separate user
+lookup; contact synchronisation is what will.
+
+**`connection_state()` is new** relative to version 1.0 of this document. ADR-049 gave Session two independent axes, and a caller recording both cannot derive the second from `is_connected()` — which answers "can I use it", not "which of the five states is it in".
+
 **Constraints:**
 
 1. Never writes to the database. Ingest is the application layer's job.
-2. Handles rate limiting internally: `FLOOD_WAIT` produces bounded exponential backoff and a `RateLimited` domain error only if the wait exceeds the configured ceiling.
+2. Handles rate limiting internally: `FLOOD_WAIT` produces bounded exponential backoff and a `RateLimited` domain error only if the wait exceeds the configured ceiling. *Not yet: `errors.is_flood_wait` recognises the condition, and absorbing it belongs with the code that issues enough requests to cause one.*
 3. Reconnects automatically with backoff and emits `ConnectionStateChanged`.
-4. `iter_history()` streams, never materialising a whole chat.
-5. **There is no method for sending typing indicators.** Its absence is the structural expression of ADR-023 §2.
+4. `fetch_history()` returns one page and its boundary, never a whole chat. A page rather than a stream because a caller draining an iterator has no cursor to store, and resumption is the point.
+5. **There is no method for sending typing indicators.** Its absence is the structural expression of ADR-023 §2, and a contract test asserts that no method with `typing` or `action` in its name exists on either implementation.
+6. Bound to one account at construction (ADR-039). No method takes an account identifier.
+7. `connect()` and `disconnect()` are idempotent; operations needing a connection raise `TdlibNotRunningError` rather than opening one implicitly. A method that silently opens a network connection is a method whose cost is invisible.
 
 ## `AuthorizationHandler`
 
 **Responsibility.** Lets the presentation layer supply credentials during the multi-step login flow without the gateway depending on any UI.
+
+*Implemented in Milestone 2.5.*
 
 ```python
 class AuthorizationHandler(Protocol):
@@ -831,10 +973,41 @@ class AuthorizationHandler(Protocol):
     async def request_code(self, hint: CodeHint) -> str: ...
     async def request_password(self, hint: PasswordHint) -> str: ...
     async def on_state_change(self, state: AuthorizationState) -> None: ...
-    async def on_error(self, error: AuthorizationError) -> RetryDecision: ...
+    async def on_error(self, error: Exception) -> RetryDecision: ...
 ```
 
 Codes and passwords are passed through and never logged, stored or retained after use.
+
+**Constraints:**
+
+1. Nothing here stores what it returns. `ConsoleAuthorizationHandler` has two slots — an attempt counter and its limit — so there is nowhere a credential could survive, and a test asserts that.
+2. `on_state_change` must not block on user input. It runs on the gateway's path, so a handler that waited there would stop every other update.
+3. `on_error` receives the *reason* Telegram gave, never the value that was rejected. `AuthorizationError` carries `operation`, `telegram_code` and `telegram_message` and nothing else.
+4. `on_error` takes `Exception` rather than `AuthorizationError`: the parameter is what the handler is shown, and narrowing it would force the gateway to construct a specific type before it knows the failure is recoverable.
+5. Cancellation propagates, so shutdown is not delayed by a prompt nobody is answering.
+
+**`CodeHint`** carries `delivery`, `length` and `timeout_seconds` — where the code was sent and how long it lasts, never the code. **`PasswordHint`** carries the user's own reminder text and a redacted recovery address, never the password.
+
+## 10.3 `AuthenticateAccount` and `LogOutAccount`
+
+*Implemented in Milestone 2.5. Application layer, not ports.*
+
+```python
+async def execute(self, gateway: TelegramGateway, handler: AuthorizationHandler,
+                  account_id: AccountId | None = None) -> LoginResult
+async def execute(self, gateway: TelegramGateway,
+                  account_id: AccountId | None = None) -> Session | None
+```
+
+The gateway is a **parameter**, not a constructor dependency: it holds a live connection, and a use case built once per call has no lifetime to hang that on (`TELEGRAM_ARCHITECTURE.md` §7.3).
+
+**Constraints:**
+
+1. Login prepares the session first. The gateway cannot connect without the store path and the encryption key, and `PrepareSession` is what creates them.
+2. **A login that authenticated as a different Telegram user is refused, not recorded.** The account already owns chats, contacts and messages belonging to the first person, and there is no way to unmix two histories.
+3. Both session axes are written from what the gateway reports. An authorized account whose connection is still catching up is an ordinary state, and recording it as fully ready would be a lie the next command believes.
+4. `LoginResult.was_already_authorized` distinguishes a restored session from a fresh sign-in, rather than implying one happened.
+5. Logout tells Telegram, records the transition, then destroys the local store and the key — in that order, so a failure part-way leaves nothing usable rather than something half-usable. Removing the directory tolerates failure; deleting the key is what makes the remaining bytes unreadable.
 
 ---
 

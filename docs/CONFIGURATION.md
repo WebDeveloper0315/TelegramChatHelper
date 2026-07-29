@@ -152,6 +152,9 @@ Complete key reference. Types, defaults and descriptions.
 | `telegram.minimum_version` | str | `1.8.0` | Lowest TDLib version accepted. The client API this project uses stabilised in 1.8 |
 | `telegram.log_verbosity` | int | `0` | TDLib's own log level, applied immediately after loading. TDLib defaults to 5 on standard error |
 | `telegram.search_system_library_path` | bool | `true` | Consider a system-installed `tdjson` as the last candidate |
+| `telegram.api_id` | int \| null | `null` | Application id from https://my.telegram.org. Required before `tgassist login` runs; there is no default because there is nothing to derive one from |
+| `telegram.api_hash_ref` | str | `TELEGRAM_API_HASH` | **Name** of the application hash in the credential store, never the value (ADR-021) |
+| `telegram.device_model` | str | `Desktop` | What this client calls itself in Telegram's active-sessions list, where the user sees it when deciding whether to revoke a session |
 
 The library is searched for in this order, and **the first candidate that
 exists is the one used**: the configured path, then `<data_dir>/tdlib/`, then
@@ -174,10 +177,7 @@ one.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `telegram.api_id` | int | — | From my.telegram.org; required for authentication |
-| `telegram.api_hash_ref` | string | `TELEGRAM_API_HASH` | **Secret store name**, not the value |
 | `telegram.session_dir` | path | `{data_dir}/sessions` | Encrypted session store |
-| `telegram.device_model` | string | `Desktop` | Reported to Telegram |
 | `telegram.reconnect_max_attempts` | int | `10` | Before giving up |
 | `telegram.reconnect_base_delay_s` | float | `2.0` | Exponential base |
 | `telegram.flood_wait_ceiling_s` | int | `300` | Above this, raise rather than wait |
@@ -352,7 +352,7 @@ unaffected by the level you choose.
 |---|---|---|---|
 | `security.secret_backend` | enum | `keyring` | `keyring` \| `encrypted_file` \| `env_only` |
 | `security.enforce_file_permissions` | bool | `true` | Verify owner-only ACLs at startup |
-| `security.require_secret_store` | bool | `true` | Refuse to start without it (`SECURITY.md` §7) |
+| `security.require_secret_store` | bool | `true` | Refuse to start without it (`SECURITY.md` §7). Checked by `Container.start()` before the database is opened; `doctor` deliberately bypasses it so it can still explain the refusal. `development` and `testing` set `false` |
 
 ## 6.12 `backup`
 

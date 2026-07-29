@@ -20,6 +20,15 @@ from tests.fakes.message_repository import (
     InMemoryMessageStore,
 )
 from tests.fakes.secret_store import InMemorySecretStore, UnavailableSecretStore
+from tests.fakes.session_repository import (
+    InMemorySessionRepository,
+    InMemorySessionStore,
+)
+from tests.fakes.telegram_gateway import (
+    DEFAULT_USER,
+    FakeTelegramGateway,
+    ScriptedHandler,
+)
 from tests.fakes.unit_of_work import InMemoryUnitOfWork, InMemoryUnitOfWorkFactory
 from tests.fakes.user_profile_repository import (
     InMemoryProfileStore,
@@ -27,8 +36,10 @@ from tests.fakes.user_profile_repository import (
 )
 
 __all__ = [
+    "DEFAULT_USER",
     "EPOCH",
     "AdvanceableClock",
+    "FakeTelegramGateway",
     "FixedClock",
     "InMemoryAccountRepository",
     "InMemoryChatRepository",
@@ -39,10 +50,13 @@ __all__ = [
     "InMemoryMessageStore",
     "InMemoryProfileStore",
     "InMemorySecretStore",
+    "InMemorySessionRepository",
+    "InMemorySessionStore",
     "InMemoryUnitOfWork",
     "InMemoryUnitOfWorkFactory",
     "InMemoryUserProfileRepository",
     "RecordingEventBus",
+    "ScriptedHandler",
     "SequentialIdGenerator",
     "UnavailableSecretStore",
 ]

@@ -395,7 +395,7 @@ sequenceDiagram
     CUR-->>SC: cursor {oldest, newest, backfill_complete}
 
     loop Until backfill complete or horizon reached
-        SC->>GW: iter_history(before=cursor.oldest, limit=batch)
+        SC->>GW: fetch_history(before=cursor.oldest, limit=batch)
         alt FLOOD_WAIT
             GW->>GW: bounded exponential backoff
         end

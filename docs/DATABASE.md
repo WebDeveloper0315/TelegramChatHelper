@@ -145,13 +145,16 @@ erDiagram
     }
 
     telegram_sessions {
-        int id PK
-        int account_id FK
-        text state
+        int account_id PK
+        text authorization_state
+        text connection_state
         text session_path
         text encryption_key_ref
+        text client_version
         timestamp connected_at
         timestamp last_activity_at
+        timestamp created_at
+        timestamp updated_at
     }
 
     contacts {
@@ -536,10 +539,24 @@ Columns: `account_id`, `primary_language`, `tone_preference`, `preferred_message
 
 ### `telegram_sessions`
 
-- Unique: `account_id`
-- FK: `account_id → accounts(id) ON DELETE CASCADE`
-- Check: `state IN ('disconnected','connecting','awaiting_phone','awaiting_code','awaiting_password','ready','reconnecting','logged_out')`
-- `encryption_key_ref` holds a `SecretStore` name only (ADR-021). A key value in this column is a security defect.
+Where an account stands with Telegram, and where its encrypted local store
+lives. Created by migration `0007`.
+
+Columns: `account_id`, `authorization_state`, `connection_state`,
+`session_path`, `encryption_key_ref`, `client_version`, `connected_at`,
+`last_activity_at`, `created_at`, `updated_at`.
+
+- **`account_id` is both the primary key and the foreign key**, as in `user_profiles`. One session per account is therefore structural rather than a separate unique index, and no additional index exists — the primary key serves every lookup this table has.
+- FK: `account_id → accounts(id) ON DELETE CASCADE`. A session cannot outlive its account.
+- **Two state columns, not one** (ADR-049). Version 1.0 of this document specified a single `state`; TDLib reports authorization and connection separately and they vary independently, so one column cannot express *authorized but reconnecting*.
+- Check: `authorization_state IN ('unauthorized','waiting_phone','waiting_code','waiting_password','ready','logged_out')`.
+- Check: `connection_state IN ('offline','connecting','updating','ready','waiting_for_network')`. Two tests assert that every member of each enumeration is storable, because the enums and these constraints would otherwise drift apart silently.
+- Check: `connection_state IN ('updating','ready') OR connected_at IS NULL` — a session that is not connected cannot carry a connection time. The socket is up from `updating` onwards, which is why that state counts as connected.
+- Check: `account_id > 0`; `length(trim(session_path)) > 0`; `length(trim(encryption_key_ref)) > 0`; `updated_at >= created_at`.
+- `client_version` records which TDLib last wrote the store, because a store written by a newer TDLib may not be readable by an older one. Nullable: nothing has written the store before the first login.
+- `encryption_key_ref` holds a `SecretStore` **name** only (ADR-021), capped at 128 characters to match the entity. The key itself lives in the operating system credential store. **A key value in this column is a security defect**, and there is no column it could hide in — a test asserts that neither the table nor the entity has a field a key would fit.
+- Access is through a repository **scoped at construction** (ADR-039), with no `delete`: a session goes with its account, by cascade, and logging out is a transition rather than a deletion.
+- A downgrade drops the row, not the store on disk. Deleting a user's encrypted session directory is not a schema change's business; re-authentication is the recovery.
 
 ## 4.2 People and Chats
 
@@ -842,7 +859,8 @@ Initial migration sequence:
 | `0004` | `contacts` — the first many-per-account table | **Applied** |
 | `0005` | `chats` — the communication graph's edge | **Applied** |
 | `0006` | `messages` — the immutable factual record | **Applied** |
-| `0007` | `telegram_sessions`, `settings`, `audit_log` | Milestone 2 |
+| `0007` | `telegram_sessions` — where an account stands with Telegram | **Applied** |
+| next | `settings`, `audit_log` | Milestone 2 |
 | `0008` | `conversations`, `attachments`, `sync_cursors` | Milestone 3 |
 | `0009` | `messages_fts` and synchronisation triggers | Milestone 3 |
 | `0010` | `memories`, `memory_proposals`, `memory_revisions`, `goals` | Milestone 5 |

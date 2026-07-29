@@ -92,7 +92,37 @@ class NativeLibrary(Protocol):
         ...
 
     def execute(self, request: str) -> str | None:
-        """Call ``td_execute`` with a JSON request and return its JSON reply."""
+        """Call ``td_execute`` with a JSON request and return its JSON reply.
+
+        Synchronous and client-free: TDLib answers a small set of requests
+        without a client, a thread or a network. That is what lets the loader
+        read a version before anything is started.
+        """
+        ...
+
+    def create_client_id(self) -> int:
+        """Create a TDLib client and return its identifier.
+
+        TDLib multiplexes clients on one receive loop, tagging every frame with
+        ``@client_id``, which is why a second account costs a client rather than
+        a thread (ADR-048).
+        """
+        ...
+
+    def send(self, client_id: int, request: str) -> None:
+        """Hand a request to TDLib. Thread-safe, and returns immediately.
+
+        The reply arrives later through :meth:`receive`, correlated by the
+        ``@extra`` the request carried.
+        """
+        ...
+
+    def receive(self, timeout: float) -> str | None:
+        """Wait up to ``timeout`` seconds for the next frame, or return ``None``.
+
+        **Blocking, and thread-affine.** Exactly one thread may call this, which
+        is the whole reason ``TdjsonClient`` owns a dedicated one (ADR-048).
+        """
         ...
 
 
@@ -128,6 +158,38 @@ class CtypesLibrary:
         function.restype = ctypes.c_char_p
         function.argtypes = [ctypes.c_char_p]
         reply = function(request.encode("utf-8"))
+        return reply.decode("utf-8") if reply is not None else None
+
+    def create_client_id(self) -> int:
+        """Create a TDLib client."""
+        function = self._handle.td_create_client_id
+        function.restype = ctypes.c_int
+        function.argtypes = []
+        return int(function())
+
+    def send(self, client_id: int, request: str) -> None:
+        """Hand a request to TDLib.
+
+        Thread-safe by TDLib's own contract, so this is called straight from the
+        event loop rather than marshalled onto the receive thread.
+        """
+        function = self._handle.td_send
+        function.restype = None
+        function.argtypes = [ctypes.c_int, ctypes.c_char_p]
+        function(ctypes.c_int(client_id), request.encode("utf-8"))
+
+    def receive(self, timeout: float) -> str | None:
+        """Block for the next frame from any client.
+
+        The returned buffer belongs to TDLib and is valid only until this
+        thread's next call, so ``c_char_p`` is used deliberately: ctypes copies
+        into a Python ``bytes`` before this returns, and nothing later reads
+        TDLib's memory.
+        """
+        function = self._handle.td_receive
+        function.restype = ctypes.c_char_p
+        function.argtypes = [ctypes.c_double]
+        reply = function(ctypes.c_double(timeout))
         return reply.decode("utf-8") if reply is not None else None
 
 

@@ -306,6 +306,88 @@ class TdlibIncompatibleError(TelegramRuntimeError):
     code = "TELEGRAM_TDLIB_INCOMPATIBLE"
 
 
+class TdlibNotRunningError(TelegramRuntimeError):
+    """An operation needed a running client and there was not one.
+
+    Covers "not started yet", "already stopped" and "the receive thread died",
+    because from a caller's position those are the same fact: there is nothing
+    to talk to. Which of them applies is in the context.
+    """
+
+    code = "TELEGRAM_TDLIB_NOT_RUNNING"
+
+
+class TdlibRequestFailedError(TelegramRuntimeError):
+    """TDLib answered a request with an error.
+
+    The request reached TDLib and was refused, which is different from the
+    client being unable to send it. TDLib's own code and message are carried in
+    the context: they name conditions like an invalid code or a flood wait, and
+    a caller that cannot see them cannot react to them.
+    """
+
+    code = "TELEGRAM_TDLIB_REQUEST_FAILED"
+
+
+class TdlibShutdownTimeoutError(TelegramRuntimeError):
+    """The receive thread did not stop when asked.
+
+    Raised *after* every waiter has been released, so a thread that will not
+    die does not also hang the application. It is still reported, because a
+    thread ignoring a stop request is a defect rather than a tidy-up detail.
+    """
+
+    code = "TELEGRAM_TDLIB_SHUTDOWN_TIMEOUT"
+
+
+class TelegramError(TelegramRuntimeError):
+    """Telegram refused an operation for a reason of its own.
+
+    The catch-all beneath the specific cases below: the request reached
+    Telegram, was understood, and was declined. TDLib's own code and message
+    travel in the context, because a caller that cannot see them cannot react
+    to them.
+    """
+
+    code = "TELEGRAM_ERROR"
+
+
+class TelegramNotConfiguredError(TelegramRuntimeError):
+    """The application credentials Telegram requires are absent or incomplete.
+
+    ``api_id`` and ``api_hash`` identify *this application* to Telegram and are
+    obtained once, by hand, from https://my.telegram.org. There is no default
+    and no way to derive them, so this is a setup step rather than a failure --
+    which is why it is reported separately from every other connection problem.
+    """
+
+    code = "TELEGRAM_NOT_CONFIGURED"
+
+
+class AuthorizationError(TelegramError):
+    """A credential submitted during login was rejected.
+
+    Recoverable by definition: a mistyped code is the ordinary case, and the
+    handler decides whether to try again. **The rejected value never appears in
+    this error**, in its message or its context -- an error object is exactly
+    the thing that reaches a log or a crash report.
+    """
+
+    code = "TELEGRAM_AUTHORIZATION_FAILED"
+
+
+class SessionRevokedError(TelegramError):
+    """Telegram no longer accepts this session.
+
+    Raised for ``AUTH_KEY_UNREGISTERED`` and ``SESSION_REVOKED``: the user
+    signed this device out from elsewhere, or Telegram invalidated it. Distinct
+    from :class:`AuthorizationError` because nothing the user types will help --
+    the remedy is a fresh login, and the local session material is now useless.
+    """
+
+    code = "TELEGRAM_SESSION_REVOKED"
+
+
 class EventDispatchError(AppError):
     """An event could not be dispatched.
 

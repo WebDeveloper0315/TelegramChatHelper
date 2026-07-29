@@ -114,8 +114,17 @@ but **nothing enforces it at startup** — carried in `ROADMAP.md` since M0. Unt
 M2 there was no session to protect, so the gap was theoretical. It stops being
 theoretical the moment a session key exists.
 
-**Proposed resolution:** enforcement lands in the session-storage slice (§14,
-slice 2). No ADR — the decision is already made, only unimplemented.
+**Resolved in slice 2 (Milestone 2.4).** `Container.start()` verifies the
+credential store before opening the database, and every CLI command that touches
+user data goes through it. Diagnostic commands deliberately do not, so `doctor`
+can still explain the refusal.
+
+Enforcement is in two places rather than one, because the flag and the operation
+answer different questions. `security.require_secret_store` governs **startup**,
+and the `development` and `testing` profiles set it `false` so a developer
+without a credential backend is not locked out. `PrepareSession` refuses
+**whatever the flag says**: there is nowhere else a session key may go, and an
+unencrypted fallback does not exist (`SECURITY.md` §8).
 
 ## 2.6 `DOMAIN_MODEL.md` §5.4: an unenforceable Contact invariant becomes enforceable
 
@@ -315,6 +324,15 @@ and `None` when the chat's beginning has been reached. Returning the boundary
 explicitly means the sync engine never has to infer "are we done" from an empty
 page, which is the classic source of an infinite backfill loop.
 
+**As implemented (slice 4).** `list_chats` is three TDLib calls, not one, and
+the order matters: `loadChats` asks the server to populate the client's list and
+answers `404` when it is already complete — an ordinary end condition, absorbed
+rather than raised; `getChats` returns *identifiers* in Telegram's own order,
+which is not re-sorted here because recomputing recency would need data this does
+not fetch; `getChat` resolves each one from TDLib's local database. A chat that
+disappears between the second and third call is skipped, because one vanished
+chat must not cost the user the other two hundred.
+
 **Removed for M2**, each to return with its consumer: `edit_message`,
 `delete_message` (no use case sends edits or deletions yet — ADR-046 makes
 messages append-only locally, so there is nothing to reconcile them with),
@@ -327,6 +345,32 @@ messages append-only locally, so there is nothing to reconcile them with),
 `API.md`'s definition stands. It is the one place the presentation layer
 supplies credentials, and codes and passwords pass through without being stored,
 logged or retained.
+
+**As implemented (slice 3):** `on_error` takes `Exception` rather than
+`AuthorizationError`. The parameter is what the handler is *shown*, and
+narrowing it would force the gateway to construct a specific type before it
+knows the failure is recoverable.
+
+`ConsoleAuthorizationHandler` keeps two slots — an attempt counter and its limit
+— so there is nowhere a credential could survive. That is asserted by test
+rather than left as a claim.
+
+## 5.2a How much of the gateway exists
+
+`TelegramGateway` is declared **one slice at a time** (ADR-051). Slice 3
+declared lifecycle, authorization, both state axes and `get_me`; slice 4 added
+`list_chats`, `get_chat` and `fetch_history`. `updates()` arrives with the update
+consumer (slice 7) and `send_message` with slice 8.
+
+`get_contact` is still absent after slice 4: Telegram carries a private chat's
+counterpart on the chat itself, so the listing needs no separate lookup. Contact
+synchronisation (slice 5) is what will need it.
+
+The gateway also owns the **single consumer** of `TdjsonClient.receive()`. The
+queue holds one item per update, so a second consumer would not duplicate the
+stream — it would split it, and each consumer would silently miss whatever the
+other took first. An architectural test asserts this, exactly as ADR-048's
+single-caller rule is asserted, *before* slice 4 introduces a second candidate.
 
 ## 5.3 Ports deliberately *not* created
 
@@ -409,6 +453,12 @@ variants live in `domain/model/telegram.py`. They are **not** the aggregates:
 they describe what Telegram said, exactly as `IncomingMessage` describes what a
 source offered (M1.5). Keeping them apart is what stops TDLib's shape leaking
 into the entities.
+
+**As implemented (slices 3 and 4):** `TelegramUser`, `TelegramChatInfo`,
+`TelegramMessage`, `CodeHint`, `PasswordHint` and `HistoryPage` exist. Each
+validates what Telegram cannot sensibly have said -- a non-positive identifier,
+a naive timestamp, a group with a single counterpart -- so a malformed frame
+fails at the boundary rather than three layers inside it.
 
 `TelegramUpdate` variants for M2: `NewMessage`, `ChatUpdated`,
 `AuthorizationStateChanged`, `ConnectionStateChanged`. `MessageEdited` and
@@ -672,8 +722,12 @@ entirely by TDLib's `connectionState` updates. Neither axis overwrites the other
   OS credential store under a name recorded in `Session.encryption_key_ref`.
   **The row holds the name; the store holds the key** — the existing
   `SecretStore` port and the `_ref` suffix redaction rule already support this.
-- `security.require_secret_store` is enforced *here*, closing §2.5. Without the
-  credential store, login refuses rather than falling back.
+- `security.require_secret_store` is enforced at startup, closing §2.5. Preparing
+  a session refuses whatever the flag says, because there is nowhere else the key
+  could go.
+- The per-account directory is **not** created when the session record is
+  written. TDLib creates its own store when it opens it, under a root that
+  already carries owner-only permissions.
 - Logout destroys the directory and the key, and writes an audit event.
 - Session material is excluded from backup and never restored (`SECURITY.md` §7
   point 5).
@@ -837,10 +891,10 @@ demonstrable. Sized like the M1.x slices that worked.
 | # | Slice | Delivers | Depends on |
 |---|---|---|---|
 | **0** | **TDLib binary resolution** | `TdjsonLoader` (discover, checksum, architecture, dependencies, load, entry points, version), pinned manifest, `tdlib doctor`/`version`/`verify`, committed build script | **Done, 2026-07-28** |
-| 1 | `TdjsonClient` | Receive thread, request/response correlation, `td_execute` config, shutdown. Provable by `getOption`. | 0 |
-| 2 | Session + storage | `Session` aggregate, migration `0007`, repository, key in credential store, `require_secret_store` enforced (§2.5) | 1 |
-| 3 | Authentication | `AuthorizationHandler`, `AuthenticateAccount`, `tgassist login` / `logout`; session survives restart | 2 |
-| 4 | Gateway reads + fake | `TelegramGateway` port, TDLib adapter reads, `FakeTelegramGateway`, shared contract suite, `tgassist chats` | 3 |
+| 1 | `TdjsonClient` | Receive thread, request/response correlation, backpressure, deterministic shutdown, health. Proved by `getOption` against the real library. | **Done, 2026-07-28** |
+| 2 | Session + storage | `Session` aggregate, migration `0007`, repository, key in credential store, `require_secret_store` enforced (§2.5) | **Done, 2026-07-28** |
+| 3 | Authentication | `AuthorizationHandler`, `AuthenticateAccount`, `tgassist login` / `logout`; session survives restart | **Done, 2026-07-28** |
+| 4 | Gateway reads + fake | `TelegramGateway` port, TDLib adapter reads, `FakeTelegramGateway`, shared contract suite, `tgassist telegram chats` | **Done, 2026-07-29** |
 | 5 | Chat and contact sync | `SyncChats` / `SyncContacts`, scope configuration, operator-identity invariant (§2.6) | 4 |
 | 6 | Backfill | `SyncCursor` + migration, `SyncEngine` backfill, batched transactions, resumption tests | 5 |
 | 7 | Live updates | Update consumer, ingestion serialiser, `MessagesIngested`, `tgassist watch` | 6 |

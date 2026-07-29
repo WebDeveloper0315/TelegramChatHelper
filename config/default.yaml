@@ -100,10 +100,25 @@ telegram:
   # Consider a system-installed tdjson as the last candidate.
   search_system_library_path: true
 
+  # Application identifier issued by https://my.telegram.org. It identifies this
+  # installation to Telegram, not the user. Required before "tgassist login"
+  # will run; there is no default, because there is nothing to derive one from.
+  api_id: null
+
+  # A NAME in the credential store, never the hash itself (ADR-021). Set the
+  # value with: tgassist secrets set TELEGRAM_API_HASH
+  api_hash_ref: TELEGRAM_API_HASH
+
+  # What this client calls itself in Telegram's active-sessions list. The user
+  # sees it when deciding whether to revoke a session.
+  device_model: Desktop
+
 security:
   # Apply owner-only permissions to directories the application creates.
   enforce_file_permissions: true
 
   # Refuse to start when the credential store is unavailable, rather than
-  # proceeding without session encryption. Enforced once the secret store lands.
+  # proceeding without session encryption. Checked by Container.start(), before
+  # the database is opened. Preparing a session refuses whatever this says:
+  # there is nowhere else a session key could go.
   require_secret_store: true

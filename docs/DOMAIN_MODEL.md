@@ -183,23 +183,40 @@ Account owns only the lifecycle it genuinely has: whether the user has selected 
 
 ## 5.3 Session
 
-**Responsibility.** Represents authenticated connection state for an Account, including the location of the encrypted Telegram session store and the current authorization stage. It exists in the domain because the authorization flow is a multi-step state machine the presentation layer must drive.
+*Implemented in Milestone 2.4. Corrected by ADR-049.*
 
-**Attributes.** `id`, `account_id`, `state`, `session_path`, `encryption_key_ref` (a name in the `SecretStore`, never a key value), `connected_at`, `last_activity_at`, `client_version`.
+**Responsibility.** Where an Account stands with Telegram: whether it has credentials, whether it has a connection, and where its encrypted local store lives. It exists in the domain because the authorization flow is a multi-step state machine the presentation layer must drive.
 
-**States.**
+**Identity.** `account_id` is the identity, simultaneously primary key and foreign key to `accounts(id)`. An Account has exactly one Session, so a surrogate key would be a second name for one row — the reasoning ADR-038 applied to User Profile.
+
+**Attributes.** `account_id`, `authorization_state`, `connection_state`, `session_path`, `encryption_key_ref` (a name in the `SecretStore`, never a key value), `client_version`, `connected_at`, `last_activity_at`, `created_at`, `updated_at`.
+
+**Two state axes, not one.** Version 1.0 of this document gave Session a single enum running from `disconnected` through `awaiting_code` to `ready` and `reconnecting`. TDLib reports **two** states and they vary independently, so one field cannot express *authorized but currently reconnecting* — the ordinary condition after any network interruption. Under the old model a reconnect had to overwrite `ready`, discarding the fact that the account was authorized, and the code then had to *infer* that authorization survived. See ADR-049.
 
 ```
-disconnected → connecting → awaiting_phone → awaiting_code
-             → awaiting_password (2FA) → ready
-             → reconnecting → disconnected | ready
-             → logged_out
+authorization: unauthorized → waiting_phone → waiting_code
+                            → waiting_password (2FA) → ready
+                            → logged_out
+
+connection:    offline ⇄ connecting ⇄ updating ⇄ ready
+               waiting_for_network
 ```
+
+Each mirrors what TDLib reports, so the adapter translates rather than infers. Neither axis overwrites the other.
+
+**Derived state.**
+- `is_authorized` — authorization is `ready`.
+- `is_connected` — connection is `updating` or `ready`. The socket is up from `updating` onwards; that state means *connected and catching up*.
+- `can_send` — authorized **and** connection is `ready`. Stricter than `is_connected` on purpose: a session still replaying its backlog may not know the conversation has moved on, and suggesting a reply into a stale view of a chat is the mistake this application exists to avoid. This replaces "only the `ready` state permits sending", which could not say which sense of ready it meant.
+- `needs_credentials` — the flow is waiting for something from a person.
 
 **Invariants.**
-- `encryption_key_ref` never holds key material.
-- Only the `ready` state permits sending.
-- Transition to `logged_out` destroys local session material.
+- `encryption_key_ref` never holds key material. A key value in that column is a security defect, not a shortcut.
+- A session that is not connected cannot record `connected_at`; a stale stamp would answer "how long connected" with a duration that never happened.
+- `updated_at >= created_at`; every timestamp is timezone-aware UTC.
+- Every invariant is restated as a `CHECK` constraint, so a row written by any route obeys them.
+
+**Lifecycle.** Prepared on demand — a session record is written when a login is first prepared, not when the Account is created — and removed by cascade with its Account. Logging out is a *transition*, not a deletion: it moves both axes and leaves a record saying so, because "this account was signed out" is a fact a deleted row cannot express. Destroying the local store and the key is the caller's work; an entity cannot delete a directory.
 
 ---
 

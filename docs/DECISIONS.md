@@ -39,9 +39,9 @@ Each decision must have one of the following statuses:
 - Rejected
 
 **ADR-001 through ADR-010 are Accepted.**
-**ADR-011 through ADR-039, ADR-041 through ADR-046 and ADR-048 through ADR-050 are Proposed and require explicit approval.**
+**ADR-011 through ADR-039, ADR-041 through ADR-046, ADR-050 and ADR-051 are Proposed and require explicit approval.**
 
-**ADR-040 and ADR-047 are Accepted and implemented.** ADR-011 through ADR-030 were approved for implementation at the close of the architecture stabilization session; ADR-031 through ADR-039 arose during implementation and await review.
+**ADR-040, ADR-047, ADR-048 and ADR-049 are Accepted and implemented.** ADR-011 through ADR-030 were approved for implementation at the close of the architecture stabilization session; ADR-031 through ADR-039 arose during implementation and await review.
 
 **ADR-040 is Accepted and implemented.**
 
@@ -98,9 +98,10 @@ Each decision must have one of the following statuses:
 | 045 | Message Identity Is Local; the External Identifier Is Optional and Its Index Partial | Proposed |
 | 046 | Messages Are Append-Only, and Nothing Deletes Them Yet | Proposed |
 | 047 | TDLib Binary Acquisition, Verification and Distribution | **Accepted** |
-| 048 | The TDLib Update Loop Runs on a Dedicated Thread, Bridged to asyncio | Proposed |
-| 049 | Session Models Authorization and Connection as Separate Axes | Proposed |
+| 048 | The TDLib Update Loop Runs on a Dedicated Thread, Bridged to asyncio | **Accepted** |
+| 049 | Session Models Authorization and Connection as Separate Axes | **Accepted** |
 | 050 | Synchronisation Cursors, Batch Boundaries and Batched Event Publication | Proposed |
+| 051 | Authorization Is Driven by a Dispatch Loop over a Single Update Stream | Proposed |
 
 ---
 
@@ -3991,11 +3992,11 @@ The TDLib Update Loop Runs on a Dedicated Thread, Bridged to asyncio
 
 Status
 
-Proposed
+Accepted
 
 Date
 
-2026-07-28
+2026-07-28 (proposed), 2026-07-28 (accepted and implemented)
 
 ---
 
@@ -4086,6 +4087,60 @@ Cons
 
 ---
 
+### As Implemented
+
+`TdjsonClient` in `infrastructure/telegram/client.py`. The decision stands
+unchanged; three things it did not specify had to be settled.
+
+**End of stream is an event, not a sentinel on the queue.** The obvious design
+places a sentinel value on the update queue at shutdown. It cannot work: the
+queue is bounded, and a stalled consumer is precisely what leaves it *full*, so
+the sentinel would be blocked by the condition it exists to report. `receive()`
+returns `None` instead, driven by an `asyncio.Event` that no amount of queued
+data can delay. Anything already queued is still drained first -- shutdown does
+not discard what was already received.
+
+**Backpressure is `run_coroutine_threadsafe`, polled.** The receive thread
+cannot `await` a full queue, so it submits the put to the loop and waits on the
+resulting concurrent future in short slices, rechecking the stop flag between
+them. Without the polling, a client stopped while its queue was full would hang
+until a consumer that is never coming drained it.
+
+**Restart is not supported**, and the state machine has no edge for it. A closed
+client's TDLib identifier is dead, and reusing the object would mean tracking
+which generation each pending future belonged to. Nothing needs it.
+
+Shutdown is deterministic and idempotent. `close()` returns only once the thread
+has stopped, every pending request has been failed with `TdlibNotRunningError`,
+and every waiting `receive()` has been released. A thread that ignores the stop
+request raises `TdlibShutdownTimeoutError` **after** the waiters are released --
+a hung thread must not also hang the application, but it is a defect and is
+reported as one.
+
+A dying receive thread is not silent: the client moves to `FAILED`, the reason
+is on `health()`, pending requests are failed and waiting receivers are
+released. `FAILED` survives `close()`, because "never started" and "died" need
+different responses.
+
+Malformed frames are counted, not raised. One frame that is not a JSON object
+must not cost every update queued behind it, and `health().malformed_frames`
+makes a pattern of them visible.
+
+Only `@type` is ever logged. A TDLib frame can carry an authorization code, a
+session key or message text (`SECURITY.md` section 9), so no frame body reaches
+a log.
+
+**The single-caller constraint is asserted by test**, not left to review:
+`td_receive` is reachable from exactly one file, and within it from exactly one
+method. Two threads calling it is undefined behaviour rather than an error, so
+a violation would be silent.
+
+Verified against the real library: `getOption` round-trips through
+`td_send`, the receive thread and the correlation registry, and the client shuts
+down cleanly. That test skips where no verified binary is recorded.
+
+---
+
 ### Related Decisions
 
 ADR-013 (concurrency model — this extends it), ADR-034 (single connection),
@@ -4101,7 +4156,7 @@ Session Models Authorization and Connection as Separate Axes
 
 Status
 
-Proposed
+Accepted and implemented
 
 Date
 
@@ -4215,10 +4270,49 @@ Cons
 
 ---
 
+### As Implemented
+
+`domain/model/session.py`, `telegram_sessions` (migration `0007`) and
+`SqlSessionRepository`. The decision stands; implementation settled three things
+it left open.
+
+**`connected` begins at `updating`, not at `ready`.** TDLib's sequence is
+`connecting` -> `updating` -> `ready`, and the socket is up from `updating`
+onwards -- that state means *connected and catching up*. Dating a connection from
+`ready` would time it from the moment its backlog finished draining, which after
+a week offline is a long way from when it connected. `is_connected` and the
+`connected_at` stamp therefore both use `CONNECTED_STATES = {UPDATING, READY}`,
+and moving between two connected states keeps the original stamp.
+
+**`can_send` is deliberately stricter than `is_connected`.** It still requires
+`connection_state is READY`. A session that is `updating` has a connection but
+has not finished replaying what it missed, so it may not know that the
+conversation it is about to reply to has moved on. Suggesting a reply into a
+stale view of a chat is the mistake this application exists to avoid, and
+waiting costs seconds.
+
+**The unconnected/timestamp rule is an invariant in both places.** A session
+that is not connected cannot carry `connected_at`, checked by the entity and
+restated as a table `CHECK`, so a row written by a repair script or a future
+migration cannot violate it either.
+
+Two tests assert that every member of each enumeration is storable, because the
+enums and the `CHECK` constraints would otherwise drift apart silently -- a state
+the entity accepts but the table refuses would fail only when a real user
+reached it.
+
+`encryption_key_ref` holds a `SecretStore` *name*; the key is generated with
+`secrets.token_urlsafe` and written to the credential store. Deliberately not
+behind an injectable port: a seam there would let anything substitute a
+predictable generator for the one protecting every message the user has sent.
+
+---
+
 ### Related Decisions
 
 ADR-037 (Account lifecycle separated from Session), ADR-038 (identity is the
-account), ADR-012 (gateway strategy). Corrects `DOMAIN_MODEL.md` §5.3.
+account), ADR-012 (gateway strategy), ADR-021 (the key is a name, not a value).
+Corrects `DOMAIN_MODEL.md` §5.3.
 
 ---
 
@@ -4393,6 +4487,160 @@ Future Considerations
 
 Related Decisions
 ```
+
+---
+
+# ADR-051
+
+## Title
+
+Authorization Is Driven by a Dispatch Loop over a Single Update Stream
+
+Status
+
+Proposed
+
+Date
+
+2026-07-28
+
+---
+
+### Context
+
+TDLib's login is **update-driven**. No request returns "you are logged in":
+the client emits `updateAuthorizationState`, the application answers with the
+matching request, and the next state arrives as another update. `TdjsonClient`
+(ADR-048) exposes exactly two things that touch this — `request()`, correlated
+by `@extra`, and `receive()`, a single-consumer queue of everything else.
+
+Something has to turn that stream into a sequence a caller can `await`, and the
+design must answer three questions the earlier ADRs left open:
+
+1. **Who consumes `client.receive()`?** The queue holds one item per update, so
+   a second consumer would not duplicate the stream — it would *split* it, and
+   each consumer would silently miss whatever the other took first.
+2. **Where do submissions run?** A `checkAuthenticationCode` awaits a reply.
+3. **How much of `TelegramGateway` exists now?** `API.md` section 10.1 and
+   `TELEGRAM_ARCHITECTURE.md` section 5.1 both specify a port with reading,
+   updates and sending on it, none of which this slice has a caller for.
+
+---
+
+### Decision
+
+**One dispatch loop, owned by the gateway, is the only consumer of
+`client.receive()`.** It routes `updateAuthorizationState` and
+`updateConnectionState` into a small mutable view, wakes anything waiting, and
+counts everything else. An architectural test asserts the single-consumer
+constraint, exactly as ADR-048's single-caller constraint is asserted.
+
+**Submissions run on the caller's task, never inside dispatch.** A submission
+that awaited its reply inside the dispatch loop would stall every other update
+behind it — including the state change it was waiting for. So
+`start_authorization` reads the view, asks the handler, calls
+`client.request()` itself, and then waits for the view to move.
+
+**The waiter compares the raw TDLib state, not the domain one.** Two TDLib
+states collapse to `UNAUTHORIZED`, and a wait that could not tell
+`waitTdlibParameters` from `waitEncryptionKey` would return before anything
+happened.
+
+**`TelegramGateway` is declared one slice at a time.** This slice declares
+lifecycle, authorization and `get_me`. Reading, updates and sending arrive with
+the code that calls them. A protocol listing methods no caller uses cannot be
+verified by a contract suite, and a fake would have to invent behaviour for
+them.
+
+**Unhandled updates are counted, not discarded silently.** `unhandled_updates`
+grows during a login, which is honest; slice 4 consumes them.
+
+---
+
+### Alternatives Considered
+
+**Expose `updates()` now and let the use case drive login.** Puts the state
+machine in the application layer, where it can be tested without a gateway.
+Rejected: it makes every consumer of the gateway responsible for knowing TDLib's
+protocol, which is the one thing the port exists to prevent. It also forces
+`updates()` to exist before anything reads it.
+
+**Drive the flow from `request()` alone, treating each reply as the next
+state.** Simpler, and it removes the dispatch loop entirely. Rejected because it
+is not how TDLib works: `checkAuthenticationCode` answers `ok`, and the state
+that matters arrives separately. A design that inferred the state from the reply
+would be right until two-factor authentication, where `ok` means *two* different
+things.
+
+**A per-request future keyed on the expected next state.** Precise, and it
+removes the polling in `_await_change_from`. Rejected: Telegram can move to a
+state nobody asked for — a revocation mid-login — and a design that only waits
+for expected states cannot see it.
+
+**Declare the whole port now, raising `NotImplementedError` for the rest.**
+Matches the documents. Rejected outright: that is placeholder code, and a fake
+implementing it would be inventing behaviour to satisfy a signature.
+
+---
+
+### Consequences
+
+Pros
+
+- The application layer never sees a TDLib type or a TDLib state name
+- The single-consumer rule is asserted rather than trusted, like ADR-048's
+- Login, retry and two-factor are testable with no network and no account: the
+  contract suite runs the real adapter against a TDLib that runs the real state
+  machine
+- The port grows with its consumers, so every method has a contract test
+
+Cons
+
+- `TelegramGateway` in `API.md` and `TELEGRAM_ARCHITECTURE.md` is larger than
+  the one that exists. Both now mark which methods are implemented; a reader
+  must check.
+- The gateway owns a task as well as a client, so `disconnect()` has two things
+  to release and a half-started `connect()` must undo both. It does.
+- A dispatch loop that dies would leave every waiter hanging, so it is written
+  never to raise.
+
+---
+
+### Future Considerations
+
+Slice 4 adds `updates()`. It must be fed *from the dispatch loop* rather than
+from a second `client.receive()` consumer, or the stream splits — which is why
+the constraint is asserted by test now, before there is a second candidate.
+
+`RetryDecision` currently has two members. A `RETRY_AFTER` for flood waits is
+the obvious third, and `errors.is_flood_wait` already recognises the condition;
+it waits for the sync engine, which is what will actually cause one.
+
+---
+
+### As Implemented
+
+Slice 3 built the dispatch loop and declared lifecycle, authorization and
+`get_me`. Slice 4 extended the port with `list_chats`, `get_chat` and
+`fetch_history` — the growth this decision anticipated, and the first test of
+whether growing a protocol one slice at a time is workable.
+
+It was: the contract suite gained a fixture and twenty-odd obligations, both
+implementations grew together, and nothing had to be un-invented. `get_contact`
+is still absent because nothing calls it, which is the rule doing its job rather
+than an oversight.
+
+The single-consumer constraint has held. Reads go through `client.request()`,
+correlated by `@extra`, so they never touch the update stream and the dispatch
+loop remains the only consumer of `client.receive()`.
+
+---
+
+### Related Decisions
+
+ADR-048 (the receive thread this consumes from), ADR-049 (the two state axes it
+reports), ADR-012 (gateway strategy), ADR-021 (credentials by name), ADR-023
+(no typing indicators — enforced structurally by the port's absence of one).
 
 ---
 

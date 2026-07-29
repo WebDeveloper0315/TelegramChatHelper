@@ -14,11 +14,35 @@ refuses to open a file it can see.
 from __future__ import annotations
 
 import json
+import queue
 import struct
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any, Final
 
+from tests.fakes.telegram_gateway import ACCEPTED_CODE, ACCEPTED_PASSWORD, DEFAULT_USER
+from tgassist.domain.model.chat import ChatType
+from tgassist.domain.model.identifiers import TelegramChatId
+from tgassist.domain.model.message import MessageType
+from tgassist.domain.model.telegram import TelegramChatInfo, TelegramMessage, TelegramUser
 from tgassist.infrastructure.telegram.loader import REQUIRED_SYMBOLS, NativeLibrary
+
+
+def user_frame(user: TelegramUser) -> dict[str, object]:
+    """Render a :class:`TelegramUser` as the TDLib object it came from.
+
+    Round-tripping through the real mapper is the point: a fake that produced a
+    shape the mapper never sees would let a mapping bug pass unnoticed.
+    """
+    return {
+        "@type": "user",
+        "id": int(user.id),
+        "first_name": user.first_name,
+        "last_name": user.last_name or "",
+        "usernames": {"editable_username": user.username or ""},
+    }
+
 
 TDLIB_VERSION = "1.8.29"
 """What a healthy fake reports. A real version, so the comparison is realistic."""
@@ -27,11 +51,26 @@ TDLIB_VERSION = "1.8.29"
 class FakeTdjson:
     """A library that behaves like a working TDLib.
 
-    Records the requests it was given, so a test can assert that the loader
-    silenced TDLib's logging before doing anything else.
+    Two roles. For the loader it answers ``td_execute``, and records what it was
+    asked so a test can assert that logging was silenced before anything else.
+    For the client it is a scriptable receive stream: :meth:`push` queues a
+    frame that :meth:`receive` will hand out, and :meth:`reply_to` makes a
+    request produce an answer.
+
+    :meth:`receive` genuinely blocks, like the real one, so the client's thread
+    behaves as it will in production rather than spinning.
     """
 
-    __slots__ = ("_symbols", "_version", "requests")
+    __slots__ = (
+        "_frames",
+        "_next_client_id",
+        "_receive_error",
+        "_replies",
+        "_symbols",
+        "_version",
+        "requests",
+        "sent",
+    )
 
     def __init__(
         self,
@@ -43,6 +82,13 @@ class FakeTdjson:
         self._version = version
         self._symbols = symbols
         self.requests: list[dict[str, object]] = []
+        self.sent: list[dict[str, object]] = []
+        self._frames: queue.Queue[str] = queue.Queue()
+        self._replies: dict[str, dict[str, object]] = {}
+        self._next_client_id = 1
+        self._receive_error: BaseException | None = None
+
+    # -- Loader-facing ---------------------------------------------------
 
     def has_symbol(self, name: str) -> bool:
         """Report whether this library exports an entry point."""
@@ -61,6 +107,349 @@ class FakeTdjson:
             return json.dumps({"@type": "optionValueString", "value": self._version})
         return None
 
+    # -- Client-facing ---------------------------------------------------
+
+    def create_client_id(self) -> int:
+        """Issue a client identifier, as TDLib does."""
+        client_id = self._next_client_id
+        self._next_client_id += 1
+        return client_id
+
+    def send(self, client_id: int, request: str) -> None:
+        """Record a request and, if one is scripted, queue its reply.
+
+        The reply carries the request's own ``@extra``, so a test exercises the
+        real correlation path rather than a shortcut around it.
+        """
+        document = json.loads(request)
+        document["@client_id"] = client_id
+        self.sent.append(document)
+
+        scripted = self._replies.get(str(document.get("@type")))
+        if scripted is not None:
+            reply = dict(scripted)
+            extra = document.get("@extra")
+            if extra is not None:
+                reply["@extra"] = extra
+            self.push(reply)
+
+    def receive(self, timeout: float) -> str | None:
+        """Block for a queued frame, or return ``None`` when none arrives.
+
+        Raises whatever :meth:`fail_receive` was given, which is how a test
+        makes the receive thread die.
+        """
+        if self._receive_error is not None:
+            error, self._receive_error = self._receive_error, None
+            raise error
+        try:
+            return self._frames.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    # -- Scripting -------------------------------------------------------
+
+    def push(self, frame: dict[str, object] | str) -> None:
+        """Queue a frame for :meth:`receive` to hand out.
+
+        Accepts a raw string so a test can push something that is not JSON.
+        """
+        self._frames.put(frame if isinstance(frame, str) else json.dumps(frame))
+
+    def reply_to(self, request_type: str, reply: dict[str, object]) -> None:
+        """Answer every request of a type with a reply."""
+        self._replies[request_type] = reply
+
+    def fail_receive(self, error: BaseException) -> None:
+        """Make the next :meth:`receive` raise, killing the receive thread."""
+        self._receive_error = error
+
+
+def chat_frame(chat: TelegramChatInfo) -> dict[str, object]:
+    """Render a :class:`TelegramChatInfo` as the TDLib object it came from.
+
+    Round-tripping through the real mapper is the point: a fake that produced a
+    shape the mapper never sees would let a mapping bug pass unnoticed.
+    """
+    if chat.chat_type is ChatType.PRIVATE:
+        kind: dict[str, object] = {
+            "@type": "chatTypePrivate",
+            "user_id": int(chat.counterpart_id) if chat.counterpart_id else 0,
+        }
+    elif chat.chat_type is ChatType.GROUP:
+        kind = {"@type": "chatTypeBasicGroup", "basic_group_id": 1}
+    else:
+        kind = {
+            "@type": "chatTypeSupergroup",
+            "supergroup_id": 1,
+            "is_channel": chat.chat_type is ChatType.CHANNEL,
+        }
+
+    frame: dict[str, object] = {
+        "@type": "chat",
+        "id": int(chat.id),
+        "type": kind,
+        "title": chat.title,
+        "unread_count": chat.unread_count,
+    }
+    if chat.last_message_id is not None:
+        frame["last_message"] = {"@type": "message", "id": int(chat.last_message_id)}
+    return frame
+
+
+def message_frame(message: TelegramMessage) -> dict[str, object]:
+    """Render a :class:`TelegramMessage` as the TDLib object it came from."""
+    content: dict[str, object] = {"@type": _CONTENT_TYPES[message.message_type]}
+    if message.text is not None:
+        key = "text" if message.message_type is MessageType.TEXT else "caption"
+        content[key] = {"@type": "formattedText", "text": message.text}
+
+    frame: dict[str, object] = {
+        "@type": "message",
+        "id": int(message.id),
+        "chat_id": int(message.chat_id),
+        "date": int(message.sent_at.timestamp()),
+        "is_outgoing": message.is_outgoing,
+        "content": content,
+    }
+    if message.sender_id is not None:
+        frame["sender_id"] = {
+            "@type": "messageSenderUser",
+            "user_id": int(message.sender_id),
+        }
+    if message.reply_to_message_id is not None:
+        frame["reply_to"] = {
+            "@type": "messageReplyToMessage",
+            "message_id": int(message.reply_to_message_id),
+        }
+    return frame
+
+
+#: The TDLib content type each domain message type is rendered as.
+_CONTENT_TYPES: Final[dict[MessageType, str]] = {
+    MessageType.TEXT: "messageText",
+    MessageType.PHOTO: "messagePhoto",
+    MessageType.VOICE: "messageVoiceNote",
+    MessageType.VIDEO: "messageVideo",
+    MessageType.DOCUMENT: "messageDocument",
+    MessageType.STICKER: "messageSticker",
+    MessageType.LOCATION: "messageLocation",
+    MessageType.POLL: "messagePoll",
+    MessageType.SERVICE: "messageChatJoinByLink",
+    MessageType.OTHER: "messageSomethingNewEntirely",
+}
+
+
+class AuthorizingTdjson(FakeTdjson):
+    """A TDLib that runs the real authorization state machine.
+
+    ``FakeTdjson`` answers requests; this one also *reacts* to them, pushing the
+    ``updateAuthorizationState`` that TDLib would push next. That is the whole
+    protocol the gateway exists to drive, so a gateway test against a fake that
+    only answered would prove nothing about the part that is hard.
+
+    The script is a state, not a list of frames: a wrong code leaves the state
+    where it was, exactly as Telegram does, so retry behaviour emerges rather
+    than being special-cased.
+    """
+
+    __slots__ = (
+        "_chats",
+        "_code",
+        "_history",
+        "_loaded",
+        "_password",
+        "_requires_password",
+        "_starts_authorized",
+        "_state",
+    )
+
+    def __init__(
+        self,
+        *,
+        starts_authorized: bool = False,
+        requires_password: bool = False,
+        code: str = ACCEPTED_CODE,
+        password: str = ACCEPTED_PASSWORD,
+        user: TelegramUser = DEFAULT_USER,
+    ) -> None:
+        """Build a library scripted for one login."""
+        super().__init__()
+        self._starts_authorized = starts_authorized
+        self._requires_password = requires_password
+        self._code = code
+        self._password = password
+        self._chats: list[TelegramChatInfo] = []
+        self._history: dict[int, list[TelegramMessage]] = {}
+        self._loaded = False
+        # Answered by default, because every flow that reaches `ready` asks it
+        # next and a test that had to remember would be testing its own setup.
+        self.reply_to("getMe", user_frame(user))
+        self._state = "authorizationStateWaitTdlibParameters"
+        self.announce(self._state)
+
+    def announce(self, state_type: str, **fields: object) -> None:
+        """Push an ``updateAuthorizationState`` for ``state_type``."""
+        self._state = state_type
+        self.push(
+            {
+                "@type": "updateAuthorizationState",
+                "authorization_state": {"@type": state_type, **fields},
+            }
+        )
+
+    def announce_connection(self, state_type: str) -> None:
+        """Push an ``updateConnectionState``."""
+        self.push({"@type": "updateConnectionState", "state": {"@type": state_type}})
+
+    def send(self, client_id: int, request: str) -> None:
+        """Answer a request, then push whatever TDLib would push next."""
+        document = json.loads(request)
+        kind = document.get("@type")
+        extra = document.get("@extra")
+
+        handled = self._advance(kind, document, extra)
+        if handled:
+            return
+        super().send(client_id, request)
+
+    def _advance(  # noqa: PLR0911, PLR0912 - one branch per TDLib request, and they are the point
+        self, kind: object, document: dict[str, Any], extra: object
+    ) -> bool:
+        """Run one step of the login. Returns whether the request was handled."""
+        if kind == "setTdlibParameters":
+            self._ok(extra)
+            if self._starts_authorized:
+                self.announce("authorizationStateReady")
+            else:
+                self.announce("authorizationStateWaitPhoneNumber")
+            return True
+
+        if kind == "setAuthenticationPhoneNumber":
+            self._ok(extra)
+            self.announce(
+                "authorizationStateWaitCode",
+                code_info={
+                    "@type": "authenticationCodeInfo",
+                    "type": {"@type": "authenticationCodeTypeSms", "length": 5},
+                    "timeout": 60,
+                },
+            )
+            return True
+
+        if kind == "checkAuthenticationCode":
+            if document.get("code") != self._code:
+                self._error(extra, 400, "PHONE_CODE_INVALID")
+                return True
+            self._ok(extra)
+            if self._requires_password:
+                self.announce(
+                    "authorizationStateWaitPassword",
+                    password_hint="the usual",  # noqa: S106 - the user's own reminder text
+                    has_recovery_email_address=True,
+                    recovery_email_address_pattern="a**@e*****.com",
+                )
+            else:
+                self.announce("authorizationStateReady")
+            return True
+
+        if kind == "checkAuthenticationPassword":
+            if document.get("password") != self._password:
+                self._error(extra, 400, "PASSWORD_HASH_INVALID")
+                return True
+            self._ok(extra)
+            self.announce("authorizationStateReady")
+            return True
+
+        if kind == "loadChats":
+            # TDLib answers 404 once the list is complete. Reproducing that is
+            # the point: an adapter that treated it as a failure would break for
+            # every account with few enough chats, and only there.
+            if self._loaded:
+                self._error(extra, 404, "Chat list is empty")
+            else:
+                self._loaded = True
+                self._ok(extra)
+            return True
+
+        if kind == "getChats":
+            limit = document.get("limit")
+            ids = [int(chat.id) for chat in self._chats]
+            self._answer(
+                extra, {"@type": "chats", "total_count": len(ids), "chat_ids": ids[:limit]}
+            )
+            return True
+
+        if kind == "getChat":
+            wanted = document.get("chat_id")
+            found = next((c for c in self._chats if int(c.id) == wanted), None)
+            if found is None:
+                self._error(extra, 404, "Chat not found")
+            else:
+                self._answer(extra, chat_frame(found))
+            return True
+
+        if kind == "getChatHistory":
+            self._answer(extra, self._history_page(document))
+            return True
+
+        if kind == "logOut":
+            self._ok(extra)
+            self.announce("authorizationStateLoggingOut")
+            return True
+
+        return False
+
+    def script_chats(self, *chats: TelegramChatInfo) -> None:
+        """Replace the chats this library will report."""
+        self._chats = list(chats)
+
+    def script_history(self, chat_id: TelegramChatId, *messages: TelegramMessage) -> None:
+        """Replace one chat's history."""
+        self._history[int(chat_id)] = list(messages)
+
+    def _history_page(self, document: dict[str, Any]) -> dict[str, object]:
+        """Build a ``messages`` reply, paging as TDLib does."""
+        chat_id = document.get("chat_id")
+        cursor = document.get("from_message_id") or 0
+        limit = document.get("limit") or 0
+
+        stored = sorted(
+            self._history.get(int(chat_id) if isinstance(chat_id, int) else 0, []),
+            key=lambda m: int(m.id),
+            reverse=True,
+        )
+        if cursor:
+            stored = [m for m in stored if int(m.id) < int(cursor)]
+        page = stored[: int(limit)] if limit else stored
+
+        return {
+            "@type": "messages",
+            "total_count": len(page),
+            "messages": [message_frame(m) for m in page],
+        }
+
+    def _answer(self, extra: object, frame: dict[str, object]) -> None:
+        """Answer a request with a payload."""
+        reply = dict(frame)
+        if extra is not None:
+            reply["@extra"] = extra
+        self.push(reply)
+
+    def _ok(self, extra: object) -> None:
+        """Answer a request with TDLib's ``ok``."""
+        frame: dict[str, object] = {"@type": "ok"}
+        if extra is not None:
+            frame["@extra"] = extra
+        self.push(frame)
+
+    def _error(self, extra: object, code: int, message: str) -> None:
+        """Answer a request with a TDLib error."""
+        frame: dict[str, object] = {"@type": "error", "code": code, "message": message}
+        if extra is not None:
+            frame["@extra"] = extra
+        self.push(frame)
+
 
 class SilentLibrary:
     """A library that exports everything but answers no request.
@@ -77,6 +466,18 @@ class SilentLibrary:
 
     def execute(self, request: str) -> str | None:
         """Answer nothing, whatever is asked."""
+        return None
+
+    def create_client_id(self) -> int:
+        """Issue a client identifier."""
+        return 1
+
+    def send(self, client_id: int, request: str) -> None:
+        """Accept a request and do nothing with it."""
+
+    def receive(self, timeout: float) -> str | None:
+        """Never produce a frame."""
+        time.sleep(min(timeout, 0.01))
         return None
 
 
@@ -99,6 +500,18 @@ class HostileLibrary:
         msg = f"exception from a mismatched library for {request[:20]}"
         raise OSError(msg)
 
+    def create_client_id(self) -> int:
+        """Issue a client identifier."""
+        return 1
+
+    def send(self, client_id: int, request: str) -> None:
+        """Accept a request and do nothing with it."""
+
+    def receive(self, timeout: float) -> str | None:
+        """Never produce a frame."""
+        time.sleep(min(timeout, 0.01))
+        return None
+
 
 class MalformedReplyLibrary:
     """A library returning something that is not JSON."""
@@ -112,6 +525,18 @@ class MalformedReplyLibrary:
     def execute(self, request: str) -> str | None:
         """Return bytes that do not parse."""
         return "not json at all"
+
+    def create_client_id(self) -> int:
+        """Issue a client identifier."""
+        return 1
+
+    def send(self, client_id: int, request: str) -> None:
+        """Accept a request and do nothing with it."""
+
+    def receive(self, timeout: float) -> str | None:
+        """Never produce a frame."""
+        time.sleep(min(timeout, 0.01))
+        return None
 
 
 def opener_for(library: NativeLibrary) -> Callable[[Path], NativeLibrary]:

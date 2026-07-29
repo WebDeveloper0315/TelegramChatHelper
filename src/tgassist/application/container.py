@@ -19,16 +19,20 @@ which is exactly the information a reader and a test need most.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
 
+from tgassist import __version__
 from tgassist.application.use_cases.account import (
     CreateAccount,
     GetAccount,
     ListAccounts,
     SetActiveAccount,
 )
+from tgassist.application.use_cases.authenticate import AuthenticateAccount, LogOutAccount
 from tgassist.application.use_cases.chat import (
     GetChat,
     ListChats,
@@ -47,11 +51,18 @@ from tgassist.application.use_cases.message import (
     IngestMessages,
     ReadChatHistory,
 )
+from tgassist.application.use_cases.session import PrepareSession
 from tgassist.application.use_cases.user_profile import (
     GetUserProfile,
     UpdateUserProfile,
 )
-from tgassist.domain.errors import SchemaVersionError, SecretStoreUnavailableError
+from tgassist.domain.errors import (
+    RecordNotFoundError,
+    SchemaVersionError,
+    SecretStoreUnavailableError,
+    TelegramNotConfiguredError,
+)
+from tgassist.domain.model.identifiers import AccountId
 from tgassist.domain.model.tdlib import TdlibRuntime
 from tgassist.domain.ports.account_repository import AccountRepository
 from tgassist.domain.ports.chat_repository import ChatRepository
@@ -64,6 +75,8 @@ from tgassist.domain.ports.message_repository import MessageRepository
 from tgassist.domain.ports.migration_runner import SchemaState, SchemaStatus
 from tgassist.domain.ports.repository import RepositoryFactory, ScopedRepositoryFactory
 from tgassist.domain.ports.secret_store import SecretStore
+from tgassist.domain.ports.session_repository import SessionRepository
+from tgassist.domain.ports.telegram_gateway import TelegramGateway
 from tgassist.domain.ports.unit_of_work import UnitOfWork
 from tgassist.domain.ports.user_profile_repository import UserProfileRepository
 from tgassist.infrastructure.clock import SystemClock
@@ -85,10 +98,13 @@ from tgassist.infrastructure.persistence import (
     chat_repository,
     contact_repository,
     message_repository,
+    session_repository,
     user_profile_repository,
 )
 from tgassist.infrastructure.security import build_default_secret_store
 from tgassist.infrastructure.telegram import LoaderSettings, TdjsonLoader
+from tgassist.infrastructure.telegram.client import TdjsonClient
+from tgassist.infrastructure.telegram.gateway import GatewaySettings, TdlibGateway
 
 
 class Container:
@@ -289,6 +305,15 @@ class Container:
         """
         return message_repository
 
+    @property
+    def sessions(self) -> ScopedRepositoryFactory[SessionRepository]:
+        """Return the session repository factory.
+
+        No delete: a session goes with its account, by cascade. Logging out is a
+        transition, not a deletion.
+        """
+        return session_repository
+
     # -- Use cases --------------------------------------------------------
     #
     # Built on demand rather than held, because a use case is a small object
@@ -389,6 +414,42 @@ class Container:
         """Build the message lookup use case."""
         return GetMessage(self._uow_factory, self.messages, self.accounts)
 
+    def prepare_session(self) -> PrepareSession:
+        """Build the session preparation use case.
+
+        Establishes what a login needs and cannot create for itself: a place to
+        put the encrypted store, and a key in the credential store to encrypt it
+        with. Authentication itself arrives in the next slice.
+        """
+        return PrepareSession(
+            self._uow_factory,
+            self.sessions,
+            self.accounts,
+            self._secrets,
+            self._clock,
+            self.config.paths.sessions_dir,
+        )
+
+    def authenticate_account(self) -> AuthenticateAccount:
+        """Build the login use case.
+
+        It takes the gateway per call rather than here, because a gateway holds
+        a live connection and this container hands out objects with no lifetime.
+        """
+        return AuthenticateAccount(
+            self._uow_factory,
+            self.sessions,
+            self.accounts,
+            self.prepare_session(),
+            self._clock,
+        )
+
+    def log_out_account(self) -> LogOutAccount:
+        """Build the logout use case."""
+        return LogOutAccount(
+            self._uow_factory, self.sessions, self.accounts, self._secrets, self._clock
+        )
+
     def repository[R](self, factory: RepositoryFactory[R], uow: UnitOfWork) -> R:
         """Build a repository bound to an open unit of work.
 
@@ -400,7 +461,38 @@ class Container:
         """
         return factory(uow)
 
-    # -- Database startup -------------------------------------------------
+    # -- Startup ----------------------------------------------------------
+
+    async def start(self, *, migrate: bool | None = None) -> SchemaStatus:
+        """Bring the application up: check the credential store, open the database.
+
+        The order is deliberate. ``SECURITY.md`` section 7 point 6 says the
+        application refuses to start when the credential store is unavailable
+        rather than falling back to an unencrypted session, and a check that ran
+        after the database was open would have already done work it promised not
+        to do.
+
+        This is the entry point every command that touches user data uses.
+        Diagnostic commands deliberately do not: ``doctor`` exists to *report* an
+        unavailable credential store, so refusing to run it would remove the one
+        tool that explains the refusal.
+
+        Args:
+            migrate: Apply pending migrations. Defaults to the configured
+                ``database.auto_migrate``.
+
+        Returns:
+            The schema position after any migration.
+
+        Raises:
+            SecretStoreUnavailableError: If ``security.require_secret_store`` is
+                set and no credential backend is available.
+            DatabaseUnavailableError: If the database cannot be opened.
+            SchemaVersionError: If the database was written by a newer version.
+            MigrationFailedError: If a migration fails.
+        """
+        await self.verify_secret_store()
+        return await self.start_database(migrate=migrate)
 
     async def start_database(self, *, migrate: bool | None = None) -> SchemaStatus:
         """Open the database and bring its schema to the expected revision.
@@ -472,8 +564,100 @@ class Container:
         runtime is unusable, because a diagnostic that raises tells the user
         less than one that explains.
         """
+        return self._tdjson_loader().inspect()
+
+    @asynccontextmanager
+    async def telegram_for(self, account_id: AccountId) -> AsyncIterator[TelegramGateway]:
+        """Open a Telegram gateway for one account, and close it afterwards.
+
+        Not a property like ``clock``: a gateway owns a native client and a
+        network connection, so it is acquired and released explicitly
+        (``TELEGRAM_ARCHITECTURE.md`` section 7.3). The context manager exists so
+        that no caller has to remember the release.
+
+        The session must already have been prepared — the gateway cannot be
+        built without the store path and the encryption key, and inventing
+        either here would put a second creator of session material in the
+        system.
+
+        Raises:
+            TelegramNotConfiguredError: If ``telegram.api_id`` is unset, or the
+                application hash is not in the credential store.
+            RecordNotFoundError: If the account has no prepared session.
+            TdlibNotFoundError: If no verified native library is available.
+        """
+        settings = await self._gateway_settings(account_id)
+        # The runtime report is discarded here: load() has already refused
+        # anything unusable, so what is left to say about it belongs to
+        # `tdlib doctor` rather than to a login.
+        library, _runtime = self._tdjson_loader().load()
+        gateway = TdlibGateway(account_id, TdjsonClient(library), settings)
+        try:
+            yield gateway
+        finally:
+            await gateway.disconnect()
+
+    async def _gateway_settings(self, account_id: AccountId) -> GatewaySettings:
+        """Collect everything TDLib needs before it will accept a request."""
         telegram = self.config.telegram
-        loader = TdjsonLoader(
+        if telegram.api_id is None:
+            msg = "telegram.api_id is not configured"
+            raise TelegramNotConfiguredError(
+                msg,
+                user_message=(
+                    "No Telegram application id is configured. Obtain one from "
+                    "https://my.telegram.org and set telegram.api_id."
+                ),
+            )
+
+        api_hash = await self._secrets.get(telegram.api_hash_ref)
+        if api_hash is None:
+            msg = f"No secret named {telegram.api_hash_ref} is stored"
+            raise TelegramNotConfiguredError(
+                msg,
+                user_message=(
+                    f"No Telegram application hash is stored under "
+                    f"{telegram.api_hash_ref}. Obtain one from "
+                    f"https://my.telegram.org and store it there."
+                ),
+                context={"api_hash_ref": telegram.api_hash_ref},
+            )
+
+        async with self._uow_factory() as uow:
+            session = await session_repository(uow, account_id).get()
+        if session is None:
+            msg = f"Account {int(account_id)} has no prepared session"
+            raise RecordNotFoundError(
+                msg,
+                user_message="That account has no Telegram session yet.",
+                context={"account_id": int(account_id)},
+            )
+
+        key = await self._secrets.get(session.encryption_key_ref)
+        if key is None:
+            msg = f"No session key is stored under {session.encryption_key_ref}"
+            raise TelegramNotConfiguredError(
+                msg,
+                user_message=(
+                    "The session encryption key is missing from the credential "
+                    "store. Sign out and sign in again to create a new one."
+                ),
+                context={"account_id": int(account_id)},
+            )
+
+        return GatewaySettings(
+            api_id=telegram.api_id,
+            api_hash=api_hash,
+            session_path=session.session_path,
+            database_encryption_key=key,
+            device_model=telegram.device_model,
+            application_version=__version__,
+        )
+
+    def _tdjson_loader(self) -> TdjsonLoader:
+        """Build a loader from the configured Telegram settings."""
+        telegram = self.config.telegram
+        return TdjsonLoader(
             LoaderSettings(
                 configured_path=telegram.tdjson_path,
                 data_dir=self.config.paths.data_dir,
@@ -482,7 +666,6 @@ class Container:
                 search_system=telegram.search_system_library_path,
             )
         )
-        return loader.inspect()
 
     def permission_report(self) -> dict[str, bool | None]:
         """Report whether each existing directory is restricted to its owner.

@@ -159,7 +159,7 @@ class SecuritySection(_Section):
         description=(
             "Refuse to start when the operating system credential store is "
             "unavailable, rather than proceeding without session encryption. "
-            "Enforced once the secret store is implemented."
+            "Checked by Container.start() before the database is opened."
         ),
     )
 
@@ -198,6 +198,33 @@ class TelegramSection(_Section):
         description=(
             "Consider a system-installed tdjson as the last candidate. Turn "
             "off to require an explicitly configured or vendored library."
+        ),
+    )
+    api_id: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Application identifier issued by https://my.telegram.org. It "
+            "identifies this installation to Telegram, not the user, and has "
+            "no default: there is nothing to derive it from."
+        ),
+    )
+    api_hash_ref: str = Field(
+        default="TELEGRAM_API_HASH",
+        min_length=1,
+        description=(
+            "Name under which the application hash is held in the SecretStore. "
+            "A name, never the value (ADR-021); the _ref suffix is what the "
+            "logging pipeline redacts on."
+        ),
+    )
+    device_model: str = Field(
+        default="Desktop",
+        min_length=1,
+        description=(
+            "What this client calls itself in Telegram's active-sessions list. "
+            "The user sees it when deciding whether to revoke a session, so it "
+            "should be recognisable rather than accurate."
         ),
     )
 

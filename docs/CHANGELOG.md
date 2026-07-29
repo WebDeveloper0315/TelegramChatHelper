@@ -36,6 +36,197 @@ Not every release requires every category.
 
 ## Added
 
+### Milestone 2.6 -- Gateway Reads
+
+Slice 4 of `TELEGRAM_ARCHITECTURE.md`: reading chats and history out of
+Telegram. Nothing is stored -- ingestion is the synchronisation engine's job,
+and a test asserts that these commands create no local rows.
+
+**The types**
+
+- `TelegramChatInfo`, `TelegramMessage` and `HistoryPage` join `TelegramUser` in `domain/model/telegram.py`. They describe what Telegram *said*; the entities describe what this application decided to remember (ADR-041, ADR-044). A `TelegramChatInfo` that is not private cannot name a counterpart, which keeps every private-chat rule from being applied to a group.
+- **`fetch_history` replaces the specified `iter_history`.** An `AsyncIterator` cannot express *where to continue from*: a caller draining one has no cursor to store, so a backfill interrupted part-way could not resume without re-reading. `HistoryPage` carries `messages` and `oldest_message_id`, and `reached_beginning` answers the single question a backfill asks.
+- **`reached_beginning` is true only for an empty page.** A short page is not proof, because Telegram returns short pages for reasons of its own -- which is the whole reason the boundary is returned rather than derived.
+
+**The adapter**
+
+- `list_chats` is **three TDLib calls, not one**. `loadChats` populates the client's list and answers `404` once it is complete -- an ordinary end condition, absorbed rather than raised, because treating it as a failure would break listing for every account with few enough chats. `getChats` returns identifiers in Telegram's own order, which is not re-sorted: recomputing recency locally would need data this does not fetch. `getChat` resolves each from TDLib's local database.
+- A chat that disappears between listing and resolving is skipped. One chat left or deleted mid-read must not cost the user the other two hundred.
+- `fetch_history` passes `offset=0`, so consecutive pages never overlap and the cursor message is never returned twice.
+- Message content maps conservatively: an unknown content type becomes `OTHER` rather than being refused, because losing it would leave a hole in a conversation the user can see in Telegram. Service messages are recognised by prefix, since TDLib has dozens and adds more.
+- A photo's **caption** is read into `text`. A conversation held in captions would otherwise look empty.
+
+**The commands**
+
+- `tgassist telegram chats` and `tgassist telegram history <chat-id>`. A `telegram` group rather than the specified top-level `chats`, because `chat` already manages what this application has *stored*, and one word is what keeps the two from being confused at the moment a user types them. Both print "Nothing was stored."
+
+**Tests -- 128 added, suite at 1997**
+
+- The contract suite is now **95 tests over both implementations**: listing, ordering, unread counts, empty chats, limits, paging that reaches every message exactly once, non-overlapping pages, and the beginning being reported rather than inferred.
+- `FakeTelegramGateway` gained `script_chats` and `script_history`, and its paging behaves as TDLib's does -- so a backfill loop written against the fake is one that works against Telegram (`TELEGRAM_ARCHITECTURE.md` §12.2).
+- The scripted TDLib renders domain objects back into TDLib JSON and the adapter maps them forward, so a mapping bug cannot pass unnoticed by agreeing with itself.
+
+## Fixed
+
+- `tgassist telegram history` claimed "Beginning of the chat" for any page shorter than the limit. Telegram returns short pages for reasons of its own, so the claim was not knowable; it now reports the cursor and says older messages *may* continue.
+
+## Architecture Decisions
+
+- **ADR-051** gains an *As Implemented* section: slice 4 was the first test of growing a protocol one slice at a time, and it held. The single-consumer constraint held too -- reads go through `client.request()`, correlated by `@extra`, so they never touch the update stream.
+
+## Scope note
+
+Nine source and test files were created or modified, within the twenty-file limit.
+
+### Milestone 2.5 -- Authentication
+
+Slice 3 of `TELEGRAM_ARCHITECTURE.md`: signing in, signing out, and a session
+that survives a restart. No reading, no updates, no sending.
+
+**The boundary**
+
+- `TelegramGateway` and `AuthorizationHandler` are now real ports. The gateway is **declared one slice at a time** (ADR-051): this slice declares lifecycle, both state axes, authorization and `get_me`, because a protocol listing methods no caller uses cannot be verified by a contract suite and a fake would have to invent behaviour for them.
+- `connection_state()` is new relative to `API.md` v1.0. ADR-049 gave Session two independent axes, and a caller recording both cannot derive the second from `is_connected()`.
+- **There is still no method for sending typing indicators**, and a contract test now asserts that neither implementation has one -- ADR-023 §2 made structural rather than documented.
+
+**Driving an update-driven protocol (ADR-051)**
+
+- TDLib's login returns nothing that says "you are logged in": state arrives as `updateAuthorizationState`. `TdlibGateway` runs one **dispatch loop** that owns the only consumer of `TdjsonClient.receive()`, and `start_authorization` reads the resulting view, asks the handler, submits, and waits for the view to move.
+- **Submissions never run inside dispatch.** One that awaited its reply there would stall every other update behind it -- including the state change it was waiting for.
+- **The waiter compares the raw TDLib state, not the domain one.** Two TDLib states collapse to `UNAUTHORIZED`, and a wait that could not tell them apart would return before anything happened.
+- **The single-consumer constraint is asserted by test**, before slice 4 introduces a second candidate. The queue holds one item per update, so a second consumer would not duplicate the stream -- it would split it, and each would silently miss what the other took.
+- `authorizationStateClosing` and `Closed` are deliberately **not** a logout. Closing is what every ordinary disconnect does, and recording it as a logout would tell the user they had been signed out every time they quit.
+- Four real Telegram flows this application does not implement -- registration, QR confirmation and the two email flows -- each get a sentence saying what happened, because "TDLib changed" and "you need a flow we do not support" need different answers.
+
+**Correctness**
+
+- **A login that authenticated as a different Telegram user is refused, not recorded.** The account already owns that person's chats, contacts and messages, and there is no way to unmix two histories afterwards.
+- Both session axes are written from what the gateway reports, so an authorized account still catching up is recorded as exactly that.
+- `LoginResult.was_already_authorized` distinguishes a restored session from a fresh sign-in rather than implying one happened.
+- Logout tells Telegram, records the transition, then destroys the store and the key -- in that order, so a failure part-way leaves nothing usable rather than something half-usable.
+
+**Security**
+
+- **Nothing retains a credential.** Each lives in a local for one request; `ConsoleAuthorizationHandler` has two slots -- an attempt counter and its limit -- so there is nowhere one could survive, and a test asserts that shape.
+- The password is read with `getpass`, so it never reaches the screen, the scrollback or the shell history. The code is not: it is short-lived, useless once submitted, and a user who cannot see what they typed will mistype it.
+- A rejection reports Telegram's reason and never the value: the mapped error carries `operation`, `telegram_code` and `telegram_message` and nothing else.
+- The application hash is a **name** in the credential store (`telegram.api_hash_ref`), never a value in a file.
+
+**Configuration**
+
+- `telegram.api_id`, `telegram.api_hash_ref` and `telegram.device_model` move from *specified* to *implemented*. They identify the installation, not the user, and are obtained by hand from my.telegram.org -- documented in `DEVELOPMENT_WORKFLOW.md` §27, and reported as `TELEGRAM_NOT_CONFIGURED` rather than as a connection failure when absent.
+
+**Tests -- 181 added, suite at 1869**
+
+- A **47-test contract suite** runs every obligation against the hand-written fake *and* against `TdlibGateway` driven by a TDLib that runs the real login state machine -- clean login, wrong code, retry, abort, two-factor, restored session, logout. That is what makes the fake trustworthy everywhere else it is used.
+- No test needs a Telegram account, a network or a real native library.
+- Two test-isolation defects found and fixed: one test wrote `TELEGRAM_API_HASH` into the developer's **real** operating-system credential manager, and the CLI tests wrote a session key per run. Both now use an in-memory store; the leaked secret was removed.
+
+## Architecture Decisions
+
+- **ADR-051** *(Proposed)* -- Authorization Is Driven by a Dispatch Loop over a Single Update Stream. Records the three questions ADR-048 and ADR-049 left open, and why the port grows with its consumers.
+
+## Changed
+
+- `TdlibRequestFailedError` now carries TDLib's own message in its context. It is a constant such as `PHONE_CODE_INVALID`, never user data, and without it a caller can only report that something was refused.
+- The ADR-048 ownership test matched `.receive(` textually and so also caught consumers of the client's own async queue -- a different call with none of the same danger. It now matches `_library.receive(`, and a second test asserts the new single-consumer rule.
+
+## Scope note
+
+Twenty-one source and test files were created or modified. That is **at the twenty-file guideline rather than inside it**, and it is worth saying why rather than rounding: this slice crosses four layers at once, because a port only the domain declares cannot be tested and an adapter with no use case above it cannot be run. The alternative was to split the port from its only implementation, which would have left a slice that proved nothing.
+
+### Milestone 2.4 -- Session Storage
+
+Slice 2 of `TELEGRAM_ARCHITECTURE.md`: where an account stands with Telegram, and
+where its encrypted local store lives. No authentication flow, no gateway, no
+synchronisation.
+
+**The aggregate**
+
+- `Session` carries **two independent state axes**, not one. TDLib reports authorization and connection separately and they vary independently, so a single enum cannot express *authorized but currently reconnecting* -- the ordinary condition after any network interruption. `DOMAIN_MODEL.md` §5.3 specified one column; it was corrected rather than worked around (ADR-049).
+- `account_id` is the identity and the primary key. One session per account, so a surrogate key would be a second name for one row.
+- `can_send` replaces "only the `ready` state permits sending", which could not say which sense of ready it meant.
+
+**Two judgements the ADR left open**
+
+- **`connected` begins at `updating`, not `ready`.** TDLib's socket is up from `updating` onwards; that state means *connected and catching up*. Dating a connection from `ready` would time it from the moment its backlog finished draining, which after a week offline is a long way from when it connected.
+- **`can_send` is stricter than `is_connected`**, still requiring `ready`. A session replaying its backlog may not know the conversation it is about to reply to has moved on, and suggesting a reply into a stale view of a chat is the mistake this application exists to avoid.
+
+**Storage**
+
+- `telegram_sessions` and migration `0007`. Every entity invariant is restated as a `CHECK` constraint, so a row written by a repair script or a future migration cannot violate it either.
+- Two tests assert that **every member of each enumeration is storable**. The enums and the constraints would otherwise drift apart silently: a state the entity accepts but the table refuses would fail only when a real user reached it.
+- `SqlSessionRepository` and an independently written in-memory fake, both run against one 46-test contract suite. **No `delete`**: a session goes with its account by cascade, and logging out is a transition that leaves a record saying so.
+- A downgrade drops the row, not the store on disk. Deleting a user's encrypted session directory is not a schema change's business.
+
+**Security**
+
+- `PrepareSession` generates the session key with `secrets.token_urlsafe` and writes it to the `SecretStore`; the row holds only the **name**. Generation is deliberately *not* behind an injectable port -- a seam there would let anything substitute a predictable generator for the one protecting every message the user has sent.
+- A test asserts structurally that **neither the entity nor the table has a field a key would fit**, so the rule is not a convention anyone has to remember.
+- Key first, row second, commit last. The other order would allow a row naming a key that was never stored, which looks like a working session until the first login fails. The reverse leftover costs nothing: the name is derived from the account, so the next attempt overwrites it.
+- Preparation is idempotent. A second key would make the store the first key encrypted permanently unreadable.
+
+**`security.require_secret_store` is enforced at last**
+
+- Carried unenforced since Milestone 0, because until now there was no session to protect. `Container.start()` verifies the credential store **before** opening the database -- a refusal that had already migrated would have done work it promised not to do -- and all 17 CLI commands that touch user data now go through it.
+- `doctor` deliberately does not, so the one tool that explains an unavailable credential store still runs.
+- `PrepareSession` refuses **whatever the flag says**. The flag governs startup; there is nowhere else a session key may go, and an unencrypted fallback does not exist.
+
+**Tests -- 157 added, suite at 1688**
+
+- Aggregate, validation, derived state, transitions, mapper, migration, cascade and check constraints; the repository contract over both implementations; the use case against fakes; and the startup rule against a real container with and without a credential backend.
+
+## Architecture Decisions
+
+- **ADR-049** is now **Accepted and implemented**, with an *As Implemented* section recording the three judgements above.
+
+## Scope note
+
+Fifteen source and test files were created or modified, within the twenty-file limit.
+
+### Milestone 2.3 -- TDLib Receive Bridge
+
+Slice 1 of `TELEGRAM_ARCHITECTURE.md`: the runtime boundary between the verified
+library and the application. No authentication, no session, no synchronisation --
+the client moves JSON objects and knows nothing of Telegram.
+
+**The bridge**
+
+- `TdjsonClient` owns a `tgassist-td` thread running `td_receive`, and hands every frame to the event loop. `td_send` is called straight from the loop, because TDLib guarantees it is thread-safe and only receipt needs a thread.
+- **The single-caller constraint is asserted by test**: `td_receive` is reachable from exactly one file and, within it, one method. Two threads calling it is undefined behaviour rather than an error, so a violation would be silent.
+- Requests correlate by an `@extra` the client generates, replacing any the caller supplied -- correlation is the registry's to own.
+- The update queue is bounded. When full, the receive thread **blocks** before its next `td_receive`, so TDLib buffers internally rather than this process growing without bound. `health()` reports depth and high-water mark, because a queue that filled once and drained looks identical to one that never filled.
+
+**Three things ADR-048 did not specify, settled here**
+
+- **End of stream is an event, not a sentinel on the queue.** The obvious design places a sentinel on the update queue at shutdown, and it cannot work: the queue is bounded, and a stalled consumer is exactly what leaves it *full*, so the sentinel would be blocked by the condition it exists to report. `receive()` returns `None`, driven by an event. Anything already queued is still drained first.
+- **Backpressure is a polled `run_coroutine_threadsafe`.** The receive thread cannot `await` a full queue, so it waits on a concurrent future in short slices, rechecking the stop flag. Without the polling, a client stopped while its queue was full would hang until a consumer that is never coming drained it.
+- **Restart is not supported.** A closed client's TDLib identifier is dead, and reusing the object would mean tracking which generation each pending future belonged to.
+
+**Failure is never silent**
+
+- A dying receive thread moves the client to `FAILED`, records why on `health()`, fails every pending request and releases every waiting receiver. `FAILED` survives `close()`: "never started" and "died" need different responses.
+- `close()` is deterministic and idempotent, returning only once the thread has stopped and every waiter is released. A thread that ignores the stop request raises `TdlibShutdownTimeoutError` **after** the waiters are released -- a hung thread must not also hang the application.
+- Malformed frames are counted, not raised. One frame that is not a JSON object must not cost every update queued behind it.
+
+**Security**
+
+- Only a frame's `@type` is ever logged, never its body. This is upstream of the redaction processor rather than relying on it: redaction is keyed on field names, and TDLib's field names are its own, so a frame logged wholesale could carry a key the processor has never heard of.
+
+**Tests -- 50 added, suite at 1528**
+
+- Lifecycle, sending, correlation, concurrent requests, queue saturation, backpressure, high-water, cancellation, malformed frames, thread death, shutdown, and the architectural single-caller check.
+- The fake TDLib **blocks** in `receive` exactly as `td_receive` does, so the client's thread behaves in tests as it will in production.
+- One integration test drives the **real** library: `getOption` round-trips through `td_send`, the receive thread and the correlation registry, and the client shuts down cleanly. It skips where no verified binary is recorded, so CI needs none.
+
+## Architecture Decisions
+
+- **ADR-048** is now **Accepted and implemented**, with an *As Implemented* section recording the three points above.
+
+## Scope note
+
+Seven source and test files were created or modified, within the twenty-file limit.
+
 ### Milestone 2.2 -- TDLib Foundation Verified Against Real Native Code
 
 Completes slice 0. The previous entry built the verification machinery against

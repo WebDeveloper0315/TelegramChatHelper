@@ -31,9 +31,14 @@ from tgassist.application.use_cases.account import CreateAccountRequest
 from tgassist.application.use_cases.contact import ContactTransition
 from tgassist.application.use_cases.message import IncomingMessage
 from tgassist.application.use_cases.user_profile import ProfileChanges
-from tgassist.domain.errors import AppError, ConfigurationError, DomainValidationError
+from tgassist.domain.errors import (
+    AppError,
+    ConfigurationError,
+    DomainValidationError,
+    RecordNotFoundError,
+)
 from tgassist.domain.model.chat import AiProcessingMode, Chat, ChatType
-from tgassist.domain.model.identifiers import AccountId
+from tgassist.domain.model.identifiers import AccountId, TelegramChatId
 from tgassist.domain.model.message import MessageType, SenderKind
 from tgassist.domain.model.query import PageRequest
 from tgassist.domain.model.tdlib import (
@@ -48,7 +53,9 @@ from tgassist.domain.model.user_profile import (
     TimeRange,
     TonePreference,
 )
+from tgassist.domain.ports.telegram_gateway import DEFAULT_CHAT_LIMIT
 from tgassist.domain.services.sensitivity import is_sensitive_key
+from tgassist.presentation.cli.authorization import ConsoleAuthorizationHandler
 
 MASKED = "********"
 
@@ -88,6 +95,11 @@ message_app = typer.Typer(help="Ingest and read conversation history.", no_args_
 app.add_typer(message_app, name="message")
 tdlib_app = typer.Typer(help="Inspect the native Telegram library.", no_args_is_help=True)
 app.add_typer(tdlib_app, name="tdlib")
+# Distinct from `chat`, which manages what this application has stored. These
+# commands read Telegram and store nothing, and one word is what keeps the two
+# from being confused at the moment a user types them.
+telegram_app = typer.Typer(help="Read directly from Telegram.", no_args_is_help=True)
+app.add_typer(telegram_app, name="telegram")
 
 ProfileOption = Annotated[
     str | None,
@@ -418,7 +430,7 @@ def account_create(
     container = _open(profile, config_dir)
 
     async def run() -> None:
-        await container.start_database()
+        await container.start()
         account = await container.create_account().execute(
             CreateAccountRequest(
                 telegram_user_id=telegram_user_id,
@@ -446,7 +458,7 @@ def account_show(
     container = _open(profile, config_dir)
 
     async def run() -> None:
-        await container.start_database()
+        await container.start()
         account = await container.get_account().execute(account_id)
         if account is None:
             typer.echo("No account found." if account_id else "No account is active.")
@@ -472,7 +484,7 @@ def account_list(
     container = _open(profile, config_dir)
 
     async def run() -> None:
-        await container.start_database()
+        await container.start()
         page = await container.list_accounts().execute(PageRequest(limit=limit))
         if not page:
             typer.echo("No accounts.")
@@ -501,7 +513,7 @@ def account_activate(
     container = _open(profile, config_dir)
 
     async def run() -> None:
-        await container.start_database()
+        await container.start()
         account = await container.set_active_account().execute(account_id)
         typer.echo(f"Account {account.id} ({account.display_name}) is now active.")
 
@@ -525,7 +537,7 @@ def profile_show(
     container = _open(profile, config_dir)
 
     async def run() -> None:
-        await container.start_database()
+        await container.start()
         found = await container.get_user_profile().execute(
             AccountId(account_id) if account_id is not None else None
         )
@@ -570,7 +582,7 @@ def profile_set(  # noqa: PLR0913 - one option per settable preference
     container = _open(profile, config_dir)
 
     async def run() -> None:
-        await container.start_database()
+        await container.start()
         changes = ProfileChanges(
             primary_language=language,
             tone_preference=tone,
@@ -638,7 +650,7 @@ def contact_add(  # noqa: PLR0913, PLR0917 - Typer reads the options from the si
     container = _open(profile, config_dir)
 
     async def run() -> None:
-        await container.start_database()
+        await container.start()
         contact = await container.create_contact().execute(
             telegram_user_id=telegram_user_id,
             display_name=display_name,
@@ -662,7 +674,7 @@ def contact_show(
     container = _open(profile, config_dir)
 
     async def run() -> None:
-        await container.start_database()
+        await container.start()
         # Deleted contacts are shown here deliberately: somebody asking for a
         # specific identifier wants to know it was deleted, not to be told it
         # does not exist.
@@ -705,7 +717,7 @@ def contact_list(
     container = _open(profile, config_dir)
 
     async def run() -> None:
-        await container.start_database()
+        await container.start()
         page = await container.list_contacts().execute(
             PageRequest(limit=limit),
             account_id=AccountId(account_id) if account_id is not None else None,
@@ -801,7 +813,7 @@ def _change_contact(
     container = _open(profile, config_dir)
 
     async def run() -> None:
-        await container.start_database()
+        await container.start()
         contact = await container.change_contact_status().execute(
             contact_id,
             transition,
@@ -859,7 +871,7 @@ def chat_open(  # noqa: PLR0913, PLR0917 - Typer reads the options from the sign
     scope = AccountId(account_id) if account_id is not None else None
 
     async def run() -> None:
-        await container.start_database()
+        await container.start()
         if resolved_type is ChatType.PRIVATE:
             if contact_id is None:
                 typer.echo(
@@ -916,7 +928,7 @@ def chat_show(
     scope = AccountId(account_id) if account_id is not None else None
 
     async def run() -> None:
-        await container.start_database()
+        await container.start()
         if (chat_id is None) == (contact_id is None):
             typer.echo("Give a chat identifier or --contact, not both.", err=True)
             raise typer.Exit(code=EXIT_ERROR)
@@ -955,7 +967,7 @@ def chat_list(
     container = _open(profile, config_dir)
 
     async def run() -> None:
-        await container.start_database()
+        await container.start()
         page = await container.list_chats().execute(
             PageRequest(limit=limit),
             account_id=AccountId(account_id) if account_id is not None else None,
@@ -996,7 +1008,7 @@ def chat_set(  # noqa: PLR0913, PLR0917 - Typer reads the options from the signa
     container = _open(profile, config_dir)
 
     async def run() -> None:
-        await container.start_database()
+        await container.start()
         chat = await container.set_chat_policy().execute(
             chat_id,
             sync_enabled=sync,
@@ -1055,7 +1067,7 @@ def message_ingest(  # noqa: PLR0913, PLR0917 - Typer reads the options from the
     container = _open(profile, config_dir)
 
     async def run() -> None:
-        await container.start_database()
+        await container.start()
         moment = _parse_instant(sent_at) if sent_at is not None else container.clock.now()
         report = await container.ingest_messages().execute(
             chat_id,
@@ -1094,7 +1106,7 @@ def message_history(
     container = _open(profile, config_dir)
 
     async def run() -> None:
-        await container.start_database()
+        await container.start()
         page = await container.read_chat_history().execute(
             chat_id,
             PageRequest(limit=limit),
@@ -1124,7 +1136,7 @@ def message_show(
     container = _open(profile, config_dir)
 
     async def run() -> None:
-        await container.start_database()
+        await container.start()
         message = await container.get_message().execute(
             message_id,
             account_id=AccountId(account_id) if account_id is not None else None,
@@ -1427,6 +1439,180 @@ def _tdlib_checks(  # noqa: PLR0911 - one exit per stage, so later stages read "
         )
     )
     return checks
+
+
+@app.command("login")
+def login(
+    account: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Sign an account in to Telegram.
+
+    Prompts only for what Telegram asks for. A session that is still valid needs
+    nothing, so running this after a restart connects and reports rather than
+    asking for a code that was never sent.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        target = account_id or await _active_account_id(container)
+        async with container.telegram_for(target) as gateway:
+            result = await container.authenticate_account().execute(
+                gateway, ConsoleAuthorizationHandler(), target
+            )
+
+        if result.was_already_authorized:
+            typer.echo(f"Already signed in as {result.user.display_name}.")
+        else:
+            typer.echo(f"Signed in as {result.user.display_name}.")
+        typer.echo(f"  authorization: {result.session.authorization_state.value}")
+        typer.echo(f"  connection: {result.session.connection_state.value}")
+
+    _run_async(container, run())
+
+
+@app.command("logout")
+def logout(
+    account: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Do not ask for confirmation.")] = False,
+) -> None:
+    """Sign an account out and destroy its local session store and key.
+
+    Irreversible in the way that matters: the encryption key is deleted, so the
+    stored session cannot be reopened even if the files survive. Conversation
+    history in the database is untouched.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        target = account_id or await _active_account_id(container)
+
+        if not yes and not typer.confirm(
+            "Sign out and delete the local Telegram session store and its key?"
+        ):
+            typer.echo("Cancelled.")
+            return
+
+        async with container.telegram_for(target) as gateway:
+            await gateway.connect()
+            session = await container.log_out_account().execute(gateway, target)
+
+        if session is None:
+            typer.echo("That account had no Telegram session.")
+            return
+        typer.echo("Signed out. The local session store and its key were deleted.")
+
+    _run_async(container, run())
+
+
+async def _active_account_id(container: Container) -> AccountId:
+    """Resolve the account to operate on, failing clearly when there is none.
+
+    The gateway has to be built before the use case runs -- it needs the session
+    the use case will update -- so the account cannot be resolved inside the use
+    case as it is everywhere else. The message matches the one
+    ``resolve_account`` produces, so the user sees the same thing whichever path
+    reported it.
+    """
+    account = await container.get_account().execute(None)
+    if account is None:
+        msg = "No account is active"
+        raise RecordNotFoundError(msg, user_message="No account is active. Create one first.")
+    return account.id
+
+
+@telegram_app.command("chats")
+def telegram_chats(
+    account: AccountOption = None,
+    limit: Annotated[
+        int, typer.Option("--limit", "-n", min=1, help="How many chats to show.")
+    ] = DEFAULT_CHAT_LIMIT,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """List the chats Telegram has for this account.
+
+    Reads Telegram, not the local database -- nothing here is stored. Use
+    `tgassist chat list` for what this application has recorded.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        target = account_id or await _active_account_id(container)
+        async with container.telegram_for(target) as gateway:
+            await gateway.connect()
+            chats = await gateway.list_chats(limit=limit)
+
+        if not chats:
+            typer.echo("No chats.")
+            return
+        for chat in chats:
+            unread = f"  {chat.unread_count} unread" if chat.unread_count else ""
+            typer.echo(f"{int(chat.id):>15}  {chat.chat_type.value:<11} {chat.title}{unread}")
+        typer.echo("")
+        typer.echo(f"{len(chats)} chat(s). Nothing was stored.")
+
+    _run_async(container, run())
+
+
+@telegram_app.command("history")
+def telegram_history(
+    chat_id: Annotated[int, typer.Argument(help="Telegram chat id, from `telegram chats`.")],
+    account: AccountOption = None,
+    limit: Annotated[
+        int, typer.Option("--limit", "-n", min=1, help="How many messages to show.")
+    ] = 20,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Show the newest messages in a Telegram chat, without storing them.
+
+    A read, not an import. Ingestion arrives with the synchronisation engine;
+    this exists so a chat can be looked at before deciding to sync it.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        target = account_id or await _active_account_id(container)
+        async with container.telegram_for(target) as gateway:
+            await gateway.connect()
+            chat = await gateway.get_chat(TelegramChatId(chat_id))
+            if chat is None:
+                typer.echo("That chat is not visible to this account.", err=True)
+                raise typer.Exit(code=EXIT_ERROR)
+            page = await gateway.fetch_history(TelegramChatId(chat_id), limit=limit)
+
+        typer.echo(f"{chat.title} ({chat.chat_type.value})")
+        typer.echo("")
+        if page.is_empty:
+            typer.echo("No messages.")
+            return
+        # Oldest first: a conversation reads downwards, whatever order the
+        # transport returned it in.
+        for item in reversed(page.messages):
+            who = "you" if item.is_outgoing else "them"
+            when = item.sent_at.strftime("%Y-%m-%d %H:%M")
+            body = item.text if item.text is not None else f"({item.message_type.value})"
+            typer.echo(f"{when}  {who:<5} {body}")
+        typer.echo("")
+        typer.echo(f"{len(page.messages)} message(s). Nothing was stored.")
+        if not page.reached_beginning:
+            # Deliberately "may": a short page is not proof of the beginning,
+            # which is why only an empty one reports it.
+            typer.echo(f"Older messages may continue before {int(page.oldest_message_id or 0)}.")
+
+    _run_async(container, run())
 
 
 def _open(profile: str | None, config_dir: Path | None) -> Container:
