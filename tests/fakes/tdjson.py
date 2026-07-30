@@ -23,7 +23,7 @@ from typing import Any, Final
 
 from tests.fakes.telegram_gateway import ACCEPTED_CODE, ACCEPTED_PASSWORD, DEFAULT_USER
 from tgassist.domain.model.chat import ChatType
-from tgassist.domain.model.identifiers import TelegramChatId
+from tgassist.domain.model.identifiers import TelegramChatId, TelegramUserId
 from tgassist.domain.model.message import MessageType
 from tgassist.domain.model.telegram import TelegramChatInfo, TelegramMessage, TelegramUser
 from tgassist.infrastructure.telegram.loader import REQUIRED_SYMBOLS, NativeLibrary
@@ -254,6 +254,7 @@ class AuthorizingTdjson(FakeTdjson):
     """
 
     __slots__ = (
+        "_book",
         "_chats",
         "_code",
         "_history",
@@ -262,6 +263,7 @@ class AuthorizingTdjson(FakeTdjson):
         "_requires_password",
         "_starts_authorized",
         "_state",
+        "_users",
     )
 
     def __init__(
@@ -281,6 +283,11 @@ class AuthorizingTdjson(FakeTdjson):
         self._password = password
         self._chats: list[TelegramChatInfo] = []
         self._history: dict[int, list[TelegramMessage]] = {}
+        # Everyone getUser can resolve, and separately the address book, because
+        # Telegram resolves anyone this account has seen whether or not they
+        # were ever saved.
+        self._users: dict[int, TelegramUser] = {int(user.id): user}
+        self._book: list[int] = []
         self._loaded = False
         # Answered by default, because every flow that reaches `ready` asks it
         # next and a test that had to remember would be testing its own setup.
@@ -313,7 +320,7 @@ class AuthorizingTdjson(FakeTdjson):
             return
         super().send(client_id, request)
 
-    def _advance(  # noqa: PLR0911, PLR0912 - one branch per TDLib request, and they are the point
+    def _advance(  # noqa: PLR0911 - one branch per TDLib request, and they are the point
         self, kind: object, document: dict[str, Any], extra: object
     ) -> bool:
         """Run one step of the login. Returns whether the request was handled."""
@@ -361,6 +368,22 @@ class AuthorizingTdjson(FakeTdjson):
             self.announce("authorizationStateReady")
             return True
 
+        if kind == "logOut":
+            self._ok(extra)
+            self.announce("authorizationStateLoggingOut")
+            return True
+
+        return self._read(kind, document, extra)
+
+    def _read(  # noqa: PLR0911 - one branch per TDLib request, and they are the point
+        self, kind: object, document: dict[str, Any], extra: object
+    ) -> bool:
+        """Answer a read request. Returns whether it was handled.
+
+        Separate from the login for readability rather than by necessity: these
+        branches share no state with the state machine above, and keeping them
+        apart makes it obvious that a read never advances a login.
+        """
         if kind == "loadChats":
             # TDLib answers 404 once the list is complete. Reproducing that is
             # the point: an adapter that treated it as a failure would break for
@@ -393,9 +416,19 @@ class AuthorizingTdjson(FakeTdjson):
             self._answer(extra, self._history_page(document))
             return True
 
-        if kind == "logOut":
-            self._ok(extra)
-            self.announce("authorizationStateLoggingOut")
+        if kind == "getContacts":
+            self._answer(
+                extra,
+                {"@type": "users", "total_count": len(self._book), "user_ids": list(self._book)},
+            )
+            return True
+
+        if kind == "getUser":
+            person = self._users.get(document.get("user_id", 0))
+            if person is None:
+                self._error(extra, 404, "User not found")
+            else:
+                self._answer(extra, user_frame(person))
             return True
 
         return False
@@ -407,6 +440,19 @@ class AuthorizingTdjson(FakeTdjson):
     def script_history(self, chat_id: TelegramChatId, *messages: TelegramMessage) -> None:
         """Replace one chat's history."""
         self._history[int(chat_id)] = list(messages)
+
+    def script_contacts(self, *users: TelegramUser) -> None:
+        """Replace the address book. Everyone in it is also resolvable."""
+        self._book = [int(user.id) for user in users]
+        self.script_users(*users)
+
+    def script_users(self, *users: TelegramUser) -> None:
+        """Make users resolvable by ``getUser`` without saving them."""
+        self._users.update({int(user.id): user for user in users})
+
+    def forget_user(self, user_id: TelegramUserId) -> None:
+        """Make a user unresolvable, as a deleted Telegram account becomes."""
+        self._users.pop(int(user_id), None)
 
     def _history_page(self, document: dict[str, Any]) -> dict[str, object]:
         """Build a ``messages`` reply, paging as TDLib does."""

@@ -61,6 +61,7 @@ from tgassist.domain.model.identifiers import (
     ChatId,
     ContactId,
     TelegramChatId,
+    require_nonzero_chat_identifier,
     require_positive_identifier,
 )
 
@@ -143,9 +144,7 @@ class Chat:
         require_positive_identifier(self.id, name="Chat id")
         require_positive_identifier(self.account_id, name="Account id")
 
-        if self.telegram_chat_id == 0:
-            msg = "A Telegram chat identifier cannot be zero"
-            raise DomainValidationError(msg, user_message="That is not a valid chat identifier.")
+        require_nonzero_chat_identifier(self.telegram_chat_id)
 
         if self.contact_id is not None:
             require_positive_identifier(self.contact_id, name="Contact id")

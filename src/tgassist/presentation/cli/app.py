@@ -30,6 +30,7 @@ from tgassist.application.container import Container
 from tgassist.application.use_cases.account import CreateAccountRequest
 from tgassist.application.use_cases.contact import ContactTransition
 from tgassist.application.use_cases.message import IncomingMessage
+from tgassist.application.use_cases.sync import SyncReport
 from tgassist.application.use_cases.user_profile import ProfileChanges
 from tgassist.domain.errors import (
     AppError,
@@ -53,7 +54,7 @@ from tgassist.domain.model.user_profile import (
     TimeRange,
     TonePreference,
 )
-from tgassist.domain.ports.telegram_gateway import DEFAULT_CHAT_LIMIT
+from tgassist.domain.ports.telegram_gateway import DEFAULT_CHAT_LIMIT, DEFAULT_CONTACT_LIMIT
 from tgassist.domain.services.sensitivity import is_sensitive_key
 from tgassist.presentation.cli.authorization import ConsoleAuthorizationHandler
 
@@ -100,6 +101,11 @@ app.add_typer(tdlib_app, name="tdlib")
 # from being confused at the moment a user types them.
 telegram_app = typer.Typer(help="Read directly from Telegram.", no_args_is_help=True)
 app.add_typer(telegram_app, name="telegram")
+# Separate from `telegram`, which reads and stores nothing. These commands
+# write, and the distinction is the one a user most needs to see before running
+# something against their own account.
+sync_app = typer.Typer(help="Copy Telegram state into the local database.", no_args_is_help=True)
+app.add_typer(sync_app, name="sync")
 
 ProfileOption = Annotated[
     str | None,
@@ -1613,6 +1619,84 @@ def telegram_history(
             typer.echo(f"Older messages may continue before {int(page.oldest_message_id or 0)}.")
 
     _run_async(container, run())
+
+
+@sync_app.command("contacts")
+def sync_contacts(
+    account: AccountOption = None,
+    limit: Annotated[
+        int, typer.Option("--limit", "-n", min=1, help="How many address-book entries to read.")
+    ] = DEFAULT_CONTACT_LIMIT,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Record the people in this account's Telegram address book.
+
+    Safe to run repeatedly: a second run over unchanged data writes nothing.
+    Nothing is ever deleted, and a contact you archived or deleted stays that
+    way.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        target = account_id or await _active_account_id(container)
+        async with container.telegram_for(target) as gateway:
+            await gateway.connect()
+            report = await container.sync_contacts().execute(gateway, target, limit=limit)
+        _report(report, "contact")
+
+    _run_async(container, run())
+
+
+@sync_app.command("chats")
+def sync_chats(
+    account: AccountOption = None,
+    limit: Annotated[
+        int, typer.Option("--limit", "-n", min=1, help="How many chats to read.")
+    ] = DEFAULT_CHAT_LIMIT,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Record the chats Telegram has for this account, and the people in them.
+
+    Messages are not read: this records who you talk to and where, which is what
+    history ingestion will need before it can run. Safe to run repeatedly.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        target = account_id or await _active_account_id(container)
+        async with container.telegram_for(target) as gateway:
+            await gateway.connect()
+            report = await container.sync_chats().execute(gateway, target, limit=limit)
+        _report(report, "chat")
+
+    _run_async(container, run())
+
+
+def _report(report: SyncReport, noun: str) -> None:
+    """Print what a synchronisation run did.
+
+    Problems are printed even when the run otherwise succeeded. A run that
+    quietly skipped somebody would look identical to one that had nothing to
+    skip, and the difference is a person missing from the operator's list.
+    """
+    typer.echo(
+        f"{report.considered} {noun}(s): {report.created} new, "
+        f"{report.updated} updated, {report.unchanged} unchanged, "
+        f"{report.skipped} skipped."
+    )
+    if report.is_clean:
+        return
+
+    typer.echo("")
+    typer.echo(f"{len(report.problems)} problem(s):", err=True)
+    for problem in report.problems:
+        typer.echo(f"  {problem}", err=True)
 
 
 def _open(profile: str | None, config_dir: Path | None) -> Container:

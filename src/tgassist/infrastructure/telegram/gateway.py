@@ -52,6 +52,7 @@ from tgassist.domain.model.identifiers import (
     AccountId,
     TelegramChatId,
     TelegramMessageId,
+    TelegramUserId,
 )
 from tgassist.domain.model.secret import SecretValue
 from tgassist.domain.model.session import AuthorizationState, ConnectionState
@@ -63,6 +64,7 @@ from tgassist.domain.model.telegram import (
 )
 from tgassist.domain.ports.telegram_gateway import (
     DEFAULT_CHAT_LIMIT,
+    DEFAULT_CONTACT_LIMIT,
     DEFAULT_HISTORY_LIMIT,
     AuthorizationHandler,
     RetryDecision,
@@ -86,8 +88,8 @@ DEFAULT_STARTUP_TIMEOUT: Final = 30.0
 #: every iteration, forever.
 MAX_AUTHORIZATION_STEPS: Final = 32
 
-#: TDLib's code for "no such thing", used for both a chat this account cannot
-#: see and a chat list with nothing more to load.
+#: TDLib's code for "no such thing", used for a chat or user this account
+#: cannot see, and for a chat list with nothing more to load.
 _NOT_FOUND: Final = 404
 
 _logger = get_logger(__name__)
@@ -431,6 +433,52 @@ class TdlibGateway:
                 return None
             raise error_mapping.translate_failure(exc, operation="get_chat") from exc
         return mapping.chat_info_from(frame)
+
+    async def get_contact(self, user_id: TelegramUserId) -> TelegramUser | None:
+        """Return one Telegram user, or ``None`` if this account cannot see them."""
+        self._require_authorized("get_contact")
+        try:
+            frame = await self._client.request({"@type": "getUser", "user_id": int(user_id)})
+        except TdlibRequestFailedError as exc:
+            if _is_absent(exc):
+                # An ordinary answer to "who is this", not a failure: the
+                # account was deleted, or is not visible to us.
+                return None
+            raise error_mapping.translate_failure(exc, operation="get_contact") from exc
+        return mapping.telegram_user_from(frame)
+
+    async def list_contacts(
+        self, *, limit: int = DEFAULT_CONTACT_LIMIT
+    ) -> tuple[TelegramUser, ...]:
+        """Return the people in this account's Telegram address book.
+
+        Two TDLib calls, for the same reason listing chats takes three:
+        ``getContacts`` returns *identifiers*, and ``getUser`` resolves each one
+        from TDLib's local database. A user who vanishes between the two calls
+        is skipped rather than failing the listing.
+
+        The order is Telegram's, not re-sorted here. It is the order the address
+        book is held in, and imposing an alphabetical one would need collation
+        rules that differ by language.
+        """
+        self._require_authorized("list_contacts")
+        try:
+            listing = await self._client.request({"@type": "getContacts"})
+        except TdlibRequestFailedError as exc:
+            raise error_mapping.translate_failure(exc, operation="list_contacts") from exc
+
+        identifiers = listing.get("user_ids")
+        if not isinstance(identifiers, list):
+            return ()
+
+        users: list[TelegramUser] = []
+        for raw in identifiers[:limit]:
+            if not isinstance(raw, int) or isinstance(raw, bool):
+                continue
+            found = await self.get_contact(TelegramUserId(raw))
+            if found is not None:
+                users.append(found)
+        return tuple(users)
 
     async def fetch_history(
         self,

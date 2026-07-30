@@ -39,7 +39,7 @@ Each decision must have one of the following statuses:
 - Rejected
 
 **ADR-001 through ADR-010 are Accepted.**
-**ADR-011 through ADR-039, ADR-041 through ADR-046, ADR-050 and ADR-051 are Proposed and require explicit approval.**
+**ADR-011 through ADR-039, ADR-041 through ADR-046, and ADR-050 through ADR-053 are Proposed and require explicit approval.**
 
 **ADR-040, ADR-047, ADR-048 and ADR-049 are Accepted and implemented.** ADR-011 through ADR-030 were approved for implementation at the close of the architecture stabilization session; ADR-031 through ADR-039 arose during implementation and await review.
 
@@ -4630,6 +4630,10 @@ implementations grew together, and nothing had to be un-invented. `get_contact`
 is still absent because nothing calls it, which is the rule doing its job rather
 than an oversight.
 
+Slice 5 then added `get_contact` and `list_contacts` — the callers arrived, so
+the methods did. `updates()` and `send_message` remain absent for the same
+reason `get_contact` was.
+
 The single-consumer constraint has held. Reads go through `client.request()`,
 correlated by `@extra`, so they never touch the update stream and the dispatch
 loop remains the only consumer of `client.receive()`.
@@ -4641,6 +4645,278 @@ loop remains the only consumer of `client.receive()`.
 ADR-048 (the receive thread this consumes from), ADR-049 (the two state axes it
 reports), ADR-012 (gateway strategy), ADR-021 (credentials by name), ADR-023
 (no typing indicators — enforced structurally by the port's absence of one).
+
+---
+
+# ADR-052
+
+## Title
+
+The Operator's Telegram Identity Is the Account's, and It Is Enforced in a Domain Service
+
+Status
+
+Proposed
+
+Date
+
+2026-07-30
+
+---
+
+### Context
+
+`DOMAIN_MODEL.md` section 5.4 states an invariant it could not enforce:
+
+> "A Contact cannot be its own Account's operator identity."
+
+`ROADMAP.md` recorded it as unenforced because nothing knew the operator's own
+Telegram identifier. `TELEGRAM_ARCHITECTURE.md` section 2.6 assigned enforcement
+to the contact-synchronisation slice, on the reasoning that authentication would
+supply the identifier through `getMe`.
+
+Implementation found that reasoning half right. The identifier is available —
+but it has been available since Milestone 1.2, on `Account.telegram_user_id`,
+which is a required column set when the account is created and verified at every
+login by `AuthenticateAccount`. Nothing had to be obtained, and no field had to
+be added. The invariant was unenforced because nobody had written the check.
+
+Two questions remained genuinely open.
+
+**Where does the rule live?** It spans two aggregates: it needs an Account to
+state anything about a Contact. A `Contact` knows its `account_id` but not the
+operator's Telegram identifier, and giving it one would store the same fact on
+every contact row. The database cannot express it either — SQLite's `CHECK`
+cannot reference another table, so the alternative would be a trigger.
+
+**What happens to Saved Messages?** Telegram's chat with oneself arrives as
+`chatTypePrivate` whose `user_id` is the operator. Every real account has one.
+Synchronisation that treated it as an ordinary private chat would try to create
+the forbidden contact on its very first run, against every account.
+
+---
+
+### Decision
+
+**The operator's Telegram identity is `Account.telegram_user_id`.** No new
+field, no new source, no new lookup. `Account.is_operator(telegram_user_id)`
+names the question so that no caller compares columns for itself.
+
+**The invariant is enforced by a domain service**, `require_not_operator`, in
+`domain/services/operator_identity.py`. Every write path that can create a
+contact calls it: `CreateContact` and both synchronisation use cases.
+
+**Saved Messages is stored as `ChatType.SAVED`.** The domain already had the
+type. Synchronisation recognises the operator on the far side of a private chat
+and stores the chat with Telegram's own title, creating no contact. The decision
+is made where the account is known, not in the pure TDLib mapper, which has no
+opinion about who is running it.
+
+**Enforcement is on write only.** A database written before this slice may hold
+a contact that is its own operator; nothing scans for one, and nothing refuses
+to open such a database. Retrofitting a check onto read paths would make
+existing installations fail to list contacts, which is a worse outcome than the
+row being there.
+
+---
+
+### Alternatives Considered
+
+**A `CHECK` constraint.** Cannot reference another table in SQLite.
+
+**A trigger.** Would work, and would be a second home for a rule the application
+already has to state — the two would eventually disagree, and the trigger's
+message would name a column rather than the problem.
+
+**A field on `Contact`, such as `is_operator`.** Storing a derived fact, on
+every row, that only one row could ever have. It would also be settable, which
+makes the invariant a value rather than a rule.
+
+**Skipping the Saved Messages chat entirely.** Smaller, and it loses data the
+operator can see in Telegram. `ChatType.SAVED` exists precisely so this chat is
+representable, and skipping it would make that enum member dead.
+
+**Mapping Saved Messages in `mapping.py`.** The mapper is a pure function over
+TDLib JSON and has no account. Passing one in would make every mapping call
+account-relative to serve one case.
+
+---
+
+### Consequences
+
+**Positive**
+
+- An invariant that has been documented-but-unenforced since Milestone 1.3 is
+  now enforced, on every write path, with one implementation.
+- The first synchronisation run against a real account works, rather than
+  failing on Saved Messages.
+- `Account.is_operator` gives later slices — message ingestion deciding whether
+  a sender is the operator — a question to ask rather than a comparison to
+  repeat.
+
+**Negative**
+
+- The rule is application-enforced rather than structural. A future write path
+  that bypasses `require_not_operator` would bypass the invariant. The
+  mitigation is that there are two write paths, both call it, and both are
+  tested.
+- Existing rows are not checked. A contact created before this slice that is the
+  operator stays.
+
+---
+
+### Related Decisions
+
+ADR-041 (contact identity is local; `telegram_user_id` is external), ADR-043
+(cross-account ownership is structurally impossible), ADR-044 (the chat is the
+only edge), ADR-053 (what synchronisation may do with what it finds).
+
+---
+
+# ADR-053
+
+## Title
+
+Synchronisation Is Additive, Per-Item Transactional, and Never Overrules the Operator
+
+Status
+
+Proposed
+
+Date
+
+2026-07-30
+
+---
+
+### Context
+
+Slice 5 is the first code that reads Telegram and writes the database, so it is
+the first place the two models have to be reconciled. Four questions had to be
+answered before any of it could be written, and each one has a wrong answer that
+looks reasonable.
+
+1. **What does Telegram own?** Telegram is authoritative about names, handles
+   and titles. It is not authoritative about `sync_enabled`, or
+   `ai_processing_mode`, or whether the operator archived somebody.
+2. **What happens to what Telegram no longer lists?** A chat the operator left
+   is still their history.
+3. **Where is the transaction boundary?** ADR-034 permits one transaction at a
+   time for the whole application, so a run-long transaction is a latency budget
+   for everything else — and the goal states that no run may leave half-written
+   results.
+4. **What ends a run, and what does not?** Telegram being unreachable and one
+   chat being undescribable are not the same failure.
+
+---
+
+### Decision
+
+**Synchronisation is additive.** It creates and updates. It never deletes, and
+it never soft-deletes. A record Telegram no longer mentions is left alone.
+
+**It never overwrites an operator's decision.** `sync_enabled` and
+`ai_processing_mode` are chosen when a chat is first discovered and never
+revisited; a contact the operator deleted is not resurrected, and its fields are
+not refreshed. A run that silently re-enabled AI processing on a chat somebody
+had disabled it on would be a privacy defect, not a bug.
+
+**It writes only what Telegram owns**: display names, handles, and the titles of
+chats that have one. A private chat's name belongs to its contact, so a private
+chat row is never rewritten by synchronisation at all.
+
+**A repeat run over unchanged data writes nothing.** The entities already return
+`self` from a transition that changes nothing, so `updated_at` continues to mean
+"when this last changed" rather than "when we last looked".
+
+**One transaction per item, not per run.** For a private chat the item is the
+pair `(Contact, Chat)`, because ADR-043's composite key means a private chat
+cannot exist without the contact it names. Each unit commits whole or not at
+all, so an interrupted run leaves complete records and no partial ones.
+
+**A transport failure ends the run; an item failure does not.** If Telegram or
+the database is unreachable, the next item meets the same wall, and a report
+listing two hundred identical failures helps nobody. A `DomainValidationError`,
+`ConflictError` or `ConstraintViolationError` on one item is recorded and the
+run continues — the same judgement the adapter already makes about a chat that
+vanishes mid-listing.
+
+**Every problem is reported.** `SyncReport` carries counts and a list of
+`SyncProblem`, and a problem does not always cost an item: a handle this
+application cannot store leaves the person recorded without one. Nothing is
+dropped quietly, and no problem carries a name or any message content
+(`SECURITY.md` section 9).
+
+**Which chats are synchronised is configuration**, `telegram.sync_chat_types`,
+defaulting to private only. Every kind of chat is still *recorded*, so the
+operator can see it and switch synchronisation on; the setting decides only the
+initial `sync_enabled`.
+
+**Chats and contacts are two use cases, not one.** The chat list and the address
+book are different populations — one holds people never saved, the other holds
+people never messaged — and neither can be derived from the other.
+
+---
+
+### Alternatives Considered
+
+**One transaction per run.** Atomic, and it holds the application's only
+transaction across a network conversation with Telegram. It also makes one
+undescribable chat cost the entire run.
+
+**One transaction per record.** Would write a contact and leave its chat
+unwritten if the second failed, which is the half-written result the pair
+boundary exists to prevent.
+
+**Deleting local records Telegram no longer lists.** Would make leaving a group
+destroy its history, and would make a transient Telegram error indistinguishable
+from a deletion.
+
+**Refreshing a soft-deleted contact's fields without restoring them.** Half a
+rule. If the operator deleted somebody, keeping their name current is work done
+on the operator's behalf that they asked not to have done.
+
+**Failing the whole run on the first bad item.** Rejected for the same reason
+slice 4 skips a chat that vanishes mid-listing: one bad chat must not cost the
+operator the other two hundred.
+
+**A generic `SyncEngine`.** Explicitly out of scope. Two use cases that share
+one contact-upsert function is the whole of what is shared; an engine would be
+an abstraction over two cases.
+
+---
+
+### Consequences
+
+**Positive**
+
+- Running `tgassist sync chats` twice is safe, and provably so: the second run
+  reports everything unchanged and commits nothing.
+- An interrupted run is resumable by re-running it, with no cursor and no extra
+  machinery.
+- The privacy settings a user chooses per chat survive every subsequent run.
+
+**Negative**
+
+- Local records can drift from Telegram in one direction: something deleted
+  there stays here. That is deliberate, and it means "what is in this database"
+  is not a question Telegram can answer.
+- N+1 lookups. A run resolves each chat's counterpart individually. TDLib serves
+  these from its local database, so the cost is real but small; if it stops
+  being small, the fix is a batch call rather than a different design.
+- The report is counts, not entities. A caller wanting to know *which* chat was
+  created must read the database.
+
+---
+
+### Related Decisions
+
+ADR-034 (one connection, one transaction at a time), ADR-041 (local identity),
+ADR-042 (soft deletion is a timestamp), ADR-043 (cross-account ownership),
+ADR-045 (idempotent message writes, which this mirrors for chats and contacts),
+ADR-052 (the operator is never a contact), ADR-051 (the port grows one slice at
+a time — this slice added `get_contact` and `list_contacts`).
+
 
 ---
 

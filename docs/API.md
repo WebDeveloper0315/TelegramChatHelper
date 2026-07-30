@@ -912,7 +912,12 @@ class TelegramGateway(Protocol):
         before_message_id: TelegramMessageId | None = None,
         limit: int = 100,
     ) -> HistoryPage: ...                                                     # implemented
-    async def get_contact(self, user_id: TelegramUserId) -> TelegramUser | None: ...
+    async def get_contact(
+        self, user_id: TelegramUserId
+    ) -> TelegramUser | None: ...                                             # implemented
+    async def list_contacts(
+        self, *, limit: int = 1000
+    ) -> tuple[TelegramUser, ...]: ...                                        # implemented
 
     # Updates
     def updates(self) -> AsyncIterator[TelegramUpdate]: ...
@@ -945,9 +950,14 @@ for an **empty** page — a short page is not proof, because Telegram returns sh
 pages for reasons of its own. That is the whole reason the boundary is returned
 rather than derived.
 
-**`get_contact` is deliberately still absent.** Telegram carries a private
-chat's counterpart on the chat itself, so nothing yet needs a separate user
-lookup; contact synchronisation is what will.
+**`get_contact` and `list_contacts` are new** relative to version 1.0, and
+they are two calls rather than one because they answer over two different
+populations. The chat list holds people this account has never saved; the
+address book holds people it has never messaged. Neither set contains the other,
+so neither can be derived from the other (ADR-053).
+
+A chat carries its counterpart's *name* but not their handle, which is why
+`get_contact` exists at all: it is what supplies `Contact.username`.
 
 **`connection_state()` is new** relative to version 1.0 of this document. ADR-049 gave Session two independent axes, and a caller recording both cannot derive the second from `is_connected()` — which answers "can I use it", not "which of the five states is it in".
 

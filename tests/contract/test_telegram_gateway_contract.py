@@ -37,7 +37,7 @@ from tgassist.domain.model.identifiers import (
 )
 from tgassist.domain.model.secret import SecretValue
 from tgassist.domain.model.session import AuthorizationState, ConnectionState
-from tgassist.domain.model.telegram import TelegramChatInfo, TelegramMessage
+from tgassist.domain.model.telegram import TelegramChatInfo, TelegramMessage, TelegramUser
 from tgassist.domain.ports.telegram_gateway import TelegramGateway
 from tgassist.infrastructure.telegram.client import TdjsonClient
 from tgassist.infrastructure.telegram.gateway import GatewaySettings, TdlibGateway
@@ -384,6 +384,17 @@ def message(number: int, *, text: str | None = None) -> TelegramMessage:
 
 HISTORY = tuple(message(number) for number in range(1, 26))
 
+#: The address book. ADA is also CHAT_A's counterpart, so the two populations
+#: overlap without either containing the other.
+ADA = TelegramUser(
+    id=TelegramUserId(2002), first_name="Ada", last_name="Lovelace", username="ada_lovelace"
+)
+GRACE = TelegramUser(id=TelegramUserId(3003), first_name="Grace", username="ghopper")
+
+#: Resolvable but never saved: somebody who messaged this account. Proves that
+#: the address book and "everyone Telegram can resolve" are different sets.
+STRANGER = TelegramUser(id=TelegramUserId(4004), first_name="Sam")
+
 
 @pytest.fixture(params=["fake", "tdlib"])
 async def readable(
@@ -395,11 +406,15 @@ async def readable(
         fake = FakeTelegramGateway(ACCOUNT, starts_authorized=True)
         fake.script_chats(CHAT_A, CHAT_B, CHAT_EMPTY)
         fake.script_history(CHAT_A.id, *HISTORY)
+        fake.script_contacts(ADA, GRACE)
+        fake.script_users(STRANGER)
         gateway = fake
     else:
         library = AuthorizingTdjson(starts_authorized=True)
         library.script_chats(CHAT_A, CHAT_B, CHAT_EMPTY)
         library.script_history(CHAT_A.id, *HISTORY)
+        library.script_contacts(ADA, GRACE)
+        library.script_users(STRANGER)
         gateway = TdlibGateway(
             ACCOUNT,
             TdjsonClient(library),
@@ -475,6 +490,60 @@ class TestGettingOneChat:
         # An ordinary answer to "does this exist for me": the account left it,
         # or never had access.
         assert await readable.get_chat(TelegramChatId(999_999)) is None
+
+
+class TestListingContacts:
+    """Obligations both implementations must satisfy."""
+
+    async def test_it_returns_the_address_book(self, readable: TelegramGateway) -> None:
+        assert {user.id for user in await readable.list_contacts()} == {ADA.id, GRACE.id}
+
+    async def test_it_preserves_telegram_ordering(self, readable: TelegramGateway) -> None:
+        assert [user.id for user in await readable.list_contacts()] == [ADA.id, GRACE.id]
+
+    async def test_it_excludes_somebody_never_saved(self, readable: TelegramGateway) -> None:
+        # The address book is not "everyone Telegram can resolve", which is why
+        # listing chats and listing contacts are two calls rather than one.
+        assert STRANGER.id not in {user.id for user in await readable.list_contacts()}
+
+    async def test_it_carries_names_and_handles(self, readable: TelegramGateway) -> None:
+        book = {user.id: user for user in await readable.list_contacts()}
+
+        assert book[ADA.id].first_name == "Ada"
+        assert book[ADA.id].last_name == "Lovelace"
+        assert book[ADA.id].username == "ada_lovelace"
+
+    async def test_a_missing_family_name_is_none(self, readable: TelegramGateway) -> None:
+        book = {user.id: user for user in await readable.list_contacts()}
+
+        assert book[GRACE.id].last_name is None
+
+    async def test_the_limit_is_a_ceiling(self, readable: TelegramGateway) -> None:
+        assert len(await readable.list_contacts(limit=1)) == 1
+
+    async def test_asking_for_more_than_exists_is_not_an_error(
+        self, readable: TelegramGateway
+    ) -> None:
+        assert len(await readable.list_contacts(limit=1000)) == 2
+
+
+class TestGettingOneContact:
+    async def test_it_returns_the_user(self, readable: TelegramGateway) -> None:
+        found = await readable.get_contact(ADA.id)
+
+        assert found is not None
+        assert found.display_name == "Ada Lovelace"
+
+    async def test_it_resolves_somebody_never_saved(self, readable: TelegramGateway) -> None:
+        # A private chat's counterpart is reached this way, and they need never
+        # have been added to the address book.
+        found = await readable.get_contact(STRANGER.id)
+
+        assert found is not None
+        assert found.username is None
+
+    async def test_an_invisible_user_is_none_not_an_error(self, readable: TelegramGateway) -> None:
+        assert await readable.get_contact(TelegramUserId(999_999)) is None
 
 
 class TestFetchingHistory:
@@ -574,14 +643,33 @@ class TestReadsRequireAuthorization:
         with pytest.raises(AuthorizationError):
             await unauthorized.fetch_history(CHAT_A.id)
 
+    async def test_listing_contacts(self, unauthorized: TelegramGateway) -> None:
+        with pytest.raises(AuthorizationError):
+            await unauthorized.list_contacts()
+
+    async def test_getting_a_contact(self, unauthorized: TelegramGateway) -> None:
+        with pytest.raises(AuthorizationError):
+            await unauthorized.get_contact(ADA.id)
+
 
 class TestReadsRequireAConnection:
     """Nothing connects implicitly."""
 
-    @pytest.mark.parametrize("operation", ["list_chats", "get_chat", "fetch_history"])
-    async def test_each_refuses_without_one(self, subject: GatewaySubject, operation: str) -> None:
+    @pytest.mark.parametrize(
+        ("operation", "argument"),
+        [
+            ("list_chats", None),
+            ("get_chat", CHAT_A.id),
+            ("fetch_history", CHAT_A.id),
+            ("list_contacts", None),
+            ("get_contact", ADA.id),
+        ],
+    )
+    async def test_each_refuses_without_one(
+        self, subject: GatewaySubject, operation: str, argument: object
+    ) -> None:
         method = getattr(subject.gateway, operation)
-        arguments = () if operation == "list_chats" else (CHAT_A.id,)
+        arguments = () if argument is None else (argument,)
 
         with pytest.raises(TdlibNotRunningError):
             await method(*arguments)
@@ -630,6 +718,28 @@ class TestReadsAgreeAcrossImplementations:
         )
         await real.connect()
         from_adapter = await real.fetch_history(CHAT_A.id, limit=7)
+        await real.disconnect()
+
+        assert from_fake == from_adapter
+
+    async def test_the_same_address_book_round_trips_identically(self, tmp_path: Path) -> None:
+        fake = FakeTelegramGateway(ACCOUNT, starts_authorized=True)
+        fake.script_contacts(ADA, GRACE)
+        await fake.connect()
+        from_fake = await fake.list_contacts()
+        await fake.disconnect()
+
+        library = AuthorizingTdjson(starts_authorized=True)
+        library.script_contacts(ADA, GRACE)
+        real = TdlibGateway(
+            ACCOUNT,
+            TdjsonClient(library),
+            _settings(tmp_path),
+            state_timeout=TIMEOUT,
+            startup_timeout=TIMEOUT,
+        )
+        await real.connect()
+        from_adapter = await real.list_contacts()
         await real.disconnect()
 
         assert from_fake == from_adapter

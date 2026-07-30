@@ -20,6 +20,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
+from tgassist.domain.model.chat import ChatType
 from tgassist.infrastructure.config.paths import AppPaths, default_data_dir
 
 ENV_PREFIX = "TGASSIST_"
@@ -165,7 +166,10 @@ class SecuritySection(_Section):
 
 
 class TelegramSection(_Section):
-    """How the native Telegram library is located and accepted (ADR-047)."""
+    """How Telegram is reached, and what is done with what it returns.
+
+    The library half follows ADR-047; the synchronisation half follows ADR-053.
+    """
 
     tdjson_path: Path | None = Field(
         default=None,
@@ -225,6 +229,15 @@ class TelegramSection(_Section):
             "What this client calls itself in Telegram's active-sessions list. "
             "The user sees it when deciding whether to revoke a session, so it "
             "should be recognisable rather than accurate."
+        ),
+    )
+    sync_chat_types: tuple[ChatType, ...] = Field(
+        default=(ChatType.PRIVATE,),
+        description=(
+            "Which kinds of chat are synchronised when first discovered. Every "
+            "kind is recorded either way, so nothing is hidden; this decides "
+            "only the initial sync_enabled, and nothing revisits it afterwards "
+            "-- a chat the user switched off stays off (ADR-053)."
         ),
     )
 

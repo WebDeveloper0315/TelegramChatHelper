@@ -578,6 +578,7 @@ Columns: `id`, `account_id`, `telegram_user_id`, `username`, `display_name`,
 - Check constraints: `id > 0`, `account_id > 0`, `telegram_user_id > 0`, `length(trim(display_name)) > 0`, `username IS NULL OR length(username) BETWEEN 5 AND 32`, `updated_at >= created_at`, `archived_at IS NULL OR deleted_at IS NULL`.
 - **No index on `(account_id, username)`** yet: nothing looks a contact up by handle. It arrives with the search that needs it, measured against `DATABASE.md` §20 rather than added on the assumption that it will be wanted.
 - Access is through a repository **scoped at construction** (ADR-039).
+- **Written by synchronisation from Milestone 2.7**, which touches only `username`, `display_name` and `updated_at` — the fields Telegram owns. It never writes `archived_at` or `deleted_at`, and it never clears one: a contact the operator deleted is not resurrected by anything Telegram says (ADR-053). The unique index over soft-deleted rows is what makes that decision enforceable rather than merely intended.
 
 ### `chats`
 
@@ -600,6 +601,10 @@ Columns: `id`, `account_id`, `telegram_chat_id`, `chat_type`, `contact_id`,
 - Check: `(chat_type = 'private') = (contact_id IS NOT NULL)` and `(chat_type <> 'private') = (title IS NOT NULL)` — both directions, so neither a private chat with nobody in it nor a group chat claiming a single counterpart can be written.
 - Check: `id > 0`, `account_id > 0`, `contact_id IS NULL OR contact_id > 0`, `title IS NULL OR length(trim(title)) > 0`, `updated_at >= created_at`.
 - **No index on `(account_id, last_message_at)` or `(account_id, sync_enabled)`** yet: neither column exists, and both arrive with the query that needs them (Milestone 3).
+
+- **Written by synchronisation from Milestone 2.7**, which sets `sync_enabled` and `ai_processing_mode` when a chat is first discovered and never afterwards. Both are the operator's, and a run that rewrote `ai_processing_mode` would be a privacy defect rather than a bug (ADR-053). The only column synchronisation updates on an existing row is `title`, and never on a private chat, whose name belongs to its contact.
+- **The `saved` chat type is reached from Milestone 2.7.** Telegram's Saved Messages is a private chat with the operator, which the composite foreign key and the operator-identity rule together make unstorable as one (ADR-052).
+- **One transaction writes a `contacts` row and its `chats` row together.** The composite foreign key makes the pair the atomic unit: a private chat cannot be inserted before the contact it names exists, so an interrupted run must leave neither rather than the first.
 
 **Referencing this table.** Every later table in the graph — messages first — should reference `(account_id, chat_id)` compositely, and needs a `chats (account_id, id)` index added in the migration that creates it (ADR-043).
 
@@ -860,6 +865,7 @@ Initial migration sequence:
 | `0005` | `chats` — the communication graph's edge | **Applied** |
 | `0006` | `messages` — the immutable factual record | **Applied** |
 | `0007` | `telegram_sessions` — where an account stands with Telegram | **Applied** |
+| — | Milestone 2.7 (chat and contact synchronisation) added **no migration** | — |
 | next | `settings`, `audit_log` | Milestone 2 |
 | `0008` | `conversations`, `attachments`, `sync_cursors` | Milestone 3 |
 | `0009` | `messages_fts` and synchronisation triggers | Milestone 3 |

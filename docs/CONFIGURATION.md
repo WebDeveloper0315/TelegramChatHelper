@@ -155,6 +155,7 @@ Complete key reference. Types, defaults and descriptions.
 | `telegram.api_id` | int \| null | `null` | Application id from https://my.telegram.org. Required before `tgassist login` runs; there is no default because there is nothing to derive one from |
 | `telegram.api_hash_ref` | str | `TELEGRAM_API_HASH` | **Name** of the application hash in the credential store, never the value (ADR-021) |
 | `telegram.device_model` | str | `Desktop` | What this client calls itself in Telegram's active-sessions list, where the user sees it when deciding whether to revoke a session |
+| `telegram.sync_chat_types` | list of `private` \| `group` \| `supergroup` \| `channel` \| `saved` | `[private]` | Which kinds of chat `tgassist sync chats` switches synchronisation on for **when it first discovers them**. Every kind is recorded either way, so nothing is hidden; this decides only the initial `sync_enabled`, and a chat the user switches off stays off (ADR-053) |
 
 The library is searched for in this order, and **the first candidate that
 exists is the one used**: the configured path, then `<data_dir>/tdlib/`, then

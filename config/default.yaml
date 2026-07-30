@@ -113,6 +113,13 @@ telegram:
   # sees it when deciding whether to revoke a session.
   device_model: Desktop
 
+  # Which kinds of chat "tgassist sync chats" switches synchronisation on for
+  # when it first discovers them. Every kind is recorded either way, so nothing
+  # is hidden -- this decides only the initial setting, and a chat you switch
+  # off stays off. One of: private, group, supergroup, channel, saved.
+  sync_chat_types:
+    - private
+
 security:
   # Apply owner-only permissions to directories the application creates.
   enforce_file_permissions: true

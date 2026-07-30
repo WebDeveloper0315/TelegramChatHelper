@@ -269,12 +269,17 @@ every later aggregate references.
 | `get_by_username`, `search`, `purge` | **Omitted** -- no consumer |
 | No Chat, Conversation, Message, Goal, Memory or Telegram | Confirmed |
 
-**Open item carried forward.** `DOMAIN_MODEL.md` section 5.4 states that a
-Contact cannot be its own Account's operator identity. It is not enforced:
-nothing knows the operator's own Telegram identifier until authentication
-establishes it (Milestone 2). Enforcing it there is a check in `Contact.create`
-plus one migration-time backfill, and doing it now would mean inventing the
-value it compares against.
+**Open item, closed in Milestone 2.7.** `DOMAIN_MODEL.md` section 5.4 states
+that a Contact cannot be its own Account's operator identity. It was recorded
+here as unenforceable until authentication established the operator's own
+Telegram identifier.
+
+That turned out to be wrong in an instructive way. The identifier was already
+`Account.telegram_user_id`, a required column set at account creation in this
+very milestone's predecessor. Nothing had to be established; the check had
+simply not been written. It now lives in a domain service and is called by every
+write path that can create a contact (ADR-052). No backfill was needed, because
+nothing had ever created such a row.
 
 ### Milestone 1.4 -- Chat, the Communication Graph (complete, 2026-07-28)
 
@@ -573,6 +578,51 @@ command was corrected to say "may continue" rather than claiming otherwise.
   and slice 7 is what reads them.
 - The reads have never run against real Telegram servers, only against a TDLib
   that answers as Telegram does.
+
+---
+
+### Milestone 2.7 -- Chat and Contact Synchronisation (complete, 2026-07-30)
+
+Slice 5. The first code that reads Telegram *and* writes the database, so the
+first place the two models had to be reconciled.
+
+| Deliverable | Status |
+|---|---|
+| `SyncChats`, `SyncContacts`, `SyncReport`, `SyncProblem` | Done |
+| `get_contact` and `list_contacts` on the port, adapter and fake | Done |
+| Operator-identity invariant enforced (`DOMAIN_MODEL.md` 5.4) | Done -- ADR-052 |
+| Saved Messages stored as `ChatType.SAVED` | Done |
+| `telegram.sync_chat_types` scope configuration | Done |
+| One transaction per item; a private chat and its contact share one | Done |
+| `tgassist sync chats`, `tgassist sync contacts` | Done |
+| Schema changes | **None** -- nothing needed a column |
+| Contract suite over both gateway implementations | 124 tests, 29 added |
+| Suite | 2110 passing, 113 added |
+
+**Running it twice is safe, and provably so.** A second run over unchanged data
+reports everything unchanged, commits nothing, and does not move `updated_at`.
+
+**Synchronisation never overrules the operator** (ADR-053). `sync_enabled` and
+`ai_processing_mode` are set once at discovery and never revisited; a deleted
+contact is not resurrected; nothing is ever deleted locally because Telegram
+stopped listing it.
+
+**A defect fixed:** `TelegramChatInfo` and `TelegramMessage` required *positive*
+identifiers, and Telegram numbers every group and channel below zero. Slice 4's
+tests used positive identifiers for groups, which Telegram never does, so the
+adapter would have failed against any real account with a single group. The
+`Chat` entity and the schema already had the rule right; the DTOs did not, and
+all three now share one function.
+
+**Open:**
+
+- Nothing has run against real Telegram servers. Every layer is verified against
+  a TDLib that answers as Telegram does.
+- A run resolves each chat's counterpart individually. TDLib serves these from
+  its local database, so the cost is small; if it stops being small the fix is a
+  batch call, not a different design.
+- History is not synchronised. That is slice 6, and `SyncCursor` arrives with
+  it.
 
 ---
 

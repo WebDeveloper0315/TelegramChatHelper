@@ -190,6 +190,24 @@ class Account:
             updated_at=now,
         )
 
+    # -- Derived state ----------------------------------------------------
+
+    def is_operator(self, telegram_user_id: TelegramUserId) -> bool:
+        """Report whether a Telegram user is this account's own operator identity.
+
+        The Account is where the operator's Telegram identity lives, so the
+        question is answered here rather than by each caller comparing fields.
+        Two things ask it, and they are the reason it exists (ADR-052):
+
+        * A Contact must never be the operator (``DOMAIN_MODEL.md`` section 5.4).
+          Recording yourself as somebody you talk to would anchor memories,
+          goals and relationship data on the operator's own account.
+        * Telegram's Saved Messages chat is a *private chat with yourself*, so
+          synchronisation must recognise it rather than try to create a contact
+          for it.
+        """
+        return self.telegram_user_id == telegram_user_id
+
     # -- State transitions ------------------------------------------------
 
     def activated(self, now: datetime) -> Account:

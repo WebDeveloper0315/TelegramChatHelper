@@ -131,8 +131,26 @@ unencrypted fallback does not exist (`SECURITY.md` §8).
 > "A Contact cannot be its own Account's operator identity."
 
 Recorded in `ROADMAP.md` as unenforced because nothing knew the operator's own
-Telegram identifier. Authentication supplies it (`getMe`). This design assigns
-enforcement to the contact-sync slice (§14, slice 5).
+Telegram identifier. This design assigned enforcement to the contact-sync slice
+(§14, slice 5).
+
+**Resolved in slice 5 (ADR-052), and the reasoning above was half wrong.** The
+identifier does not come from `getMe` — it has been on `Account.telegram_user_id`
+since Milestone 1.2, a required column set at account creation and verified at
+every login. Nothing had to be obtained. The invariant was unenforced because
+nobody had written the check, not because the value was missing.
+
+It is now enforced by a domain service, `require_not_operator`, called by every
+write path that can create a contact. It is not enforced in the schema: SQLite's
+`CHECK` cannot reference another table, and a trigger would be a second home for
+a rule the application already states.
+
+Implementation also found the case that makes the rule unavoidable rather than
+merely correct. Telegram's **Saved Messages** is a private chat whose counterpart
+is the operator, and every real account has one — so a synchronisation that did
+not recognise it would try to create the forbidden contact on its first run
+against every account. It is stored as `ChatType.SAVED`, which the domain model
+already had.
 
 ## 2.7 `ARCHITECTURE.md` layer order places Telegram below Storage
 
@@ -359,12 +377,14 @@ rather than left as a claim.
 
 `TelegramGateway` is declared **one slice at a time** (ADR-051). Slice 3
 declared lifecycle, authorization, both state axes and `get_me`; slice 4 added
-`list_chats`, `get_chat` and `fetch_history`. `updates()` arrives with the update
-consumer (slice 7) and `send_message` with slice 8.
+`list_chats`, `get_chat` and `fetch_history`; slice 5 added `get_contact` and
+`list_contacts`. `updates()` arrives with the update consumer (slice 7) and
+`send_message` with slice 8.
 
-`get_contact` is still absent after slice 4: Telegram carries a private chat's
-counterpart on the chat itself, so the listing needs no separate lookup. Contact
-synchronisation (slice 5) is what will need it.
+`list_contacts` is a separate call from `list_chats` rather than a convenience
+over it: the address book and the chat list are different populations, and
+neither contains the other. `get_contact` exists because a chat carries its
+counterpart's name but not their handle.
 
 The gateway also owns the **single consumer** of `TdjsonClient.receive()`. The
 queue holds one item per update, so a second consumer would not duplicate the
@@ -646,12 +666,30 @@ Chats first, then their contacts, because a private chat cannot be stored
 without the contact it names (ADR-043's composite key). Order is a correctness
 requirement, not a preference.
 
-- `list_chats` → for each in scope, upsert `Contact` then `Chat`.
-- `Chat.telegram_chat_id` for a private chat equals the contact's
-  `telegram_user_id`; the mapping is explicit in `mapping.py`, not assumed at
-  each call site.
-- The operator's own identity from `get_me()` is **excluded** from contacts,
-  finally enforcing the invariant in §2.6.
+- `list_chats` → for each, upsert `Contact` then `Chat`, in one transaction.
+- The operator's own identity is **excluded** from contacts, finally enforcing
+  the invariant in §2.6.
+
+**As implemented (slice 5).** Three things differ from the sketch above.
+
+*The operator's identity comes from the Account, not from `get_me()`* — it is
+already there, and re-deriving it per run would let it change halfway through
+one (ADR-052).
+
+*A private chat's Telegram identifier is not assumed to equal its counterpart's
+user identifier.* It happens to today, and relying on a coincidence Telegram has
+never promised would break silently if it stopped holding. `TelegramChatInfo`
+carries `counterpart_id` explicitly, so the join is read rather than computed.
+
+*Every chat is recorded, not only those in scope.* Scope
+(`telegram.sync_chat_types`, default private) decides the initial `sync_enabled`,
+not whether a row exists — so the operator can see a group and switch
+synchronisation on, rather than wondering where it went. Nothing revisits that
+setting afterwards (ADR-053).
+
+Contacts are also synchronised from the **address book**, which the sketch above
+did not mention: it holds people this account saved but never messaged, and no
+amount of reading the chat list would find them.
 
 ---
 
@@ -895,7 +933,7 @@ demonstrable. Sized like the M1.x slices that worked.
 | 2 | Session + storage | `Session` aggregate, migration `0007`, repository, key in credential store, `require_secret_store` enforced (§2.5) | **Done, 2026-07-28** |
 | 3 | Authentication | `AuthorizationHandler`, `AuthenticateAccount`, `tgassist login` / `logout`; session survives restart | **Done, 2026-07-28** |
 | 4 | Gateway reads + fake | `TelegramGateway` port, TDLib adapter reads, `FakeTelegramGateway`, shared contract suite, `tgassist telegram chats` | **Done, 2026-07-29** |
-| 5 | Chat and contact sync | `SyncChats` / `SyncContacts`, scope configuration, operator-identity invariant (§2.6) | 4 |
+| 5 | Chat and contact sync | `SyncChats` / `SyncContacts`, scope configuration, operator-identity invariant (§2.6) | **Done, 2026-07-30** |
 | 6 | Backfill | `SyncCursor` + migration, `SyncEngine` backfill, batched transactions, resumption tests | 5 |
 | 7 | Live updates | Update consumer, ingestion serialiser, `MessagesIngested`, `tgassist watch` | 6 |
 | 8 | Send | `SendMessage`, explicit-approval path, architectural test asserting no typing method | 7 |
@@ -931,9 +969,22 @@ it before any other Telegram work, exactly as ADR-012 §3 intended.
 | **049** | Session Models Authorization and Connection as Separate Axes | §2.2 — corrects `DOMAIN_MODEL.md` §5.3 |
 | **050** | Synchronisation Cursors, Batch Boundaries and Batched Event Publication | §8, §11.1 — reconciles bulk ingest with ADR-031 and ADR-034 |
 
+Two more were written during implementation, because implementation found
+decisions this plan had not seen:
+
+| ADR | Title | Written in |
+|---|---|---|
+| **051** | Authorization Is Driven by a Dispatch Loop over a Single Update Stream | Slice 3 — §5.1's port surface and §7.1's single consumer |
+| **052** | The Operator's Telegram Identity Is the Account's, and It Is Enforced in a Domain Service | Slice 5 — §2.6 |
+| **053** | Synchronisation Is Additive, Per-Item Transactional, and Never Overrules the Operator | Slice 5 — §8.4, §8.6 |
+
 Documentation corrections needing no ADR: §2.3 (migration plan), §2.4 (port
-surface), §2.5 (already decided, unimplemented), §2.6 (assignment), §2.7
-(diagram).
+surface), §2.5 (already decided, unimplemented), §2.7 (diagram).
+
+**§2.6 was listed here as needing no ADR, and that was wrong.** Assigning
+enforcement to a slice is scheduling; deciding *where a cross-aggregate
+invariant lives*, when neither entity can hold it and the schema cannot express
+it, is architecture. ADR-052 records it.
 
 ---
 

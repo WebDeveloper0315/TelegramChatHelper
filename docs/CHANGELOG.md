@@ -36,6 +36,127 @@ Not every release requires every category.
 
 ## Added
 
+### Milestone 2.7 -- Chat and Contact Synchronisation
+
+Slice 5 of `TELEGRAM_ARCHITECTURE.md`: the first code that reads Telegram and
+writes the database.
+
+**Two use cases, not one engine**
+
+- `SyncChats` reads the chat list; `SyncContacts` reads the address book. They
+  are two because the populations are two: the chat list holds people this
+  account never saved, and the address book holds people it never messaged.
+  Neither set contains the other, so neither can be derived from the other.
+- `SyncReport` carries counts and `SyncProblem` entries. A problem does not
+  always cost an item -- a handle this application cannot store leaves the
+  person recorded without one -- so problems are counted separately from
+  skipped items. Nothing is dropped quietly, and no problem carries a name or
+  any message content (`SECURITY.md` section 9).
+- There is no `SyncEngine`, no scheduler and no retry policy. What the two use
+  cases share is one contact-upsert function, and an abstraction over two cases
+  would be the framework this slice was told not to build.
+
+**What synchronisation may and may not do (ADR-053)**
+
+- **Additive.** Nothing is ever deleted. A chat that has disappeared from
+  Telegram is still the operator's history.
+- **It never overwrites an operator's decision.** `sync_enabled` and
+  `ai_processing_mode` are chosen when a chat is first discovered and never
+  revisited; a contact the operator deleted stays deleted, and its fields are
+  not refreshed. A run that silently re-enabled AI processing on a chat somebody
+  had disabled it on would be a privacy defect, not a bug.
+- **A repeat run over unchanged data writes nothing**, so `updated_at` still
+  means "when this last changed" rather than "when we last looked".
+- **One transaction per item.** For a private chat the item is the pair
+  `(Contact, Chat)`, because ADR-043's composite key means a private chat cannot
+  exist without the contact it names. An interrupted run leaves complete records
+  and no partial ones -- verified against a real SQLite database, because the
+  in-memory repositories write through and cannot show a rollback.
+- **A transport failure ends the run; an item failure does not.** If Telegram or
+  the database is unreachable, the next item meets the same wall. One chat
+  Telegram describes badly must not cost the operator the other two hundred,
+  which is the judgement the adapter already makes about a chat that vanishes
+  mid-listing.
+
+**The operator's own identity (ADR-052)**
+
+- `DOMAIN_MODEL.md` section 5.4's invariant -- "a Contact cannot be its own
+  Account's operator identity" -- has been documented and unenforced since
+  Milestone 1.3. It is enforced now, by a domain service called from every write
+  path that can create a contact.
+- The identifier it compares against needed no work: it has been
+  `Account.telegram_user_id` since Milestone 1.2. `ROADMAP.md` and
+  `TELEGRAM_ARCHITECTURE.md` both said authentication would have to supply it
+  through `getMe`; both were wrong, and both now say so.
+- **Telegram's Saved Messages is why the rule is unavoidable rather than merely
+  correct.** It arrives as a private chat whose counterpart is the operator, and
+  every real account has one -- so a synchronisation that did not recognise it
+  would try to create the forbidden contact on its first run against every
+  account. It is stored as `ChatType.SAVED`, which the domain model already had
+  and nothing had yet reached.
+
+**The gateway grew again (ADR-051)**
+
+- `get_contact` and `list_contacts`. `get_contact` exists because a chat carries
+  its counterpart's *name* but not their handle, and `Contact.username` needs
+  one. `list_contacts` is two TDLib calls, for the same reason `list_chats` is
+  three: `getContacts` returns identifiers, and `getUser` resolves each.
+
+**Configuration**
+
+- `telegram.sync_chat_types`, default `[private]`. Every kind of chat is
+  *recorded* either way, so the operator can see a group and switch
+  synchronisation on; the setting decides only the initial `sync_enabled`.
+
+**Commands**
+
+- `tgassist sync chats` and `tgassist sync contacts`, in a `sync` group distinct
+  from `telegram` -- which reads and stores nothing. Writing is the distinction
+  a user most needs to see before running something against their own account.
+
+**Tests -- 113 added, suite at 2110**
+
+- 80 covering first sync, repeat sync, changed names and handles, Saved
+  Messages, sync scope, deleted and archived contacts, two accounts knowing the
+  same person, cross-account refusal, Telegram unavailable, a refused row, a
+  broken database, and four against a real SQLite file for the transaction
+  boundary.
+- The gateway contract suite is now **124 tests over both implementations**.
+
+## Fixed
+
+- **`TelegramChatInfo` and `TelegramMessage` refused negative identifiers**, and
+  Telegram numbers every group and channel below zero. `tgassist telegram chats`
+  would therefore have failed against any real account with a single group. The
+  `Chat` entity and the schema had the rule right -- `telegram_chat_id <> 0`,
+  deliberately not `> 0` -- and the DTOs added in slice 4 did not; all three now
+  share `require_nonzero_chat_identifier`. Slice 4's tests missed it by using
+  positive identifiers for groups, which Telegram never issues.
+
+## Changed
+
+- `AuthenticateAccount` and both synchronisation use cases now share one
+  gateway-ownership check, `require_gateway_account`. Two copies of an ownership
+  rule is one copy too many.
+- `resolve_account` gained a sibling, `require_account`, returning the whole
+  Account for callers that need something it knows. Same query either way.
+
+## Architecture Decisions
+
+- **ADR-052** -- the operator's Telegram identity is the Account's, and the
+  invariant is enforced in a domain service. Not in the schema: SQLite's `CHECK`
+  cannot reference another table, and a trigger would be a second home for a
+  rule the application already states.
+- **ADR-053** -- synchronisation is additive, per-item transactional, and never
+  overrules the operator.
+
+## Scope note
+
+Nineteen source and test files were created or modified, plus one configuration
+file -- within the twenty-file limit. No migration was needed: every column
+synchronisation writes already existed, which is what "prove there is a current
+consumer" is meant to produce.
+
 ### Milestone 2.6 -- Gateway Reads
 
 Slice 4 of `TELEGRAM_ARCHITECTURE.md`: reading chats and history out of

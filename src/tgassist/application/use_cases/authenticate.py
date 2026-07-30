@@ -21,7 +21,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from tgassist.application.use_cases.account_scope import resolve_account
+from tgassist.application.use_cases.account_scope import require_gateway_account, resolve_account
 from tgassist.application.use_cases.session import PrepareSession
 from tgassist.domain.errors import AuthorizationError
 from tgassist.domain.model.identifiers import AccountId
@@ -109,7 +109,7 @@ class AuthenticateAccount:
             SecretStoreUnavailableError: If no credential backend is available.
         """
         resolved = await self._resolve(account_id)
-        self._require_same_account(gateway, resolved)
+        require_gateway_account(gateway, resolved)
 
         # Preparing first: the gateway cannot connect without the store path and
         # the encryption key, and this is what creates them.
@@ -186,17 +186,6 @@ class AuthenticateAccount:
             await sessions.update(updated)
             await uow.commit()
             return updated
-
-    @staticmethod
-    def _require_same_account(gateway: TelegramGateway, account_id: AccountId) -> None:
-        """Refuse a gateway bound to a different account."""
-        if gateway.account_id != account_id:
-            msg = f"Gateway is bound to account {int(gateway.account_id)}, not {int(account_id)}"
-            raise AuthorizationError(
-                msg,
-                user_message="That connection belongs to a different account.",
-                context={"gateway": int(gateway.account_id), "account": int(account_id)},
-            )
 
 
 class LogOutAccount:

@@ -87,3 +87,21 @@ def require_positive_identifier(value: int, *, name: str) -> None:
     if value < MIN_IDENTIFIER:
         msg = f"{name} must be a positive integer, got {value}"
         raise DomainValidationError(msg, user_message="An internal identifier was invalid.")
+
+
+def require_nonzero_chat_identifier(value: TelegramChatId) -> None:
+    """Raise if a Telegram chat identifier is zero.
+
+    Separate from :func:`require_positive_identifier` because the rule genuinely
+    differs, as the note on :data:`TelegramChatId` says: Telegram numbers groups
+    and channels below zero, so requiring a positive value would refuse every
+    group and channel a real account has. One function, so the two places that
+    hold a chat identifier -- the entity and the gateway's view of one -- cannot
+    disagree about it.
+
+    Raises:
+        DomainValidationError: If the identifier is zero.
+    """
+    if value == 0:
+        msg = "A Telegram chat identifier cannot be zero"
+        raise DomainValidationError(msg, user_message="That is not a valid chat identifier.")

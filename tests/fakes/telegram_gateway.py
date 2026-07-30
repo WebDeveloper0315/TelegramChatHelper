@@ -36,6 +36,7 @@ from tgassist.domain.model.telegram import (
 )
 from tgassist.domain.ports.telegram_gateway import (
     DEFAULT_CHAT_LIMIT,
+    DEFAULT_CONTACT_LIMIT,
     DEFAULT_HISTORY_LIMIT,
     AuthorizationHandler,
     RetryDecision,
@@ -56,16 +57,20 @@ ACCEPTED_PASSWORD = "not-a-real-password"  # noqa: S105 - a fake's scripted answ
 class FakeTelegramGateway(TelegramGateway):
     """A Telegram gateway that answers from a script.
 
-    Reads are scripted separately from the login: :meth:`script_chats` and
-    :meth:`script_history` say what this account has, and the paging in
-    :meth:`fetch_history` behaves as TDLib's does, so a backfill loop written
-    against this fake is one that works against Telegram.
+    Reads are scripted separately from the login: :meth:`script_chats`,
+    :meth:`script_contacts`, :meth:`script_users` and :meth:`script_history` say
+    what this account has, and the paging in :meth:`fetch_history` behaves as
+    TDLib's does, so a backfill loop written against this fake is one that works
+    against Telegram.
 
     Attributes:
         connect_calls: How many times :meth:`connect` was called, so idempotency
             is observable rather than assumed.
         list_calls: How many times the chat list was requested, so a caller that
             fetches it twice is visible.
+        contact_calls: How many users were resolved individually, so a sync that
+            looks somebody up once per run rather than once per chat is
+            measurable.
         submitted: Which credential kinds were asked for, in order. Deliberately
             **not** what was submitted: a fake that recorded codes and passwords
             would be a test fixture that stores credentials, which is the thing
@@ -75,6 +80,7 @@ class FakeTelegramGateway(TelegramGateway):
     __slots__ = (
         "_account_id",
         "_authorized",
+        "_book",
         "_chats",
         "_code",
         "_connected",
@@ -84,7 +90,9 @@ class FakeTelegramGateway(TelegramGateway):
         "_requires_password",
         "_starts_authorized",
         "_user",
+        "_users",
         "connect_calls",
+        "contact_calls",
         "disconnect_calls",
         "list_calls",
         "logout_calls",
@@ -125,10 +133,16 @@ class FakeTelegramGateway(TelegramGateway):
         self._connection = ConnectionState.OFFLINE
         self._chats: list[TelegramChatInfo] = []
         self._history: dict[int, list[TelegramMessage]] = {}
+        # Everyone get_contact can resolve, and -- separately -- the order of
+        # the address book. Telegram resolves anybody this account has seen,
+        # whether or not they were ever saved, so the two are not the same set.
+        self._users: dict[int, TelegramUser] = {int(user.id): user}
+        self._book: list[int] = []
         self.connect_calls = 0
         self.disconnect_calls = 0
         self.logout_calls = 0
         self.list_calls = 0
+        self.contact_calls = 0
         self.submitted: list[str] = []
 
     # -- Identity ---------------------------------------------------------
@@ -246,6 +260,25 @@ class FakeTelegramGateway(TelegramGateway):
         self._require_authorized("get_chat")
         return next((chat for chat in self._chats if chat.id == chat_id), None)
 
+    async def get_contact(self, user_id: TelegramUserId) -> TelegramUser | None:
+        """Return one resolvable user, or ``None`` if this account cannot see them."""
+        self._require_authorized("get_contact")
+        self.contact_calls += 1
+        return self._users.get(int(user_id))
+
+    async def list_contacts(
+        self, *, limit: int = DEFAULT_CONTACT_LIMIT
+    ) -> tuple[TelegramUser, ...]:
+        """Return the address book, in the order it was scripted.
+
+        A saved entry whose user has since become unresolvable is skipped, which
+        is what the real adapter does when ``getUser`` answers 404 between the
+        two calls.
+        """
+        self._require_authorized("list_contacts")
+        found = (self._users.get(identifier) for identifier in self._book[:limit])
+        return tuple(user for user in found if user is not None)
+
     async def fetch_history(
         self,
         chat_id: TelegramChatId,
@@ -275,6 +308,23 @@ class FakeTelegramGateway(TelegramGateway):
     def script_chats(self, *chats: TelegramChatInfo) -> None:
         """Replace the chats this gateway will report."""
         self._chats = list(chats)
+
+    def script_contacts(self, *users: TelegramUser) -> None:
+        """Replace the address book. Everyone in it is also resolvable."""
+        self._book = [int(user.id) for user in users]
+        self.script_users(*users)
+
+    def script_users(self, *users: TelegramUser) -> None:
+        """Make users resolvable by :meth:`get_contact` without saving them.
+
+        The population a private chat's counterpart comes from: somebody who
+        messaged this account is resolvable but was never added to the book.
+        """
+        self._users.update({int(user.id): user for user in users})
+
+    def forget_user(self, user_id: TelegramUserId) -> None:
+        """Make a user unresolvable, as a deleted Telegram account becomes."""
+        self._users.pop(int(user_id), None)
 
     def script_history(self, chat_id: TelegramChatId, *messages: TelegramMessage) -> None:
         """Replace one chat's history."""

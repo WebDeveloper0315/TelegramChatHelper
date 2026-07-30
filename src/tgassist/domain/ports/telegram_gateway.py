@@ -5,14 +5,10 @@ Telegram; :class:`AuthorizationHandler` is the only way a credential reaches the
 gateway.
 
 `TelegramGateway` is declared one slice at a time (ADR-051). It now covers
-lifecycle, authorization, the operator's own identity, and reading chats and
-history. Updates and sending arrive with the code that calls them: a protocol
-listing methods no caller uses cannot be verified by a contract suite, and a
-fake would have to invent behaviour for them.
-
-`get_contact` is deliberately still absent. Telegram carries a private chat's
-counterpart on the chat itself, so nothing yet needs to look a user up
-separately; contact synchronisation is what will.
+lifecycle, authorization, the operator's own identity, and reading chats,
+contacts and history. Updates and sending arrive with the code that calls them:
+a protocol listing methods no caller uses cannot be verified by a contract
+suite, and a fake would have to invent behaviour for them.
 """
 
 from __future__ import annotations
@@ -24,6 +20,7 @@ from tgassist.domain.model.identifiers import (
     AccountId,
     TelegramChatId,
     TelegramMessageId,
+    TelegramUserId,
 )
 from tgassist.domain.model.session import AuthorizationState, ConnectionState
 from tgassist.domain.model.telegram import (
@@ -43,6 +40,14 @@ DEFAULT_CHAT_LIMIT: Final = 200
 #: practical page size, and with the transaction granularity the sync engine
 #: will use (``TELEGRAM_ARCHITECTURE.md`` section 8.4).
 DEFAULT_HISTORY_LIMIT: Final = 100
+
+#: How many address-book entries to resolve when a caller does not say.
+#:
+#: Telegram caps a personal address book at 5 000, and returns the whole thing
+#: in one answer. This is a ceiling on how many of those entries are *resolved*
+#: into users, so that a single command cannot turn into thousands of lookups
+#: without the caller having asked for it.
+DEFAULT_CONTACT_LIMIT: Final = 1000
 
 
 class RetryDecision(StrEnum):
@@ -211,6 +216,43 @@ class TelegramGateway(Protocol):
         """
         ...
 
+    async def get_contact(self, user_id: TelegramUserId) -> TelegramUser | None:
+        """Return one Telegram user, or ``None`` if this account cannot see them.
+
+        ``None`` rather than an error, for the same reason :meth:`get_chat`
+        answers that way: an account that has been deleted, or that this account
+        has no visibility of, is an ordinary answer to "who is this".
+
+        A chat carries its counterpart's *name*, but not their handle. This is
+        what supplies the handle, which is why it exists now and did not before.
+
+        Raises:
+            TdlibNotRunningError: If there is no connection.
+            AuthorizationError: If the account is not authorized.
+        """
+        ...
+
+    async def list_contacts(
+        self, *, limit: int = DEFAULT_CONTACT_LIMIT
+    ) -> tuple[TelegramUser, ...]:
+        """Return the people in this account's Telegram address book.
+
+        A different population from :meth:`list_chats`: the address book holds
+        people this account has saved, including ones it has never messaged,
+        and excludes everybody it has only ever been messaged *by*. Neither set
+        contains the other, which is why both are read.
+
+        Args:
+            limit: How many entries to resolve at most. A ceiling rather than a
+                page size; Telegram returns the whole book in one answer.
+
+        Raises:
+            TdlibNotRunningError: If there is no connection.
+            AuthorizationError: If the account is not authorized.
+            TelegramError: If Telegram refused.
+        """
+        ...
+
     async def fetch_history(
         self,
         chat_id: TelegramChatId,
@@ -243,6 +285,7 @@ class TelegramGateway(Protocol):
 
 __all__ = [
     "DEFAULT_CHAT_LIMIT",
+    "DEFAULT_CONTACT_LIMIT",
     "DEFAULT_HISTORY_LIMIT",
     "AuthorizationHandler",
     "RetryDecision",

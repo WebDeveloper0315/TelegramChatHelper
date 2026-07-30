@@ -253,7 +253,11 @@ Three states, expressed as two nullable timestamps of which at most one is set; 
 
 **Deferred attributes.** `first_name` / `last_name` (duplicated by `display_name`; needed for salutation generation in Milestone 8), `phone_number_hash` (the salt strategy belongs with the code that first receives a phone number), `language` (nothing reads it; `UserProfile.primary_language` is what reply generation consults), `country` / `timezone` (Telegram supplies neither), `is_blocked` (distinct from archived, but nothing processes anybody until Milestone 8), `notes` (overlaps the Memory aggregate), `first_seen_at` / `last_seen_at` (written by synchronisation from message timestamps). Each is one additive migration away.
 
-**Note.** "A Contact cannot be its own Account's operator identity" is stated in version 1.0 but not enforced: nothing prevents adding a contact whose `telegram_user_id` equals the owning Account's. It becomes checkable once authentication establishes the operator's own identifier (Milestone 2), and is recorded as an open item in `ROADMAP.md` rather than half-enforced now.
+**Enforced since Milestone 2.7.** "A Contact cannot be its own Account's operator identity" was stated in version 1.0 and unenforced until synchronisation needed it. It is now checked by the domain service `require_not_operator` on every write path that can create a contact -- `CreateContact` and both synchronisation use cases.
+
+The identifier it compares against is `Account.telegram_user_id`, which has existed since Milestone 1.2; the rule was unenforced because nobody had written the check, not because the value was missing. It is not a schema constraint: SQLite's `CHECK` cannot reference another table, and a trigger would be a second home for the same rule (ADR-052).
+
+Enforcement is on write only. A database written before Milestone 2.7 may hold such a row; nothing scans for one, because refusing to list contacts would be a worse outcome than the row existing.
 
 ---
 
@@ -283,6 +287,10 @@ Three states, expressed as two nullable timestamps of which at most one is set; 
 **Deferred attributes.** `last_message_at` (written by ingestion; until messages exist it would be null on every row), `is_muted` (nothing notifies), `is_archived` (a third way to hide something, after archiving the Contact and disabling sync), `retention_days` (no global policy to inherit until Milestone 10), `deleted_at` (see the lifecycle above). Each is one additive migration away.
 
 **Notes.** MVP scope is private chats (`PROJECT_SPEC.md` §12). All five kinds are modelled so that enabling group support is additive — and because the private-chat invariants are only meaningful if a non-private chat is representable.
+
+`saved` earned its place in Milestone 2.7. Telegram's Saved Messages arrives as a private chat whose counterpart is the operator, which cannot be stored as a private chat because that would require a Contact the operator is forbidden to be (ADR-052). Every real account has one, so this is the ordinary case rather than an edge one.
+
+Synchronisation records every kind of chat but sets `sync_enabled` only for the kinds in `telegram.sync_chat_types` (default: private). A group is therefore visible and switchable rather than absent, and nothing revisits that setting once the chat exists (ADR-053).
 
 ---
 

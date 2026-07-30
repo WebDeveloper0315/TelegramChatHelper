@@ -25,6 +25,7 @@ from tgassist.domain.model.identifiers import (
     TelegramChatId,
     TelegramMessageId,
     TelegramUserId,
+    require_nonzero_chat_identifier,
     require_positive_identifier,
 )
 from tgassist.domain.model.message import MessageType
@@ -151,10 +152,10 @@ class TelegramChatInfo:
         """Validate what a chat cannot be without.
 
         Raises:
-            DomainValidationError: If the identifier is not positive, the unread
-                count is negative, or a non-private chat names a counterpart.
+            DomainValidationError: If the identifier is zero, the unread count
+                is negative, or a non-private chat names a counterpart.
         """
-        require_positive_identifier(self.id, name="Telegram chat id")
+        require_nonzero_chat_identifier(self.id)
 
         if self.unread_count < 0:
             msg = f"A chat cannot have {self.unread_count} unread messages"
@@ -220,11 +221,11 @@ class TelegramMessage:
         """Validate identity and time.
 
         Raises:
-            DomainValidationError: If an identifier is not positive, or the
+            DomainValidationError: If an identifier is unusable, or the
                 timestamp is not timezone-aware UTC.
         """
         require_positive_identifier(self.id, name="Telegram message id")
-        require_positive_identifier(self.chat_id, name="Telegram chat id")
+        require_nonzero_chat_identifier(self.chat_id)
         if self.sender_id is not None:
             require_positive_identifier(self.sender_id, name="Telegram sender id")
         if self.reply_to_message_id is not None:

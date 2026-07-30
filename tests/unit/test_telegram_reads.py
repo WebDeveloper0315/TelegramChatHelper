@@ -56,9 +56,17 @@ def chat(**overrides: Any) -> TelegramChatInfo:
 
 
 class TestTelegramChatInfo:
-    def test_requires_a_positive_identifier(self) -> None:
-        with pytest.raises(DomainValidationError, match="Telegram chat id"):
+    def test_refuses_a_zero_identifier(self) -> None:
+        with pytest.raises(DomainValidationError, match="cannot be zero"):
             chat(id=TelegramChatId(0))
+
+    @pytest.mark.parametrize("kind", [ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL])
+    def test_a_negative_identifier_is_legitimate(self, kind: ChatType) -> None:
+        # Telegram numbers groups and channels below zero, so requiring a
+        # positive value here would refuse every group a real account has --
+        # which is exactly what this type did until chat synchronisation was
+        # written against realistic data.
+        assert int(chat(id=TelegramChatId(-100_500), chat_type=kind, counterpart_id=None).id) < 0
 
     def test_refuses_a_negative_unread_count(self) -> None:
         with pytest.raises(DomainValidationError, match="cannot have -1 unread") as excinfo:
@@ -111,9 +119,14 @@ class TestTelegramMessage:
             ("reply_to_message_id", TelegramMessageId(0)),
         ],
     )
-    def test_identifiers_must_be_positive(self, field: str, value: int) -> None:
+    def test_unusable_identifiers_are_refused(self, field: str, value: int) -> None:
         with pytest.raises(DomainValidationError):
             msg(**{field: value})
+
+    def test_a_message_in_a_group_has_a_negative_chat_identifier(self) -> None:
+        # The same rule as the chat itself: a message in a group carries the
+        # group's identifier, and Telegram numbers those below zero.
+        assert int(msg(chat_id=TelegramChatId(-100_500)).chat_id) < 0
 
     def test_a_service_message_may_have_no_sender(self) -> None:
         # Telegram itself produced it; attributing it to somebody would put

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from tgassist.application.use_cases.account_scope import resolve_account
+from tgassist.application.use_cases.account_scope import require_account, resolve_account
 from tgassist.domain.errors import ConflictError, RecordNotFoundError
 from tgassist.domain.model.contact import Contact
 from tgassist.domain.model.identifiers import AccountId, ContactId, TelegramUserId
@@ -27,6 +27,7 @@ from tgassist.domain.ports.contact_repository import ContactRepository
 from tgassist.domain.ports.id_generator import IdGenerator
 from tgassist.domain.ports.repository import RepositoryFactory, ScopedRepositoryFactory
 from tgassist.domain.ports.unit_of_work import UnitOfWork, UnitOfWorkFactory
+from tgassist.domain.services.operator_identity import require_not_operator
 
 
 class ContactTransition(StrEnum):
@@ -102,11 +103,16 @@ class CreateContact(_ScopedUseCase):
                 would be useless, so the message says it was deleted and can be
                 restored.
             RecordNotFoundError: If no account matches, or none is active.
-            DomainValidationError: If a value violates a Contact invariant.
+            DomainValidationError: If a value violates a Contact invariant, or
+                if the Telegram user is the account's own operator identity
+                (ADR-052).
         """
         async with self._unit_of_work() as uow:
-            contacts = await self._scoped(uow, account_id)
+            account = await require_account(self._accounts(uow), account_id)
+            contacts = self._contacts(uow, account.id)
             telegram_id = TelegramUserId(telegram_user_id)
+
+            require_not_operator(account, telegram_id)
 
             existing = await contacts.get_by_telegram_id(telegram_id, include_deleted=True)
             if existing is not None:

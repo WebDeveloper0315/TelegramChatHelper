@@ -52,6 +52,7 @@ from tgassist.application.use_cases.message import (
     ReadChatHistory,
 )
 from tgassist.application.use_cases.session import PrepareSession
+from tgassist.application.use_cases.sync import SyncChats, SyncContacts
 from tgassist.application.use_cases.user_profile import (
     GetUserProfile,
     UpdateUserProfile,
@@ -449,6 +450,27 @@ class Container:
         return LogOutAccount(
             self._uow_factory, self.sessions, self.accounts, self._secrets, self._clock
         )
+
+    def sync_chats(self) -> SyncChats:
+        """Build the chat synchronisation use case.
+
+        The configured chat types are resolved here rather than read inside the
+        use case: configuration is infrastructure, and a use case that reached
+        for it would be one a test could not run without a config file.
+        """
+        return SyncChats(
+            self._uow_factory,
+            self.chats,
+            self.contacts,
+            self.accounts,
+            self._clock,
+            self._ids,
+            frozenset(self.config.telegram.sync_chat_types),
+        )
+
+    def sync_contacts(self) -> SyncContacts:
+        """Build the contact synchronisation use case."""
+        return SyncContacts(self._uow_factory, self.contacts, self.accounts, self._clock, self._ids)
 
     def repository[R](self, factory: RepositoryFactory[R], uow: UnitOfWork) -> R:
         """Build a repository bound to an open unit of work.
