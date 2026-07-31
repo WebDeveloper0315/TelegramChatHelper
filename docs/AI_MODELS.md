@@ -96,6 +96,133 @@ Making the deterministic services explicit is deliberate: they are free, instant
 
 # 4. Provider Abstraction and Capability Matrix
 
+## Implementation status (Milestone 9a)
+
+The boundary is built; the pipeline above it is not. What exists today:
+
+- **One port**, `AiProvider`, with two members -- `model` and `generate`. A
+  capability is a property of the model, not a class of client: one endpoint
+  answers a completion, a classification and a structured extraction, and
+  splitting the port would mean several adapters over one endpoint (ADR-057 §1).
+  Embeddings will need a second port, declared by the slice that has a caller
+  for it -- an embedding is not text, and no honest signature covers both.
+- **One execution use case**, `ExecuteAiTask`. Every AI feature calls it and
+  inherits the privacy gate, the timeout, the token accounting and the audit
+  record. It interprets nothing: no parsing, no schema validation, no repair.
+  Those belong to the task that knows what shape it asked for.
+- **Two implementations**: `AnthropicProvider` over an injectable
+  `HttpTransport`, and `ScriptedAiProvider` -- deterministic, shipped, and the
+  default, so a fresh installation works with no key and no network.
+- **`ai_calls`**, written for every invocation including failures and refusals.
+
+## Implementation status (Milestone 9b)
+
+The first capability built on that boundary: **memory proposal extraction**.
+Conversation -> prompt -> `ExecuteAiTask` -> structured output -> proposal ->
+review queue. What it adds:
+
+- **A prompt registry.** Versioned files inside the package, indexed by
+  `_registry.yaml`, validated at startup, immutable once loaded. No prompt text
+  in Python source (ADR-008, ADR-026).
+- **A structured output validator.** Shape only, with exactly one repair
+  attempt, over a deliberately small JSON Schema subset that refuses any schema
+  using more (ADR-020, ADR-058 §6).
+- **`ExtractMemories`.** Renders the prompt, calls the boundary, validates,
+  filters and persists. Every fact it produces is a `MemoryProposal` awaiting a
+  person's decision — **nothing is remembered** (ADR-019, ADR-058).
+
+## Implementation status (Milestone 9c)
+
+The lifecycle completes: a person reviews what the model proposed, and an
+accepted proposal becomes a `Memory` (ADR-059).
+
+- **`Memory` is a separate aggregate** in a separate table. Every query that
+  asks what is known reads something nothing can write to without a decision.
+- **Identity belongs to the application.** A memory's key is a deterministic
+  normalisation of its value; the model never supplies one.
+- **A decision is made once** — no undo, no reopen — and acceptance creates
+  exactly one memory, in the same transaction.
+- **Memories are immutable and forgettable.** Correcting one means forgetting it
+  and accepting a fresh proposal.
+
+## Implementation status (Milestone 9d)
+
+Memories are now *usable*: `BuildMemoryContext` selects what a model should be
+told about somebody, deterministically (ADR-060).
+
+- **Deterministic ranking, not semantic.** Five lexicographic keys over stored
+  facts — category priority, importance, confidence, recency, identifier — and
+  no weights. Explainable one comparison at a time.
+- **A token budget spent after ranking**, never changing it. What does not fit
+  is skipped and reported; nothing is shortened.
+- **Retrieval never crosses contacts.** A group chat sees only the facts about
+  nobody in particular.
+- **`tgassist memory context`** shows the whole selection, the reason for each
+  placement, the token cost and every omission — with no model involved.
+- **`MemoriesRetrieved`** is published after a recorded retrieval. Nothing
+  subscribes yet; it is what a later report on retrieval quality reads.
+- **The token estimate is four characters per token**, with a stated error: it
+  over-estimates ordinary English prose by roughly 5–15% and under-estimates
+  text that tokenises badly. Systematic rather than random, so budget decisions
+  stay reproducible (ADR-060 §8a).
+
+**Why this before embeddings.** Not because it is better. Because a vector index
+shipped first would be compared against nothing, and "semantic retrieval
+improved the suggestions" would be a claim with no denominator. This is the
+baseline that makes the comparison possible, and it builds the parts a semantic
+version still needs: the budget, the degradation order, and the record of what
+was omitted.
+
+## Implementation status (Milestone 9e)
+
+The first feature that *consumes* what the application knows. A conversation and
+its retrieved memories are assembled into one prompt, a model answers in a fixed
+shape, and what comes back is checked (ADR-061).
+
+- **A fixed context order**: system prompt, memories, conversation, task and
+  output format. Memories before the conversation because they are the frame a
+  constraint is read through; the task last because a final instruction is the
+  one a model follows most reliably.
+- **A trim order with two floors.** The oldest messages go first, then the
+  lowest-ranked memories; the system prompt, the task, the format and the **most
+  recent message** are never removed. Nothing is ever shortened to fit.
+- **Attribution is checked.** The model reports which memories it used, and
+  every key is verified against what was actually supplied. A key that was never
+  supplied is a fabricated citation, discarded and counted.
+- **`tgassist chat suggest`** shows the whole chain: memories supplied and
+  omitted, what the budget trimmed, the transcript, the prompt version, the
+  token estimate, the AI call and the draft.
+- **Nothing is sent.** There is no code path from a suggestion to Telegram.
+
+Not yet built: embeddings, similarity, hybrid retrieval, decay, pinning,
+conflict detection, supersession, revisions, auto-approval, expiry, streaming,
+token counting, health checks, capability discovery, retries, fallback chains
+and cost limits. Those sections remain the specification, not a description.
+
+**Why the abstraction exists before there are two providers.** Not for
+portability -- for *determinism*. Every AI feature after this one needs the same
+five things (gate, timeout, accounting, normalised failures, audit record), and
+built once per feature they would be built five times and drift. The one that
+drifted would be the privacy gate. Portability is a consequence, not the reason.
+
+**Why prompt versions exist before prompts are complicated.** A version costs
+one column now. Without it, the first time an output changes there is no way to
+tell whether the model changed or the prompt did -- and that question is asked
+*after* the change, about data that had to already be collected when it
+happened. It cannot be added retroactively.
+
+**Why AI execution and memory extraction are separate milestones.** Execution is
+about *how* a model is called: the gate, the timeout, the cost, the record.
+Extraction is about *what* is asked and what is believed of the answer: a prompt,
+a schema, a validator, a confidence threshold, a proposal a user reviews. Built
+together, a malformed extraction response would be indistinguishable from a
+broken provider, and every later task's schema would land inside the one
+component every task shares. Built apart, extraction begins with a boundary that
+is already deterministic and already instrumented.
+
+---
+
+
 `LLMProvider` exposes `capabilities()` (`API.md` §11.1). Capabilities are **discovered and verified** by `tgassist ai check`, never trusted from configuration.
 
 | Capability | Meaning | Consequence when absent |
@@ -343,12 +470,33 @@ Defences:
 4. **Supersession, not overwriting.** Value changes create a `MemoryRevision`, so belief history is recoverable and mistakes are reversible.
 5. **User precedence.** `provenance = USER` outranks AI provenance in both retrieval and conflict resolution.
 6. **Rejection memory.** Rejected proposals are retained and consulted, so a declined fact is not re-proposed on every conversation.
-7. **Grounding requirement.** The extraction prompt requires a verbatim quotation from the source message supporting each proposal; a proposal without one is discarded before it reaches the user.
+7. **Grounding requirement.** The extraction prompt requires a verbatim quotation supporting each proposal; a proposal without one is discarded before it reaches the user. **Implemented and strengthened (ADR-058 §8):** the quotation is not merely required, it is *checked against the conversation the model was shown* — whitespace-insensitive and case-insensitive, and nothing more forgiving. A model cannot quote what nobody said, so this catches the failure that matters most: a fluent, plausible fact about somebody that was never stated. The cost is that a true fact the model paraphrased rather than quoted is discarded too; that is deliberate, because a paraphrase cannot be checked.
 8. **Periodic review.** A background job surfaces low-confidence, never-retrieved memories older than a threshold for confirmation or removal.
+
+**Implemented today (9b–9c):** 1 (every proposal waits for a person; there is still no auto-approval), 3 (provenance is the proposal, the conversation and the AI call, and a memory can only lose all of it at once — when the chat is deleted), 6 (rejected proposals are consulted by the duplicate check) and 7 (grounding, checked rather than merely requested).
+
+**Defence 4 is met differently from how it was specified.** "Supersession, not overwriting" assumed memories are edited. They are not: a memory is immutable, and correcting one means forgetting it and accepting a new proposal (ADR-059 §5). Belief history is therefore recoverable from the `deleted_at` timestamps rather than from a revision table.
+
+**Defence 2 (conservative auto-approval) and 5 (user precedence) are not implemented, and 8 (periodic review) is not either.** The first two need auto-approval and user-typed memories respectively; the third needs retrieval counts. **Nothing yet detects that two live memories contradict each other** — the key deduplicates and does not compare — which is the largest gap this milestone leaves.
 
 ---
 
 # 14. Hallucination Prevention in Replies
+
+**Implemented today (9e):** the suggestion prompt forbids inventing facts and
+requires the model to say which supplied memories it used; every reported key is
+**checked against what was actually supplied**, and a key that was not is a
+fabricated citation, discarded and counted (ADR-061 §3).
+
+What that catches is narrow — a claim of grounding the model never had. It does
+not prove that a memory reported as used influenced the text, and nothing
+available at this layer can. What it buys is a reader who can ask "why did it
+say that?" and be shown the exact facts that were in front of the model.
+
+The stronger control is structural and is already in place: a suggestion is a
+draft that a person reads before anything happens with it, and there is no code
+path from generation to sending.
+
 
 1. The reply prompt requires that factual claims about the contact be grounded in the supplied memories or recent messages.
 2. Where information is missing, the required behaviour is to ask a clarifying question or say so — never to invent.

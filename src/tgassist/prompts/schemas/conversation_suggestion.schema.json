@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "conversation_suggestion",
+  "description": "What the suggestion prompt is permitted to return. Three fields: the draft, how sure the model is, and which supplied memories affected it. Nothing else -- a model cannot name a chat, a recipient or an action, because there is no field here to put one in (ADR-061).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["suggestion", "confidence", "used_memory_keys"],
+  "properties": {
+    "suggestion": {
+      "type": "string",
+      "description": "The message the operator could send. Bounded well below what a chat platform accepts: a suggestion longer than this is one nobody will read before sending, which defeats the review it exists for.",
+      "minLength": 1,
+      "maxLength": 2000
+    },
+    "confidence": {
+      "type": "number",
+      "description": "Self-reported, and poorly calibrated (AI_MODELS section 15). Used to decide whether a suggestion is offered at all, and nothing more is claimed of it. Bounded here so a value outside the range is caught as a malformed answer rather than compared against a threshold as though it meant something.",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "used_memory_keys": {
+      "type": "array",
+      "description": "The key of every supplied memory that affected the suggestion. Required, and an empty array is a correct answer: many replies need no stored knowledge at all. Every key is checked against what was actually supplied -- a key that was not is a fabricated attribution, discarded and counted.",
+      "minItems": 0,
+      "maxItems": 50,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 120
+      }
+    }
+  }
+}

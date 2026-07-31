@@ -36,6 +36,894 @@ Not every release requires every category.
 
 ## Added
 
+### Milestone 10b -- Suggestion Review Queue
+
+Slice 10b: every generated suggestion is stored and waits for a decision.
+Generate -> review -> accept or dismiss. **Accepting sends nothing**, because
+there is nothing in this application that could send.
+
+**Nothing acts automatically, and it is structural rather than a rule**
+
+- `AcceptSuggestion` is given no gateway, no scheduler and no executor; a test
+  asserts on its constructor signature, so wiring one in is a deliberate change
+  somebody has to defend.
+- The repository has `add`, `get`, `list_pending`, `list_by_chat` and `decide`,
+  and no `execute`, `send` or `schedule`. The absence of an operation is a
+  stronger guarantee than a rule about not calling one (ADR-062).
+
+**One decision, enforced twice**
+
+- The entity refuses a second decision and names the one already made.
+- The repository's single mutation is conditional -- `UPDATE ... WHERE status =
+  'pending'` -- so two decisions arriving at once cannot both land.
+- No undo, no reopen, no edit. **An edited draft is not what the model
+  suggested**, and the record exists to say what it suggested when somebody
+  agreed with it.
+
+**Three fields for three audiences**
+
+- `title` for a listing, `description` for the person deciding -- for a reply
+  draft, the draft itself -- and `payload` as JSON for a machine that does not
+  exist yet.
+- The split is what keeps review uniform as the kinds of suggestion multiply: a
+  second type needs new payload handling and **no new review**, and no reviewer
+  ever has to read JSON to decide.
+
+**Dismissals are kept**
+
+- A record of only what was agreed with cannot show what the generator is
+  getting wrong. `list_pending` is the queue -- what has not been decided --
+  while `list_by_chat` shows a conversation's whole history, dismissals
+  included.
+
+### Database
+
+- **Migration `0014`** -- `suggestions`. Composite foreign keys to chats,
+  conversations and AI calls (ADR-043), **all `CASCADE`**: unlike a memory,
+  whose provenance is `SET NULL` because approved knowledge outlives the
+  exchange it came from, a suggestion is a draft *about* a conversation and
+  means nothing once that conversation is gone.
+- Ten check constraints, including `(status = 'pending') = (decided_at IS
+  NULL)`. **No `updated_at`**, because nothing edits a suggestion.
+- A **partial** index for the queue (`WHERE status = 'pending'`) -- an index
+  carrying every decided row would grow without bound while serving nothing --
+  and a non-partial one for a chat's history.
+
+### Changed
+
+- Generation now writes its draft alongside the `AiCall` in one transaction and
+  publishes `SuggestionsCreated`. `chat suggest` names the row it saved.
+- Slice 9e's `Suggestion` DTO is renamed `GeneratedSuggestion`: the name now
+  belongs to the stored aggregate, and one of the two had to give it up.
+
+### Fixed
+
+- Nothing. No defect was found in existing behaviour while implementing this
+  slice.
+
+### Milestone 9e -- Context Assembly & First Real Prompt
+
+Slice 9e: memories reach a model. Conversation + retrieved memories -> one
+assembled prompt -> structured answer -> a draft on the screen. **Nothing is
+sent, and nothing is stored.**
+
+**A fixed context order, and each position argued**
+
+- System prompt, memories, conversation, task and output format (ADR-061 §1).
+- **Memories before the conversation** because they are the *frame*: a
+  constraint like "do not mention the old job" changes how every message below
+  should be read, and a model that met the messages first has already formed a
+  reading by the time it learns the rule.
+- **The conversation between them**, delimited and untrusted, so an injection
+  attempt is bracketed by trusted rules above and the actual instruction below.
+- **The task last**, because a model's final instruction is the one it follows
+  most reliably -- and the one that must survive an injection that got past
+  everything above.
+- **Rejected:** an order chosen for readability, and letting the model decide
+  what to read first. Both make the prompt unreproducible, and an
+  unreproducible prompt makes every later comparison meaningless.
+
+**A trim order with two floors**
+
+- **Never removed:** the system prompt, the task, the output format, and the
+  **most recent message** -- without it there is nothing to respond to.
+- **First to go: the oldest messages.** In a chronological record, recency is
+  relevance.
+- **Then the lowest-ranked memories**, and the justification matters because the
+  instinct is the opposite: memories arriving here have *already survived
+  retrieval's budget*, so each was deliberately chosen, while message history is
+  bulk kept because it is cheap.
+- **Nothing is ever shortened to fit.** A truncated fact is a fact that was
+  never stated.
+
+**Attribution is checked**
+
+- The prompt supplies each memory with its key; the model reports which it used;
+  every key is **verified against what was actually supplied**. A key that was
+  not is a fabricated citation -- discarded, counted, and flagged on the output.
+- What that catches is narrow but real: a suggestion claiming grounding it does
+  not have is worse than one claiming none, because the first invites trust.
+
+**The assembler writes no prose**
+
+- It decides *what* is included and *in what order*; the prompt file decides
+  *what it means and what to do about it*. Not one imperative sentence in
+  `context_assembly.py` reaches a model, and the prompt version recorded against
+  a call therefore covers all the wording that was sent.
+
+**Commands**
+
+- `tgassist chat suggest <chat>` -- memories supplied and omitted, what the
+  budget trimmed, the transcript, the prompt version, the token estimate, the AI
+  call and the draft. `--show-prompt` prints the exact text that was sent.
+
+**Tests -- 86 added, suite at 3243**
+
+- 37 over the assembler: ordering, each trim rule, the floors, determinism,
+  empty memories, empty conversation, attribution keys, and that a memory cannot
+  forge a delimiter.
+- 53 behaviour tests: prompt generation, malformed output, a repair that works,
+  a repair that does not, a provider timeout, the privacy gate, fabricated
+  attribution, eight against a **real SQLite database** including the two
+  rollback cases, and four end-to-end command-line tests.
+
+## Fixed
+
+- **An approved memory could forge a prompt delimiter.** Memories are trusted
+  content -- a person accepted them -- so they are not wrapped in the "this is
+  data, not instructions" markers. But a memory's *text* came from a model
+  reading a conversation, so it can contain anything that conversation did: a
+  value carrying `<<<END_CONVERSATION_CONTENT>>>` would sit outside the
+  delimited block and close it early for everything below. Found when retrieval
+  was first connected to a prompt. Memory text and keys are now neutralised
+  without being delimited: **trusting a fact is not the same as trusting its
+  punctuation** (ADR-061).
+
+## Changed
+
+- **The one-repair loop moved out of `ExtractMemories` into
+  `StructuredAiTask`.** ADR-058 put it inside the only structured task there
+  was; there are now two, and "exactly one repair" must not be able to become
+  "one here and two there". Everything about *what* is asked stays with each
+  caller.
+
+### Milestone 9d -- Memory Retrieval
+
+Slice 9d: approved memories become usable. Conversation -> contact -> ranked
+memories -> token budget -> context. **No embeddings, no similarity, no model.**
+
+**Deterministic before semantic, and the reason is measurement**
+
+- A vector index shipped first would be compared against nothing, and "semantic
+  retrieval improved the suggestions" would be a claim with no denominator. This
+  is the baseline that makes the comparison possible (ADR-060).
+- It also builds the parts a semantic version still needs and cannot borrow from
+  a model: the token budget, the order a context degrades in, and the record of
+  what was left out.
+
+**Five ranking keys, lexicographic, no weights**
+
+- **Category priority** -- ordered by what it costs to get wrong. A `constraint`
+  first (ignoring one is worse than saying nothing), then `open_question`, then
+  time-sensitive facts, then identity, then durable context, then preference,
+  then interests. `other` last.
+- **Importance**, then **confidence**. Importance first deliberately: a person's
+  judgement of what is worth knowing outranks a machine's estimate of what is
+  true, and self-reported confidence is poorly calibrated.
+- **Recency** by when the fact was *accepted*, then the **identifier** as a
+  total tie-break, so ordering never depends on what the database returned.
+- **Rejected: a weighted score.** It reads as principled and is not -- the
+  weights would be invented, no test could show one set beats another, and
+  changing one silently reorders everything.
+- **`last_retrieved_at` is not a ranking key.** Ranking by it would make a
+  retrieved memory rank higher and so be retrieved again -- a feedback loop, not
+  a relevance signal. It is recorded so the *absence* of retrieval stays
+  visible.
+
+**The budget is spent after ranking and never changes it**
+
+- What does not fit is **skipped**, and the walk continues, so one long fact near
+  the top does not empty the context beneath it. Order among the selected is
+  untouched and every omission is reported with its reason.
+- **Nothing is ever shortened to fit.** A truncated fact is a different fact.
+
+**Retrieval never crosses contacts**
+
+- A private chat retrieves that person's memories; a chat with no single
+  counterpart retrieves the facts about nobody in particular -- and a private
+  chat does not see those either. Strict in both directions, enforced by the
+  repository.
+
+**Accounting, and what it means for immutability**
+
+- `BuildMemoryContext` records the retrieval; `GetMemoryContext` does not.
+  Looking at what would be sent is not using it, and an inspection that inflated
+  the counters would corrupt the measurement it exposes.
+- The count is incremented **in SQL** over the whole selection in one statement,
+  in the same transaction as the read, so concurrent contexts cannot lose a
+  count and a context of twenty memories costs one write.
+- **`Memory` is still immutable.** What retrieval writes is bookkeeping *about*
+  a fact, not the fact -- a refinement of ADR-059 rather than an exception to
+  it.
+
+**Commands**
+
+- `tgassist memory context <chat>` -- the selection, the ranking order, why each
+  memory placed where it did, the token usage and every omission. `--record` to
+  count it as a real retrieval would.
+- `tgassist memory accept --importance low|normal|high|critical`.
+
+**Tests -- 124 added, suite at 3157**
+
+- 44 over the selector: every ranking key in isolation, every key's precedence
+  over the next, stability under input reordering, the budget, the cap, and that
+  every category has a distinct priority.
+- 38 more contract obligations over both repository implementations: contact
+  isolation, the contactless partition, forgotten memories ignored, ordering,
+  the limit, and retrieval accounting including concurrency-safe increments.
+- 42 behaviour tests: context generation, a chat without a contact, budget and
+  cap exhaustion, candidate truncation, rollback during the read, rollback after
+  the accounting, eight against a **real SQLite database**, and eleven
+  end-to-end command-line tests.
+
+**`MemoriesRetrieved`**
+
+- Published after a recorded retrieval commits, carrying what was selected, how
+  many were considered and what it cost. `GetMemoryContext` publishes nothing:
+  an inspection is not a retrieval, and one that announced itself would make the
+  events disagree with the counters.
+- **Nothing subscribes yet.** The consumer is known rather than guessed --
+  whatever eventually reports on retrieval quality reads this, and the
+  alternative is a component that polls the counters.
+
+## Changed
+
+- `ScriptedAiProvider.token_count` now delegates to the domain's
+  `estimate_tokens`, so the fake's accounting and the budget the selector
+  enforces cannot drift apart.
+- ADR-060 gained three further rejected alternatives -- random sampling,
+  asking a model which memories to use, and retrieving inside repository
+  queries -- and a stated bound on the token estimator's error.
+
+### Milestone 9c -- Proposal Review & Memory Creation
+
+Slice 9c: the lifecycle closes. `MemoryProposal` -> accept or reject ->
+`Memory`. Only accepted proposals become memories, and nothing bypasses review.
+
+**A memory is a different thing from a proposal**
+
+- Different aggregate, different table, different identifier. A proposal is what
+  a model said; a memory is what a person decided to believe, and every later
+  feature that asks "what do we know" reads a table nothing can write to without
+  a decision (ADR-059).
+- A memory takes a **new** identifier at acceptance. The two have different
+  lifetimes -- the proposal is a permanent record of an extraction, the memory
+  can be forgotten -- and one identifier for both would confuse them everywhere.
+
+**Identity belongs to the application**
+
+- `MemoryKey` is a deterministic normalisation of the value: case folded,
+  punctuation dropped, whitespace collapsed, truncated. "Lives in Lisbon." and
+  "lives  in lisbon" are one fact.
+- **The model never supplies it.** A key is an identity, and a model that could
+  name one could collide with an existing memory -- silently preventing a true
+  fact from being stored, or claiming the identity of one already there.
+- **It deduplicates; it does not detect contradictions.** "Lives in Lisbon" and
+  "Lives in Porto" are different keys, so both are stored. That is deliberate,
+  it is the price of not letting a model name the subject of a fact, and it is
+  the largest gap this milestone leaves.
+
+**A decision is made once**
+
+- Two independent enforcements: the entity refuses `decided()` on anything but a
+  pending proposal, and the repository's one update names `pending` in its
+  `WHERE` clause -- so a check-then-write cannot be overtaken, and two decisions
+  racing cannot both win.
+- **No undo and no reopen.** Reversing an acceptance would have to decide what
+  becomes of a memory that has since been read and acted on; reopening a
+  rejection would mean a fact a person declined could appear anyway. Both are
+  already recoverable by ordinary means.
+- Accepting twice is refused **with the identifier of the memory it produced** --
+  somebody accepting twice has usually forgotten they did it once.
+
+**Acceptance creates exactly one memory, in one transaction**
+
+- The decision and its consequence are the same event. A committed acceptance
+  with no memory would be a fact the user believes they kept and cannot find.
+- "Exactly one" is a **unique index on `memories.proposal_id`**, not a rule the
+  use case keeps.
+
+**Memories are immutable, and forgettable**
+
+- No edit method and no `update` on the repository. Correcting a memory means
+  forgetting it and accepting a fresh proposal, because an edit in place would
+  keep the provenance while changing the fact.
+- Deletion is soft -- a timestamp, not a flag, because retention has to ask
+  "deleted before when" -- and it **frees the key**, so the same fact can be
+  accepted again.
+- Provenance is `SET NULL`, not `CASCADE`: `ai_calls` and `memory_proposals`
+  both cascade from `chats`, so without it deleting a chat would silently erase
+  approved knowledge. What is lost is the trail, not the fact.
+
+**Commands**
+
+- `tgassist memory accept` / `reject` / `list` / `show` / `forget`.
+
+**Tests -- 165 added, suite at 3033**
+
+- 74 contract obligations over both repository implementations, weighted towards
+  the three unique indexes, soft deletion and the contact purge.
+- 14 more over the proposal repository's one mutation, including that a second
+  decision changes nothing.
+- 77 behaviour tests: accept, reject, duplicate acceptance, duplicate rejection,
+  accepting a rejected proposal, rejecting an accepted one, rollback before
+  commit, rollback after the memory was written, duplicate key, cascade
+  behaviour, eleven against a **real SQLite database**, and thirteen end-to-end
+  command-line tests.
+
+## Fixed
+
+- **A memory could survive a chat deletion as a row and not as an object.** The
+  schema nulls a memory's provenance when the chat it came from is deleted --
+  deliberately, so approved knowledge is not erased -- but the entity required
+  an AI-derived memory to name its proposal and call, so the surviving row could
+  not be reconstituted. Found by the cascade test. The invariant is now
+  **all-or-nothing**: provenance is complete or absent, never partial, which
+  permits the loss the schema intends and still refuses the half-state nothing
+  can produce.
+
+## Changed
+
+- **`tgassist memory show` now shows a *memory*.** The command that shows a
+  proposal is `tgassist memory proposal`. Slice 9b had `show` for proposals, and
+  one name for two different things is a name that will be typed wrongly.
+- `tgassist memory forget` is **beyond the five commands the slice specified**,
+  and is included because `CLAUDE.md` and `PRIVACY.md` §6 both require that a
+  user can delete what the application remembers -- and this is the first slice
+  in which there is anything to delete.
+
+### Milestone 9b -- Memory Proposal Extraction
+
+Slice 9b: the first complete AI feature. Conversation -> prompt ->
+`ExecuteAiTask` -> structured output -> `MemoryProposal` -> review queue.
+
+**Nothing is remembered**
+
+- Every extracted fact becomes a `MemoryProposal` with status `pending`. There
+  is no code path in this slice that changes a status: the repository has no
+  `update` and no `delete`, and the aggregate has no method returning a changed
+  one, so *accepted* and *rejected* are terminal by being **unreachable**
+  (ADR-058).
+- The alternative -- writing memories and letting the user correct them -- fails
+  in a way that is hard to recover from. A wrong memory is *retrieved*, put into
+  later prompts and used to justify later suggestions, so an error propagates
+  into work the user never connected to the extraction that caused it.
+
+**The model supplies four fields, and only four**
+
+- `category`, `value`, `confidence`, `evidence`. Identifier, timestamp,
+  conversation, AI call, prompt version and status are assigned by the
+  application, and the output schema sets `additionalProperties: false` -- so an
+  answer carrying an `id` or a `status` **fails validation** rather than being
+  partially trusted.
+
+**Prompts are versioned assets, not strings**
+
+- `system.md` and `memory/extract.md` live in `src/tgassist/prompts/`, **inside
+  the package**: a prompt outside the wheel is a prompt an installed application
+  does not have. Discovery is by `_registry.yaml`, never by globbing.
+- The **version lives only in the prompt's front matter**. `PROMPTS.md` §3 put
+  it in two places, and two places recording a version is one too many for them
+  to agree.
+- Everything is validated at startup: the file, its front matter, its id, and --
+  in both directions -- that its declared inputs match the placeholders its body
+  uses. A prompt found broken while a user waits is the same defect found at the
+  worst moment.
+- **Untrusted content is delimited by the prompt model, not by the template.** A
+  template that had to remember the markers is one that can forget them. Any run
+  of three or more angle brackets in untrusted text is collapsed to two, so no
+  message can forge a boundary. Previously-stored proposal values are treated as
+  untrusted too -- they are model output derived from conversation content that
+  nobody has reviewed.
+
+**Structured output is validated before anything interprets it**
+
+- Shape only: required fields, types, enumerations, ranges, lengths. No business
+  rules, so the same validator serves later features without acquiring an
+  argument for each.
+- **A deliberately small JSON Schema subset, and any schema using more is
+  refused when it loads.** That check is what makes a hand-written validator
+  safe: an unimplemented keyword is a startup failure rather than a constraint
+  that silently passes. No new dependency.
+- **Exactly one repair attempt.** The model gets its own answer back with the
+  violations named, and is forbidden from changing the content -- a repair that
+  added facts would be a second, unreviewed extraction.
+
+**Three deterministic filters, and the first is the important one**
+
+- **Ungrounded evidence.** The quotation must appear in the conversation the
+  model was shown. The cheapest anti-hallucination check there is, and the one
+  that catches a fluent, plausible fact nobody ever said.
+- **Low confidence**, below `memory.min_confidence`.
+- **Already proposed**, against stored proposals *including rejected ones*, and
+  against the batch itself.
+- Every discard is **counted**. A run that returned nothing and a run that
+  discarded eight invented claims are very different events.
+
+**The model call sits inside no transaction**
+
+- Read in one, call the model in none, write in another. Holding the single
+  application-wide transaction across a call that takes seconds would stop
+  everything else in the process (ADR-034). The unique index on
+  `(account_id, conversation_id, category, value)` is the backstop, so the worst
+  case is a proposal that is not stored -- never one that is wrong.
+
+**Commands**
+
+- `tgassist memory extract <conversation>`, `memory proposals`, `memory show`.
+  No approve and no reject: this slice has nothing to approve *into*.
+
+**Tests -- 240 added, suite at 2868**
+
+- 71 over prompts and structured output, including the shipped prompt files:
+  that untrusted content cannot forge a delimiter, that a declaration and a
+  template cannot drift apart, and that every registry failure is reported at
+  load.
+- 84 contract obligations over both repository implementations, weighted towards
+  the two composite foreign keys and the one-fact-per-conversation index.
+- 85 behaviour tests: valid proposal, malformed JSON, repair succeeding, repair
+  failing, missing field, duplicate, low confidence, empty extraction, AI
+  refusal, provider timeout, rollback before commit, rollback after proposals
+  were written, deterministic replay, seven against a **real SQLite database**,
+  and seven end-to-end command-line tests.
+
+## Changed
+
+- `ScriptedAiProvider` gains `script_json()`, which serialises with sorted keys
+  so the same payload always produces the same text. Malformed answers are still
+  scripted as exact text: a helper that could only produce valid JSON could not
+  describe the failures worth testing.
+- `Container.start()` now loads and validates the prompt registry, **before**
+  opening the database. It is the cheapest check and the one whose failure is
+  entirely our own fault.
+
+### Milestone 9a -- AI Provider Boundary
+
+Slice 9a: the complete AI integration boundary. Not memory extraction -- this is
+the layer that makes every later AI capability deterministic, testable and
+provider-independent.
+
+**One port, one use case**
+
+- `AiProvider` has two members: `model` and `generate`. A capability is a
+  property of the *model*, not a class of client -- one endpoint answers a
+  completion, a classification and a structured extraction -- so there is no
+  `CompletionProvider`, `ChatProvider` or `EmbeddingProvider` (ADR-057 §1).
+- `ExecuteAiTask` is the only place a model is invoked. It resolves the account,
+  reads the chat's `ai_processing_mode`, applies the timeout, calls the provider
+  and records what happened. It **interprets nothing** -- no parsing, no schema,
+  no repair -- because every task's schema would otherwise land inside the one
+  component every task shares.
+- `AiModel` is a value object, not a stored `ai_providers` row. Its
+  `data_boundary` comes from the **vendor**, never from configuration: a
+  boundary a user could edit would put the privacy guarantee in a file.
+
+**The privacy gate, including its fourth row**
+
+| chat mode | local model | external model |
+| --- | --- | --- |
+| `disabled` | refused | refused |
+| `local_only` | allowed | refused |
+| `cloud_allowed` | allowed | allowed |
+| *no chat named* | allowed | **refused** |
+
+- Content that names no chat carries no permission, and in a local-first
+  application the absence of a permission is not a permission.
+- A refusal is **recorded** before the error is raised, and the error names the
+  record. An audit containing only the calls that were allowed cannot show that
+  a call was blocked.
+
+**`ai_calls` -- append-only, and a digest rather than an answer**
+
+- No `update` and no `delete` in the repository. The absence of both is the
+  guarantee, the same discipline `messages` has (ADR-046).
+- The prompt is never stored, under any setting. The response is stored as a
+  truncated SHA-256 digest -- which is what deterministic replay actually needs,
+  *did these two runs produce the same answer* -- and as text only when
+  `ai.store_responses` is on, which the production profile refuses. The same
+  arrangement `logging.diagnostic_mode` already has (ADR-057 §6).
+- Cost is `Decimal` in the domain and **TEXT** in the column. Money in fractions
+  of a cent summed over many rows is exactly where binary floating point drifts.
+- `PromptVersion` is required on every call from the first one. Without it the
+  first time an output changes there is no way to tell whether the model changed
+  or the prompt did, and that question is asked after the change.
+
+**Two implementations, neither of which opens a socket in tests**
+
+- `AnthropicProvider` over an injected `HttpTransport` (stdlib `urllib`; **no
+  new dependency**), so the real adapter's request body, headers, parsing,
+  stop-reason mapping and usage reading are all exercised without a network.
+- `ScriptedAiProvider` is **shipped source**, not a test fixture, and is the
+  default vendor. A fresh installation has a working AI boundary that costs
+  nothing, and the provider the tests exercise is the provider that ships. It is
+  deterministic by construction: queued answers and failures, latency as a
+  parameter, `len(text) // 4` tokens. Nothing in it samples randomness.
+
+**Commands**
+
+- `tgassist ai run <content>`, `ai show <id>`, `ai list`. `run` is the whole
+  boundary end to end; `show` prints metadata and never a prompt.
+
+**Tests -- 188 added, suite at 2628**
+
+- 50 contract obligations over **both** providers -- the scripted one and the
+  real Anthropic adapter -- covering text, finish reasons, usage, the answering
+  model, deterministic replay, normalised failures, recovery, request
+  validation, and what goes on the wire.
+- 54 contract obligations over both repository implementations, weighted towards
+  the composite foreign key, the append-only shape and exact cost round-tripping.
+- 84 behaviour tests: the value objects, success, every failure mode, timeout,
+  cancellation, the four rows of the gate, deterministic replay, reading
+  records, six against a **real SQLite database**, and eight end-to-end
+  command-line tests.
+
+## Fixed
+
+- **`ai_calls` could not survive a chat deletion.** The composite foreign key
+  `(account_id, chat_id) -> chats` was declared `ON DELETE SET NULL`, on the
+  reasoning that what a call cost is still true after the chat is gone. SQLite
+  nulls *every* column of a composite key, including the NOT NULL `account_id`,
+  so deleting a chat that had AI calls failed outright with an integrity error.
+  Found by the repository contract suite, which is the only place a chat is
+  deleted. It cascades now: a record derived from a deleted chat is residue of
+  that chat, which is why every other child of `chats` already cascades. The
+  consequence is deliberate -- deleting a chat removes its calls from the spend
+  history.
+
+### Milestone 3.0 -- Conversation Segmentation
+
+Slice 8: grouping stored messages into bounded episodes, deterministically and
+without a model of any kind.
+
+**The aggregate**
+
+- `Conversation` joins the domain model with `started_at`, `ended_at` and
+  `message_count`. It is the first aggregate here that is **derived** -- every
+  other one records something a person or Telegram decided -- which is why it
+  has no external identifier, why it can be recomputed at any time, and why it
+  is the only aggregate whose repository has a `delete`.
+- **`ended_at` is not nullable and there is no `is_open`.** Version 1.0 used the
+  first to express the second. A conversation derived from messages that already
+  exist always has a last one; and whether it may still grow depends on how long
+  ago it ended -- on *now* -- which no stored flag can keep true without a job to
+  correct it. `Conversation.is_open_at(now, gap)` asks it against an instant.
+
+**Membership is the time range**
+
+- A message belongs to the conversation whose `[started_at, ended_at]` contains
+  its `sent_at`. **Messages carry no `conversation_id` and there is no join
+  table** (ADR-056). Two reasons: `Message` is append-only and its repository has
+  no update path at all (ADR-046), so storing the link would reopen exactly what
+  that discipline closed; and conversations within a chat do not overlap, so the
+  range already *is* the membership.
+- It also keeps a rebuild cheap. Fifty thousand messages produce a few hundred
+  conversation rows, and only those are written.
+- Non-overlap is a unique `(account_id, chat_id, started_at)`, which replaces
+  version 1.0's partial unique index on `is_open` and enforces something
+  stronger.
+
+**The rule, and why it is replayable**
+
+- An inactivity gap (`conversation.gap_minutes`, default 360) plus a message cap
+  (`conversation.max_messages`, default 200) -- the documented rule, unchanged.
+- It is a pure function in `domain/services/segmentation.py`: no clock, no
+  configuration lookup, no AI. It reads `sent_at` and a count, in the total order
+  `(sent_at, telegram_message_id, id)`. Every component of that key is immutable
+  once stored, which is what makes a boundary reproducible -- and the tiebreak is
+  deliberately *not* insertion order, because a backfill stores an older message
+  later.
+- Rejected: calendar day (cuts an evening exchange at midnight, and needs a
+  timezone Telegram does not report), sender changes (turns a back-and-forth into
+  dozens of conversations), reply chains (not stored, mostly absent, and a reply
+  to a month-old message would splice two episodes).
+
+**Identity is matched, not generated**
+
+- A recomputed segment claims **the stored conversation owning the plurality of
+  its messages**; a stored conversation may be claimed by at most one segment,
+  the earliest, with ties to the lowest identifier. Both tie-breaks exist to make
+  the result a function of the arguments alone.
+- Four lines, and it gets the four interesting cases right: **extension** (the
+  last conversation grows and keeps its identity), **a new episode** (created;
+  earlier ones untouched), **merge** (the larger contributor survives), **split**
+  (the earlier half keeps the identity, because a conversation can be claimed
+  only once).
+- Without it a rebuild would replace every conversation with an
+  identical-looking new one, and Milestone 8's summaries and plans would point
+  at rows that no longer exist.
+
+**Incremental by window**
+
+- A boundary depends only on the gap to the message before it, so a new message
+  can change nothing earlier than the conversation it follows. A pass
+  re-segments from that conversation's *start* -- not from the new message, which
+  would see nothing before it, call it a boundary, and split an episode at
+  whatever instant the caller named.
+
+**Commands**
+
+- `tgassist conversation rebuild <chat>`, `conversation list <chat>`,
+  `conversation show <id>`. None of them reaches Telegram: `rebuild` recomputes,
+  it does not fetch.
+
+**Tests -- 136 added, suite at 2440**
+
+- 80 covering the rule (including that the order messages arrive in does not
+  matter), the entity's invariants, first pass, idempotency, live extension and
+  creation, late history, merge, split, resumed backfill, membership, three
+  injected failures, seven against a **real SQLite database**, and 11
+  end-to-end command-line tests running the goal's scenario.
+- 56 contract obligations over both repository implementations, weighted towards
+  the composite foreign key and the unique start.
+
+## Fixed
+
+- **`IngestMessages.execute` never announced what it stored.** Slice 7 gave the
+  backfill and live synchronisation an event to publish and left the third
+  ingestion path -- the one the CLI and any import tool uses -- silent. Nothing
+  noticed until segmentation subscribed, because until now nothing listened. The
+  rule that removes the asymmetry is stated where both live: **whoever commits,
+  announces.** `execute` owns its transaction and publishes; `ingest_within`
+  leaves the commit to its caller and does not.
+
+## Changed
+
+- `MessagesIngested` gains `oldest_sent_at`. `newest_sent_at` cannot say how far
+  back a batch reached -- a backfill page of a hundred messages from last year
+  has a newest that is also last year -- and how far back it reached is exactly
+  what decides which conversations a re-segmentation must revisit.
+- `MessageRepository` gains `list_since`: one chat's messages from an instant
+  onwards, **oldest first**. Served by the index the history listing already
+  needed, so segmentation added none of its own. Still no `update` and no
+  `delete`.
+
+## Architecture Decisions
+
+- **ADR-056** -- a conversation is a time range with a matched identity, and
+  membership is not stored. Covers identity, the rule, incremental
+  re-segmentation, boundary stability and stored-versus-derived state.
+  Supersedes `DOMAIN_MODEL.md` §5.7's `is_open` and `DATABASE.md`'s partial
+  unique index on it.
+
+## Scope note
+
+Sixteen source and test files were created or modified, plus one migration and
+one configuration file -- within the twenty-file limit.
+
+### Milestone 2.9 -- Live Update Dispatch
+
+Slice 7 of `TELEGRAM_ARCHITECTURE.md`: consuming TDLib's update stream, so the
+application stays current once its history is stored.
+
+**The stream**
+
+- `TelegramGateway.updates()` yields `TelegramUpdate` values in arrival order.
+  It is **not** a second consumer of `TdjsonClient.receive()` -- the gateway
+  already owns the only one (ADR-051), and a second would split the stream
+  rather than duplicate it. The dispatch loop maps `updateNewMessage` into a
+  `NewMessage` and offers it to a bounded queue that `updates()` drains.
+- **One consumer at a time**, refused rather than left to be discovered as
+  missing messages: the queue holds one item per update, so two iterators would
+  take turns.
+- **Backpressure, not loss.** A full queue stops the dispatch loop, which stops
+  draining the client queue, which stops the receive thread, which leaves TDLib
+  holding the backlog. Nothing is dropped anywhere along that chain.
+- **Unknown update kinds are counted and dropped.** So is an `updateNewMessage`
+  this version cannot map. A TDLib release that adds a kind must not be able to
+  stop the loop, because a stopped loop leaves every waiter hanging on a state
+  that can no longer change.
+
+**Why the ordering cannot lose an update**
+
+- The queue starts filling at `connect()` -- before chat synchronisation, before
+  the backfill, before anything consumes it. The gap between finishing one phase
+  and starting the next therefore contains nothing.
+- What a queue cannot cover is a process that was not running. So a live run
+  **catches up first**, paging forward from `newest_synced_message_id` until it
+  meets the stored range. Backfill could never do this: it walks *downwards*
+  from the oldest stored message and never looks above the top. This is the
+  reader Milestone 2.8 recorded that field for (ADR-054, ADR-055).
+
+**One ingestion path, processed serially**
+
+- Backfill, catch-up and live updates all go through `IngestMessages`. A
+  duplicate update is recognised by the partial unique index and costs nothing
+  (ADR-045).
+- Updates are processed **one at a time, one transaction each**. ADR-034 permits
+  one transaction at a time for the whole application, so per-chat or pooled
+  concurrency would contend for the same connection and buy nothing but a
+  nondeterministic order to reason about.
+- One update failing rolls back that update and nothing else; the drain
+  continues, and the reason is kept in the report.
+
+**Lifecycle**
+
+- `BackgroundTaskSupervisor` (infrastructure) restarts a task that fails
+  recoverably, with growing backoff, and gives up after
+  `telegram.live_max_restarts`. It does **not** restart a task that returned
+  normally -- a consumer that reached the end of its stream has finished -- and
+  does not fight cancellation, which is how shutdown is expressed.
+- `Container.run_live_sync` sequences shutdown: cancel the consumer, let its
+  in-flight transaction roll back through the unit of work's own exit path, then
+  let the caller close the gateway and the database. It lives at the composition
+  root because joining an infrastructure supervisor to an application use case is
+  what a composition root is for.
+
+**Events**
+
+- `MessagesIngested` is published, at last -- once per committed batch, by all
+  three producers, and **after** the commit rather than inside it. It carries a
+  `source` field (`backfill`, `catch_up`, `live`) that ADR-050 did not name: a
+  subscriber that treated fifty thousand back-filled rows like one arriving
+  message would do fifty thousand times the work it meant to.
+
+**Commands**
+
+- `tgassist sync live` follows Telegram until Ctrl+C.
+- `tgassist sync status` reports what is stored -- per chat, its state and the
+  span of its stored range. It opens no connection, so it says what the last run
+  achieved rather than what is true in Telegram now.
+
+**Tests -- 83 added, suite at 2304**
+
+- 68 in `test_live.py`, covering ordered delivery, duplicate updates,
+  interleaved chats, unknown update kinds, event publication, a handler that
+  raises, failure isolation, the catch-up in seven shapes, graceful shutdown,
+  supervised restart, unrecoverable failure, the supervisor's own policy, and
+  **11 end-to-end command-line tests** running the goal's scenario: follow,
+  interrupt, restart, and no duplicates.
+- 15 contract obligations over both gateway implementations, including that the
+  same updates arrive identically through the fake and through real TDLib.
+
+## Fixed
+
+- **A supervised task looked finished before it had started.** `create_task`
+  only schedules, and `TaskStatus.running` was set inside the task -- so a
+  caller polling `is_running` before the loop next ran saw `False` and concluded
+  the work had ended. `tgassist sync live` consequently stopped immediately and
+  reported nothing. The status is now marked running synchronously, in `start`.
+- **`SyncHistory` gained an argument and the harness did not**, which was caught
+  by thirty-six existing tests rather than at review. Recorded because the
+  lesson is the reverse of a complaint: a constructor that takes one collaborator
+  per dependency makes an omission a compile-time-shaped failure.
+
+## Changed
+
+- `SyncHistory` now publishes `MessagesIngested` per committed batch. Its
+  translation helpers `incoming_from` and `sender_kind_of` are public, so live
+  synchronisation performs the *same* translation -- a message read live and the
+  same message read from history cannot disagree about whose side it is on.
+
+## Architecture Decisions
+
+- **ADR-055** -- live updates are dispatched by the one receive loop, buffered
+  from connect, and consumed serially. Covers dispatcher ownership, start-up
+  ordering, parallelism, the unknown-update policy and shutdown semantics.
+- **ADR-050** is closed out. Decision 3 (`MessagesIngested`) is implemented.
+  Decision 4's ingestion serialiser is **satisfied without a queue**: the two
+  producers never run concurrently, so a single consumer task already serialises
+  every write. The decision stands; the machinery it anticipated was not needed.
+
+## Scope note
+
+Fourteen source and test files were created or modified, plus one configuration
+file -- within the twenty-file limit. No migration: live synchronisation writes
+the same rows the backfill does.
+
+### Milestone 2.8 -- Resumable Message Backfill
+
+Slice 6 of `TELEGRAM_ARCHITECTURE.md`: reading a chat's history backwards and
+storing it, one bounded batch at a time, resuming exactly where the last run
+stopped.
+
+**The bookmark**
+
+- `SyncCursor` joins the domain model, keyed by its **chat** rather than by a
+  surrogate: exactly one cursor per chat, so the invariant is the key (ADR-054,
+  applying ADR-038's reasoning). `account_id` rides along so the foreign key can
+  be composite, which is what makes a cursor for one account's chat
+  unattachable to another's.
+- It stores a **Telegram message identifier**, not a timestamp. Telegram pages
+  history by identifier; identifiers are unique and totally ordered within a
+  chat, and timestamps are neither, so a timestamp cursor either re-reads or
+  skips at every page boundary.
+- Both ends of the range or neither, enforced by the entity *and* a check
+  constraint. A floor with no ceiling describes a range whose extent nobody can
+  state.
+- `backfill_complete` is read together with `backfill_horizon`: "complete" means
+  complete *for that horizon*, so raising the configured depth reopens the
+  cursor and continues from the same floor instead of reporting success.
+
+**The five guarantees, and where each one lives**
+
+- **Resumability** is the cursor. Nothing else -- no reconciliation pass, no
+  repair logic.
+- **Crash safety** is the transaction boundary. Messages and cursor are written
+  in *one* unit of work, so a process that dies mid-batch leaves neither. The
+  test that proves it throws an exception one statement before the commit and
+  asserts that no message was persisted and the bookmark did not move.
+- **Idempotency** is the partial unique index (ADR-045) plus the lookup
+  ingestion already performed. A `--reset` re-reads all 25 messages and stores
+  none of them.
+- **Bounded transactions** are `telegram.backfill_batch_size`, default 100.
+- **Deterministic progress** is a property rather than a hope: every batch moves
+  the bookmark down or ends the run, and a batch that leaves it where it was
+  stops with `no_progress`.
+
+**What ends a run**
+
+The first of: an empty page (the beginning of the chat), a page older than
+`telegram.backfill_horizon_days` (default 365), the caller's `--max-batches`, or
+an error. The per-chat cap in `PROJECT_SPEC.md` §4.1 is **not** implemented: it
+needs a count of stored messages per chat, which needs a repository method and an
+index that should be chosen by the query using it.
+
+**Commands**
+
+- `tgassist sync history [CHAT]`, with `--resume`, `--reset` and `--max-batches`.
+  Omitting the chat backfills every chat with synchronisation switched on, paging
+  the chat list to exhaustion rather than taking the first page -- a silent cap
+  there would look exactly like an account with fewer chats.
+- `--resume` is the default behaviour stated explicitly, and it is **refused
+  alongside `--reset`**: the two ask for opposite things, and a flag that
+  silently lost to another would be worse than no flag.
+
+**Tests -- 111 added, suite at 2221**
+
+- 64 covering the cursor's own rules, empty and single and multi-page histories,
+  interruption by batch limit and by an exception, resume, `--reset`, duplicate
+  identifiers, the horizon in both directions, sender attribution, and the
+  refusals.
+- 36 contract tests over both repository implementations, weighted towards the
+  composite foreign key.
+- 9 end-to-end command-line tests running the goal's own scenario: back-fill,
+  interrupt, `--resume`, and no duplicates. Two more went to the ingestion
+  pipeline, where the duplicate-within-a-batch defect belonged.
+- The whole backfill runs against **real TDLib** as well as the fake, and the two
+  are asserted to store the same messages, take the same batches and resume the
+  same way.
+
+## Fixed
+
+- **`IngestMessages` raised on a batch naming the same message twice.** Nothing
+  is written until the batch is built, so the repository could not answer for an
+  identifier the batch itself had already claimed; the second copy met the unique
+  index. An error raised over exactly the case the pipeline promises to absorb.
+  Identifiers are now tracked as the batch is assembled, so a repeat *within* a
+  batch is skipped like a repeat across runs.
+- **`SyncHistory` read a chat before checking the gateway owned it.** A call
+  wired to the wrong account learned whether that account had a given chat, from
+  the error message, before being refused. The ownership check now runs
+  immediately after the account resolves and before any of its data is read --
+  the ordering slice 5 already asserted for chat and contact synchronisation.
+
+## Architecture Decisions
+
+- **ADR-054** -- the cursor's identity, value and terminating conditions: keyed
+  by chat, storing a message identifier, recording the horizon it reached, and
+  which of `DOMAIN_MODEL.md` §5.22's fields are deferred and why.
+- **ADR-050** gains an *As Implemented* section. Its decisions 1, 2, 5 and 6
+  held exactly; decision 3 (`MessagesIngested`) is unimplemented because nothing
+  subscribes, and decision 4 (the ingestion serialiser) because there is still
+  only one producer. Both are recorded rather than quietly skipped.
+
+## Scope note
+
+Fourteen source and test files were created or modified, plus one migration and
+one configuration file -- within the twenty-file limit. `IngestMessages` gained
+one method, `ingest_within`, so that a backfill batch and the cursor accounting
+for it can share a transaction; its existing behaviour is unchanged.
+
 ### Milestone 2.7 -- Chat and Contact Synchronisation
 
 Slice 5 of `TELEGRAM_ARCHITECTURE.md`: the first code that reads Telegram and

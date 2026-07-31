@@ -83,6 +83,115 @@ logging:
     alembic: WARNING
     sqlalchemy.engine: WARNING
 
+# Which model runs AI tasks, and what is recorded about them. Nothing here
+# reaches a network until "vendor" names a real provider: the default is a
+# deterministic fake, so a fresh installation has a working AI boundary that
+# costs nothing.
+ai:
+  # anthropic | fake
+  vendor: fake
+
+  # The model identifier, as the vendor spells it.
+  model: fake-local-1
+
+  # A NAME in the credential store, never the key itself. Set the value with:
+  #   keyring set tgassist ANTHROPIC_API_KEY
+  api_key_ref: ANTHROPIC_API_KEY
+
+  # Where to send requests. Null uses the vendor's own endpoint.
+  endpoint: null
+
+  # What a million tokens cost, for the estimate recorded on each call. Null
+  # records no cost, which is honest: zero would claim the call was free.
+  input_cost_per_million: null
+  output_cost_per_million: null
+  cost_currency: USD
+
+  # How long to wait for a model, and a ceiling on any one answer.
+  timeout_seconds: 60.0
+  max_output_tokens: 4096
+
+  # Store the text of each response beside its digest. OFF, and rejected in the
+  # production profile: a response carries conversation content once a real
+  # task runs. The digest is always stored, which is what replay needs.
+  store_responses: false
+
+# What divides one conversation from the next. Both are deterministic rules
+# over stored messages -- no AI is involved, and changing either changes
+# boundaries the next time "tgassist conversation rebuild" runs.
+conversation:
+  # Silence longer than this begins a new conversation, in minutes.
+  gap_minutes: 360
+
+  # A conversation holds at most this many messages. A bound on downstream
+  # context, not a claim about meaning.
+  max_messages: 200
+
+  # Re-segment a chat whenever messages are stored for it. Turn off for a bulk
+  # import and run "tgassist conversation rebuild" once at the end.
+  segment_on_ingest: true
+
+memory:
+  # What this application does with the facts a model proposes. Every value
+  # here is a judgement, not a rule: none of them makes a proposal invalid,
+  # only unworthy of your attention. Nothing configured here can cause a
+  # proposal to become a memory -- that needs a person (ADR-058).
+
+  # Below this, a proposal is discarded rather than queued. Self-reported model
+  # confidence is poorly calibrated, so this is a coarse filter. Raising it
+  # shortens the queue and loses true facts the model was unsure of.
+  min_confidence: 0.6
+
+  # The most one extraction run may store. A review queue is only useful while
+  # it is short enough to read.
+  max_proposals_per_conversation: 10
+
+  # How many of a conversation's messages to show the model, counting from the
+  # end. A bound on the request, and therefore on its cost.
+  context_message_limit: 100
+
+  # How much of any one message to show. Bounds the payload space available to
+  # a prompt injection attempt.
+  max_message_chars: 2000
+
+  # Retrieval: what gets told to a model about somebody.
+
+  # The most a memory context may cost, estimated at four characters to a
+  # token. Spent in ranking order; what does not fit is left out and reported,
+  # never shortened.
+  context_token_budget: 800
+
+  # The most memories one context may contain, however small. Forty true facts
+  # are worse than eight -- the eight that matter get diluted.
+  context_max_memories: 20
+
+  # How many of a contact's memories to consider before ranking. A bound on the
+  # cost of building a context, not on its content.
+  max_candidates: 500
+
+suggestion:
+  # What bounds a prompt asking for a reply. Budgets only: the order things
+  # appear in, and the order they are removed in when the budget bites, are
+  # domain rules with stated reasons rather than preferences.
+
+  # The most the assembled memories and conversation may cost, estimated at
+  # four characters to a token. Excludes the system prompt and the task, which
+  # are never trimmed. When it bites, the oldest messages go first and then the
+  # lowest-ranked memories.
+  prompt_token_budget: 2000
+
+  # How many recent messages to consider.
+  recent_message_limit: 20
+
+  # How much of any one message to show. Bounds the payload space available to
+  # a prompt injection attempt. A message cut here is marked, so the model can
+  # tell it was cut.
+  max_message_chars: 2000
+
+  # How many messages survive whatever the budget says. One: the thing being
+  # replied to.
+  minimum_messages: 1
+
 telegram:
   # Path to the tdjson shared library. Null searches the documented locations:
   # <data_dir>/tdlib/, then the platform library loader. A named file is still
@@ -112,6 +221,27 @@ telegram:
   # What this client calls itself in Telegram's active-sessions list. The user
   # sees it when deciding whether to revoke a session.
   device_model: Desktop
+
+  # Messages per history fetch and per transaction. The whole application has
+  # one transaction at a time, so this is also how long everything else waits
+  # while a backfill writes. 100 matches TDLib's practical page size.
+  backfill_batch_size: 100
+
+  # How far back "tgassist sync history" reaches, in days. 0 means no limit.
+  # Lowering it deletes nothing; raising it reopens a completed backfill.
+  backfill_horizon_days: 365
+
+  # How many history pages "tgassist sync live" reads forward, per chat, to
+  # recover what arrived while nothing was running.
+  catch_up_pages: 20
+
+  # How many recoverable failures "tgassist sync live" rides out before giving
+  # up. 0 means the first failure ends the run.
+  live_max_restarts: 5
+
+  # How many Telegram updates to hold before backpressure reaches TDLib. A full
+  # queue slows the receive loop; nothing is dropped.
+  update_queue_size: 1000
 
   # Which kinds of chat "tgassist sync chats" switches synchronisation on for
   # when it first discovers them. Every kind is recorded either way, so nothing

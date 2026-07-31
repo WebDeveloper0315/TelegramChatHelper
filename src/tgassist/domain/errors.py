@@ -397,3 +397,134 @@ class EventDispatchError(AppError):
     """
 
     code = "EVENT_DISPATCH_ERROR"
+
+
+class AiError(AppError):
+    """The AI boundary could not do what was asked.
+
+    The base every provider adapter normalises to. A caller catches these and
+    never a transport exception, which is what stops the choice of HTTP library
+    from reaching the application layer (ADR-057).
+    """
+
+    code = "AI_ERROR"
+
+
+class AiNotConfiguredError(AiError):
+    """No usable model is configured.
+
+    Distinct from a provider failing: nothing was attempted, because there was
+    nothing to attempt it with. Every AI feature is expected to degrade rather
+    than break when this is raised (``PROJECT_SPEC.md`` section 4.2).
+    """
+
+    code = "AI_NOT_CONFIGURED"
+
+
+class AiForbiddenError(AiError):
+    """The privacy gate refused this call.
+
+    Raised when a chat's ``ai_processing_mode`` does not permit the model that
+    would answer -- an external model for a ``local_only`` chat, or any model at
+    all for a ``disabled`` one (ADR-024). Not a failure of the provider: the
+    request was never made, and that is the point.
+    """
+
+    code = "AI_FORBIDDEN"
+
+
+class AiTimeoutError(AiError):
+    """The model did not answer in time.
+
+    Recorded as a call that happened, because it did: a request that timed out
+    after generation had begun was still billed for.
+    """
+
+    code = "AI_TIMEOUT"
+
+
+class AiRateLimitedError(AiError):
+    """The provider refused for rate reasons.
+
+    Distinct from :class:`AiProviderError` because it is the one failure worth
+    retrying *later* rather than differently. Nothing retries yet; the
+    distinction is recorded so that whatever does can tell them apart.
+    """
+
+    code = "AI_RATE_LIMITED"
+
+
+class AiProviderError(AiError):
+    """The provider refused for a reason of its own.
+
+    The request reached the provider, was understood, and was declined. The
+    provider's own status and message travel in the context, because a caller
+    that cannot see them cannot react to them -- and neither ever carries the
+    request or the response.
+    """
+
+    code = "AI_PROVIDER_ERROR"
+
+
+class AiResponseError(AiError):
+    """The provider answered with something this application cannot read.
+
+    A malformed body, a missing field, a shape a version change introduced.
+    Distinct from :class:`AiProviderError` because the remedy differs: one is
+    the provider saying no, the other is this application not understanding yes.
+    """
+
+    code = "AI_RESPONSE_ERROR"
+
+
+class PromptError(AppError):
+    """Base for failures of the prompt registry.
+
+    Separate from :class:`AiError` on purpose. An AI error is something a model
+    or a provider did; a prompt error is something *this application* shipped
+    wrong, and the two want different reactions -- one is retried or degraded
+    around, the other is a defect that should stop startup.
+    """
+
+    code = "PROMPT_ERROR"
+
+
+class PromptRegistryInvalidError(PromptError):
+    """The prompt registry does not describe a usable set of prompts.
+
+    A missing file, a version that is not declared, a template whose variables
+    disagree with its declaration, a schema that uses a keyword the validator
+    does not implement. Raised **at startup** rather than at generation time,
+    because a prompt discovered to be broken while a user is waiting for a
+    suggestion is the same defect discovered at the worst moment (ADR-026
+    section 7).
+    """
+
+    code = "PROMPT_REGISTRY_INVALID"
+
+
+class PromptNotFoundError(PromptError):
+    """Something asked for a prompt the registry does not have.
+
+    Distinct from an invalid registry: the registry is fine, the caller named
+    a prompt that is not in it.
+    """
+
+    code = "PROMPT_NOT_FOUND"
+
+
+class SchemaViolationError(AiError):
+    """A model's answer did not satisfy the schema its prompt is bound to.
+
+    Raised after the one repair attempt has also failed (ADR-020 section 4).
+    An :class:`AiError` rather than a :class:`PromptError` because the *call*
+    is what went wrong -- the prompt asked correctly and the model answered
+    badly -- and because every AI feature is expected to degrade around it
+    rather than break.
+
+    The violations travel in the context. The payload does not: it is model
+    output about a conversation, which is conversation content
+    (``SECURITY.md`` section 9).
+    """
+
+    code = "AI_SCHEMA_VIOLATION"

@@ -113,7 +113,8 @@ validation, unknown-key rejection, origin tracking, immutability and masking.
 **Sections are added by the milestone that implements their subsystem.** Unknown
 keys are rejected, so adding `database:` or `ai:` before Milestone 1 or 3 stops
 startup rather than being ignored. Implemented today: `app`, `database`, `logging`,
-`security`, and the native-library keys of `telegram`. The remaining sections in §6 are the specification those milestones
+`security`, `sync`, `conversation`, `ai`, `memory`, `suggestion`, and the
+native-library keys of `telegram`. The remaining sections in §6 are the specification those milestones
 implement against.
 
 ---
@@ -142,6 +143,18 @@ Complete key reference. Types, defaults and descriptions.
 | `database.encryption_enabled` | bool | `false` | Phase 2 only (ADR-022) |
 | `database.archive_dir` | path | `{data_dir}/archives` | Archive files |
 
+## 6.2a `conversation`
+
+**Implemented** as of Milestone 3.0. Deterministic rules over stored messages;
+no AI is involved, and changing either boundary rule changes boundaries the next
+time `tgassist conversation rebuild` runs (ADR-056).
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `conversation.gap_minutes` | int | `360` | Silence longer than this begins a new conversation. Six hours: long enough that an evening exchange with a break for dinner stays one conversation, short enough that yesterday's is a different one |
+| `conversation.max_messages` | int | `200` | A conversation holds at most this many messages. Not a claim about meaning — an exchange does not stop being one exchange at message 201 — but a bound without which every downstream token budget is unbounded too |
+| `conversation.segment_on_ingest` | bool | `true` | Re-segment a chat whenever messages are stored for it. Off leaves conversations to `tgassist conversation rebuild`, which is what a bulk import wants: segmenting after every batch of a 50 000-message backfill is correct but redundant |
+
 ## 6.3 `telegram`
 
 **Implemented** as of Milestone 2.1 — the native library only:
@@ -155,6 +168,11 @@ Complete key reference. Types, defaults and descriptions.
 | `telegram.api_id` | int \| null | `null` | Application id from https://my.telegram.org. Required before `tgassist login` runs; there is no default because there is nothing to derive one from |
 | `telegram.api_hash_ref` | str | `TELEGRAM_API_HASH` | **Name** of the application hash in the credential store, never the value (ADR-021) |
 | `telegram.device_model` | str | `Desktop` | What this client calls itself in Telegram's active-sessions list, where the user sees it when deciding whether to revoke a session |
+| `telegram.backfill_batch_size` | int | `100` | Messages per history fetch and per transaction. Aligned with TDLib's practical page size, so a batch is one round trip rather than a fraction of one. The whole application has one transaction at a time (ADR-034), so this is also how long everything else waits while a backfill writes |
+| `telegram.backfill_horizon_days` | int | `365` | How far back `tgassist sync history` reaches. `0` means no limit, which is possible but never the default (`PROJECT_SPEC.md` §4.1). Lowering it deletes nothing; raising it reopens a completed backfill (ADR-054) |
+| `telegram.catch_up_pages` | int | `20` | How many history pages `tgassist sync live` reads forward, per chat, to recover what arrived while nothing was running. A chat that received more than this while the process was down is better served by re-running the backfill (ADR-055) |
+| `telegram.live_max_restarts` | int | `5` | How many recoverable failures `tgassist sync live` rides out before giving up and reporting the last one. `0` means the first failure ends the run |
+| `telegram.update_queue_size` | int | `1000` | How many Telegram updates to hold before backpressure reaches TDLib. A full queue stops the dispatch loop, which stops the receive thread, which leaves TDLib holding the backlog — nothing is dropped along that chain |
 | `telegram.sync_chat_types` | list of `private` \| `group` \| `supergroup` \| `channel` \| `saved` | `[private]` | Which kinds of chat `tgassist sync chats` switches synchronisation on for **when it first discovers them**. Every kind is recorded either way, so nothing is hidden; this decides only the initial `sync_enabled`, and a chat the user switches off stays off (ADR-053) |
 
 The library is searched for in this order, and **the first candidate that
@@ -211,6 +229,26 @@ Bounded synchronisation scope — the data-minimisation control (`PRIVACY.md` §
 | `sync.media_total_budget_gb` | float | `5.0` | Total attachment storage cap |
 
 ## 6.5 `ai`
+
+**Implemented today (ADR-057).** One model at a time, named directly. There is
+no `ai.providers.<name>` map yet: a routing table with one row has never been
+exercised, and it is added by the milestone that has two providers to choose
+between.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `ai.vendor` | enum | `fake` | `anthropic` or `fake`. The default is the shipped deterministic provider, so a fresh installation has a working AI boundary that reaches no network and costs nothing. |
+| `ai.model` | string | `fake-local-1` | The model identifier as the vendor spells it. Recorded verbatim on every call. |
+| `ai.api_key_ref` | string | `ANTHROPIC_API_KEY` | A **name** in the credential store, never a key value (ADR-021). Unused by `fake`. |
+| `ai.endpoint` | string? | `null` | Where to send requests. Null uses the vendor's own. For a proxy or a compatible host -- not for a different vendor, which needs its own adapter. |
+| `ai.input_cost_per_million` | decimal? | `null` | What a million input tokens cost. Null records **no cost**, which is honest; zero would claim the call was free. |
+| `ai.output_cost_per_million` | decimal? | `null` | The same for output tokens. |
+| `ai.cost_currency` | string | `USD` | ISO 4217, three letters. |
+| `ai.timeout_seconds` | float | `60.0` | How long to wait for a model. Applied by the caller, not trusted to the adapter. |
+| `ai.max_output_tokens` | int | `4096` | A ceiling on any one answer, so a runaway generation is bounded. |
+| `ai.store_responses` | bool | `false` | Store each response's text beside its digest. **Rejected outright in the production profile** -- a response carries conversation content once a real task runs, and `SECURITY.md` §9 makes no exception for instrumentation. The digest is always stored, which is what deterministic replay needs. |
+
+**Planned** (the specification the later milestones implement against):
 
 | Key | Type | Default | Description |
 |---|---|---|---|
@@ -280,6 +318,55 @@ Per-task model assignment (`AI_MODELS.md` §5). Tasks: `analysis`, `reply`, `pla
 | `ai.memory.proposal_expiry_days` | int | `90` | Before marking expired |
 | `ai.memory.require_quote` | bool | `true` | Discard proposals without a supporting quotation |
 | `ai.memory.max_proposals_per_conversation` | int | `10` | Bound on extraction output |
+
+## 6.5a `memory`
+
+**Implemented today (ADR-058).** Every value here is a *policy*: a judgement a
+user may reasonably change, and none of which makes a proposal invalid — only
+unworthy of attention. The rules that decide whether a proposal is well formed
+live in the output schema and the entity, where configuration cannot reach
+them. **Nothing configured here can cause a proposal to become a memory.**
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `memory.min_confidence` | float | `0.6` | Below this, a proposal is discarded rather than queued. Self-reported model confidence is poorly calibrated (`AI_MODELS.md` §15), so this is a coarse filter. Raising it shortens the queue and loses true facts the model was unsure of |
+| `memory.max_proposals_per_conversation` | int | `10` | The most one extraction run may store. A review queue is only useful while it is short enough to read |
+| `memory.context_message_limit` | int | `100` | How many of a conversation's messages to show the model, counting from the end. A bound on the request, and therefore on its cost |
+| `memory.max_message_chars` | int | `2000` | How much of any one message to show. Bounds the payload space available to a prompt injection attempt (`SECURITY.md` §12) |
+| `memory.context_token_budget` | int | `800` | The most a retrieved context may cost, estimated at four characters to a token. Spent in ranking order; what does not fit is left out and **reported**, never shortened — a truncated fact is a different fact (ADR-060 §4) |
+| `memory.context_max_memories` | int | `20` | The most memories one context may hold, however small. Forty true facts are worse than eight: the model weighs them all and the eight that matter get diluted |
+| `memory.max_candidates` | int | `500` | How many of a contact's memories to consider before ranking. A bound on the cost of building a context. Reaching it means ranking did not see everything, which is reported rather than hidden |
+
+**Not configurable, deliberately:** the ranking order and the category
+priorities. They are a domain rule with a stated justification, not a
+preference — a configurable ranking would make every user's retrieval a
+different experiment, and none of them comparable (ADR-060 §2).
+
+**Not configurable, deliberately:** whether evidence is required, and whether it
+must appear in the conversation. Both are safety rules rather than preferences,
+and a setting that could switch off the grounding check would be a setting that
+switches off the only automatic defence against an invented fact.
+
+There is no `memory.prompt_directory`. Prompts ship with the application and are
+immutable once loaded; a configurable directory would make the version recorded
+against a call a claim about a file nobody controls.
+
+## 6.5b `suggestion`
+
+**Implemented today (ADR-061).** Budgets and limits only.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `suggestion.prompt_token_budget` | int | `2000` | The most the assembled memories and conversation may cost, estimated at four characters to a token. Excludes the system prompt and the task, which are never trimmed |
+| `suggestion.recent_message_limit` | int | `20` | How many recent messages to consider, and therefore how far back a suggestion can be influenced from |
+| `suggestion.max_message_chars` | int | `2000` | How much of any one message to show. Bounds the payload space available to a prompt injection attempt (`SECURITY.md` §12); a message cut here is marked so the model can tell |
+| `suggestion.minimum_messages` | int | `1` | How many messages survive whatever the budget says. One: the thing being replied to |
+
+**Not configurable, deliberately:** the order the parts appear in, and the order
+they are removed in when the budget bites. Both are domain rules with stated
+justifications rather than preferences — a configurable ordering would make
+every installation's prompt a different experiment, and none of them comparable
+(ADR-061 §1).
 
 ## 6.6 `conversation`
 

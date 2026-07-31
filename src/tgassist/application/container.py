@@ -19,8 +19,11 @@ which is exactly the information a reader and a test need most.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
@@ -32,7 +35,14 @@ from tgassist.application.use_cases.account import (
     ListAccounts,
     SetActiveAccount,
 )
+from tgassist.application.use_cases.ai import (
+    ExecuteAiTask,
+    GetAiCall,
+    ListAiCalls,
+    StructuredAiTask,
+)
 from tgassist.application.use_cases.authenticate import AuthenticateAccount, LogOutAccount
+from tgassist.application.use_cases.backfill import SyncHistory
 from tgassist.application.use_cases.chat import (
     GetChat,
     ListChats,
@@ -46,40 +56,95 @@ from tgassist.application.use_cases.contact import (
     GetContact,
     ListContacts,
 )
+from tgassist.application.use_cases.conversation import (
+    GetConversation,
+    ListConversations,
+    SegmentConversations,
+)
+from tgassist.application.use_cases.live import (
+    LIVE_TASK_NAME,
+    LiveOutcome,
+    LiveReport,
+    SyncLive,
+)
+from tgassist.application.use_cases.memory import (
+    ExtractionPolicy,
+    ExtractMemories,
+    GetMemoryProposal,
+    ListMemoryProposals,
+)
+from tgassist.application.use_cases.memory_context import (
+    BuildMemoryContext,
+    GetMemoryContext,
+)
+from tgassist.application.use_cases.memory_review import (
+    AcceptMemoryProposal,
+    DeleteMemory,
+    GetMemory,
+    ListMemories,
+    RejectMemoryProposal,
+)
 from tgassist.application.use_cases.message import (
     GetMessage,
     IngestMessages,
     ReadChatHistory,
 )
 from tgassist.application.use_cases.session import PrepareSession
+from tgassist.application.use_cases.suggestion import (
+    BuildPromptContext,
+    GenerateConversationSuggestion,
+)
+from tgassist.application.use_cases.suggestion_review import (
+    AcceptSuggestion,
+    DismissSuggestion,
+    GetSuggestion,
+    ListSuggestions,
+)
 from tgassist.application.use_cases.sync import SyncChats, SyncContacts
+from tgassist.application.use_cases.sync_status import GetSyncStatus
 from tgassist.application.use_cases.user_profile import (
     GetUserProfile,
     UpdateUserProfile,
 )
 from tgassist.domain.errors import (
+    AiNotConfiguredError,
     RecordNotFoundError,
     SchemaVersionError,
     SecretStoreUnavailableError,
     TelegramNotConfiguredError,
 )
+from tgassist.domain.events import MessagesIngested
+from tgassist.domain.model.ai import AiModel, AiVendor, DataBoundary
 from tgassist.domain.model.identifiers import AccountId
 from tgassist.domain.model.tdlib import TdlibRuntime
 from tgassist.domain.ports.account_repository import AccountRepository
+from tgassist.domain.ports.ai_call_repository import AiCallRepository
+from tgassist.domain.ports.ai_provider import AiProvider
 from tgassist.domain.ports.chat_repository import ChatRepository
 from tgassist.domain.ports.clock import Clock
 from tgassist.domain.ports.contact_repository import ContactRepository
+from tgassist.domain.ports.conversation_repository import ConversationRepository
 from tgassist.domain.ports.database import HealthReport
 from tgassist.domain.ports.event_bus import EventBus
 from tgassist.domain.ports.id_generator import IdGenerator
+from tgassist.domain.ports.memory_proposal_repository import MemoryProposalRepository
+from tgassist.domain.ports.memory_repository import MemoryRepository
 from tgassist.domain.ports.message_repository import MessageRepository
 from tgassist.domain.ports.migration_runner import SchemaState, SchemaStatus
+from tgassist.domain.ports.prompt_registry import PromptRegistry
 from tgassist.domain.ports.repository import RepositoryFactory, ScopedRepositoryFactory
 from tgassist.domain.ports.secret_store import SecretStore
 from tgassist.domain.ports.session_repository import SessionRepository
+from tgassist.domain.ports.suggestion_repository import SuggestionRepository
+from tgassist.domain.ports.sync_cursor_repository import SyncCursorRepository
 from tgassist.domain.ports.telegram_gateway import TelegramGateway
 from tgassist.domain.ports.unit_of_work import UnitOfWork
 from tgassist.domain.ports.user_profile_repository import UserProfileRepository
+from tgassist.domain.services.context_assembly import AssemblyRules
+from tgassist.domain.services.memory_selection import SelectionRules
+from tgassist.domain.services.segmentation import SegmentationRules
+from tgassist.infrastructure.ai import AnthropicProvider, ScriptedAiProvider
+from tgassist.infrastructure.ai.anthropic import DEFAULT_ENDPOINT
 from tgassist.infrastructure.clock import SystemClock
 from tgassist.infrastructure.config import (
     AppConfig,
@@ -96,16 +161,29 @@ from tgassist.infrastructure.persistence import (
     SqliteDatabase,
     UnitOfWorkFactory,
     account_repository,
+    ai_call_repository,
     chat_repository,
     contact_repository,
+    conversation_repository,
+    memory_proposal_repository,
+    memory_repository,
     message_repository,
     session_repository,
+    suggestion_repository,
+    sync_cursor_repository,
     user_profile_repository,
 )
+from tgassist.infrastructure.prompts import FilePromptRegistry
 from tgassist.infrastructure.security import build_default_secret_store
+from tgassist.infrastructure.tasks import BackgroundTaskSupervisor
 from tgassist.infrastructure.telegram import LoaderSettings, TdjsonLoader
 from tgassist.infrastructure.telegram.client import TdjsonClient
 from tgassist.infrastructure.telegram.gateway import GatewaySettings, TdlibGateway
+
+#: How often the live runner checks whether the run it is watching is still
+#: going. Short enough that Ctrl+C feels immediate, long enough that an idle
+#: run costs nothing measurable.
+_LIVE_POLL_SECONDS = 0.05
 
 
 class Container:
@@ -128,6 +206,7 @@ class Container:
         "_ids",
         "_loaded",
         "_migrations",
+        "_prompts",
         "_secrets",
         "_uow_factory",
     )
@@ -163,6 +242,9 @@ class Container:
         self._clock = clock if clock is not None else SystemClock()
         self._ids = ids if ids is not None else UuidV7IdGenerator(self._clock)
         self._events = events if events is not None else InProcessEventBus()
+        # Constructed here, read at start(): building the object graph must
+        # not be able to fail because a file on disk is wrong.
+        self._prompts = FilePromptRegistry()
         self._secrets = secrets if secrets is not None else build_default_secret_store()
         self._database = (
             database
@@ -298,6 +380,25 @@ class Container:
         return chat_repository
 
     @property
+    def memory_proposals(self) -> ScopedRepositoryFactory[MemoryProposalRepository]:
+        """Return the memory proposal repository factory.
+
+        No update and no delete, which is what makes *pending* the only state a
+        stored proposal can be in (ADR-058).
+        """
+        return memory_proposal_repository
+
+    @property
+    def memories(self) -> ScopedRepositoryFactory[MemoryRepository]:
+        """Return the memory repository factory.
+
+        No update. A memory is immutable, and the only mutation is a soft
+        delete written as a named operation rather than a general update
+        (ADR-059).
+        """
+        return memory_repository
+
+    @property
     def messages(self) -> ScopedRepositoryFactory[MessageRepository]:
         """Return the message repository factory.
 
@@ -314,6 +415,45 @@ class Container:
         transition, not a deletion.
         """
         return session_repository
+
+    @property
+    def ai_calls(self) -> ScopedRepositoryFactory[AiCallRepository]:
+        """Return the AI call repository factory.
+
+        Append-only: the port has no update and no delete, so nothing built from
+        this factory can change or remove a recorded call (ADR-057).
+        """
+        return ai_call_repository
+
+    @property
+    def conversations(self) -> ScopedRepositoryFactory[ConversationRepository]:
+        """Return the conversation repository factory.
+
+        The one repository with a ``delete``: a conversation is derived from
+        messages that are still there, so a stale one is a wrong answer rather
+        than history (ADR-056).
+        """
+        return conversation_repository
+
+    @property
+    def suggestions(self) -> ScopedRepositoryFactory[SuggestionRepository]:
+        """Return the suggestion repository factory.
+
+        One mutation -- pending to a terminal state, once -- and no ``execute``.
+        Accepting a suggestion records agreement; nothing here can act on one
+        (ADR-062).
+        """
+        return suggestion_repository
+
+    @property
+    def sync_cursors(self) -> ScopedRepositoryFactory[SyncCursorRepository]:
+        """Return the sync cursor repository factory.
+
+        No delete: a cursor goes with its chat, by cascade. Resetting a backfill
+        writes a fresh cursor rather than removing one, so there is no window in
+        which a chat has messages and no bookmark.
+        """
+        return sync_cursor_repository
 
     # -- Use cases --------------------------------------------------------
     #
@@ -405,6 +545,7 @@ class Container:
             self.accounts,
             self._clock,
             self._ids,
+            self._events,
         )
 
     def read_chat_history(self) -> ReadChatHistory:
@@ -472,6 +613,458 @@ class Container:
         """Build the contact synchronisation use case."""
         return SyncContacts(self._uow_factory, self.contacts, self.accounts, self._clock, self._ids)
 
+    def sync_history(self) -> SyncHistory:
+        """Build the history backfill use case.
+
+        It receives the ingestion pipeline rather than the message repository,
+        so the idempotency rule has one home -- and so a backfill batch and the
+        cursor accounting for it share the transaction ``ingest_within`` leaves
+        open (ADR-050).
+        """
+        return SyncHistory(
+            self._uow_factory,
+            self.sync_cursors,
+            self.chats,
+            self.accounts,
+            self.ingest_messages(),
+            self._clock,
+            self._events,
+            self.config.telegram.backfill_batch_size,
+            self.config.telegram.backfill_horizon_days,
+        )
+
+    def sync_live(self) -> SyncLive:
+        """Build the live synchronisation use case.
+
+        The same ingestion pipeline the backfill receives, so both producers
+        write through one path and the idempotency rule has one home (ADR-055).
+        """
+        return SyncLive(
+            self._uow_factory,
+            self.sync_cursors,
+            self.chats,
+            self.accounts,
+            self.ingest_messages(),
+            self._clock,
+            self._events,
+            self.config.telegram.backfill_batch_size,
+            self.config.telegram.catch_up_pages,
+        )
+
+    async def run_live_sync(
+        self,
+        gateway: TelegramGateway,
+        account_id: AccountId | None = None,
+        *,
+        catch_up: bool = True,
+        report: LiveReport | None = None,
+    ) -> LiveOutcome:
+        """Follow Telegram under supervision, and stop everything in order.
+
+        Here rather than in a use case because it is the one thing a composition
+        root exists for: joining an infrastructure component -- the asyncio task
+        supervisor -- to an application one. An application use case importing
+        the supervisor would break the dependency rule, and an architectural
+        test says so (ADR-011).
+
+        The shutdown order is section 7.2's, and living here is what keeps every
+        caller from having to remember it:
+
+        1. The consumer task is cancelled, so no new update is taken.
+        2. Its in-flight transaction rolls back through the unit of work's own
+           exit path, so no batch is left half-written.
+        3. Only then does the caller's ``async with`` close the gateway, and
+           only after that does :meth:`aclose` close the database.
+
+        Returns rather than raising when interrupted: a ``KeyboardInterrupt`` at
+        the terminal is how a person says "that is enough", and the counters are
+        still worth reporting.
+
+        Args:
+            gateway: A connected gateway bound to this account.
+            account_id: Account to follow. ``None`` selects the active one.
+            catch_up: Whether to recover what arrived while nothing was running.
+            report: A report to write into, so a caller can watch it move.
+
+        Returns:
+            What the run did and why it stopped.
+        """
+        progress = report if report is not None else LiveReport()
+        live = self.sync_live()
+        supervisor = BackgroundTaskSupervisor(max_restarts=self.config.telegram.live_max_restarts)
+        supervisor.start(
+            LIVE_TASK_NAME,
+            lambda: live.execute(gateway, account_id, report=progress, catch_up=catch_up),
+        )
+
+        try:
+            # Polling rather than awaiting the task, because the supervisor may
+            # restart it: awaiting one attempt would return the moment that
+            # attempt died, which is the opposite of what supervision is for.
+            with contextlib.suppress(asyncio.CancelledError, KeyboardInterrupt):
+                while supervisor.is_running:
+                    await asyncio.sleep(_LIVE_POLL_SECONDS)
+        finally:
+            statuses = await supervisor.stop()
+
+        status = next((s for s in statuses if s.name == LIVE_TASK_NAME), None)
+        return LiveOutcome(
+            report=progress,
+            restarts=status.restarts if status is not None else 0,
+            failure=status.failure if status is not None else None,
+        )
+
+    def segmentation_rules(self) -> SegmentationRules:
+        """Return the configured boundary rules."""
+        section = self.config.conversation
+        return SegmentationRules(
+            gap=timedelta(minutes=section.gap_minutes),
+            max_messages=section.max_messages,
+        )
+
+    def segment_conversations(self) -> SegmentConversations:
+        """Build the segmentation use case."""
+        return SegmentConversations(
+            self._uow_factory,
+            self.conversations,
+            self.messages,
+            self.accounts,
+            self._clock,
+            self._ids,
+            self.segmentation_rules(),
+        )
+
+    def get_conversation(self) -> GetConversation:
+        """Build the conversation lookup, which reads its messages by range."""
+        return GetConversation(self._uow_factory, self.conversations, self.messages, self.accounts)
+
+    def list_conversations(self) -> ListConversations:
+        """Build the conversation listing use case."""
+        return ListConversations(self._uow_factory, self.conversations, self.accounts)
+
+    def subscribe_segmentation(self) -> None:
+        """Re-segment a chat whenever messages are stored for it.
+
+        Wired here because a subscription joins two components neither of which
+        should know the other: ingestion announces what it wrote, and
+        segmentation decides what that means. Neither imports the other.
+
+        The handler is deliberately narrow. It re-segments **from the oldest
+        message in the batch**, so a live update rewrites one conversation and a
+        backfill batch rewrites the few its page covered -- never the whole chat.
+        A failure is absorbed by the bus (``EventBus`` contract point 4), which
+        is right: the messages are committed either way, and the next rebuild
+        recomputes what this pass could not.
+        """
+        if not self.config.conversation.segment_on_ingest:
+            return
+
+        async def on_ingested(event: MessagesIngested) -> None:
+            await self.segment_conversations().execute(
+                event.chat_id, AccountId(event.account_id), since=event.oldest_sent_at
+            )
+
+        self._events.subscribe(MessagesIngested, on_ingested, name="segment-conversations")
+
+    async def ai_provider(self) -> AiProvider:
+        """Build the configured model client.
+
+        Async because a real vendor needs its key from the credential store, and
+        that is I/O. The fake needs nothing, which is why a fresh installation
+        has a working AI boundary before anybody configures anything.
+
+        Raises:
+            AiNotConfiguredError: If the configured vendor needs a key and none
+                is stored. Every AI feature is expected to degrade rather than
+                break when this is raised (``PROJECT_SPEC.md`` section 4.2).
+        """
+        section = self.config.ai
+        model = self.ai_model()
+
+        if section.vendor is AiVendor.FAKE:
+            # A shipped provider, not a test double reached at runtime: a fresh
+            # installation gets a working AI boundary that costs nothing, and
+            # the tested path is the shipped path (ADR-057).
+            return ScriptedAiProvider(model=model)
+
+        key = await self._secrets.get(section.api_key_ref)
+        if key is None:
+            msg = f"No API key is stored under {section.api_key_ref}"
+            raise AiNotConfiguredError(
+                msg,
+                user_message=(
+                    f"No AI provider key is stored under {section.api_key_ref}. "
+                    f"Store one, or set ai.vendor to fake."
+                ),
+                context={"vendor": section.vendor.value, "api_key_ref": section.api_key_ref},
+            )
+        return AnthropicProvider(
+            model,
+            key,
+            endpoint=section.endpoint if section.endpoint else DEFAULT_ENDPOINT,
+        )
+
+    def ai_model(self) -> AiModel:
+        """Return the configured model, and what using it implies.
+
+        The data boundary comes from the **vendor**, not from configuration: a
+        cloud model is external however it is configured, and letting a setting
+        say otherwise would put the privacy guarantee in a file the user can
+        edit (ADR-024).
+        """
+        section = self.config.ai
+        return AiModel(
+            vendor=section.vendor,
+            identifier=section.model,
+            data_boundary=(
+                DataBoundary.LOCAL if section.vendor is AiVendor.FAKE else DataBoundary.EXTERNAL
+            ),
+            input_cost_per_million=section.input_cost_per_million,
+            output_cost_per_million=section.output_cost_per_million,
+            currency=section.cost_currency,
+        )
+
+    async def execute_ai_task(self) -> ExecuteAiTask:
+        """Build the AI execution use case.
+
+        The only place a model is invoked. Everything after this slice calls it
+        and gets the privacy gate, the timeout, the cost accounting and the
+        audit record without having to remember any of them (ADR-057).
+        """
+        return ExecuteAiTask(
+            self._uow_factory,
+            self.ai_calls,
+            self.chats,
+            self.accounts,
+            await self.ai_provider(),
+            self._clock,
+            self._ids,
+            self.config.ai.store_responses,
+        )
+
+    def get_ai_call(self) -> GetAiCall:
+        """Build the recorded-call lookup."""
+        return GetAiCall(self._uow_factory, self.ai_calls, self.accounts)
+
+    def list_ai_calls(self) -> ListAiCalls:
+        """Build the recorded-call listing."""
+        return ListAiCalls(self._uow_factory, self.ai_calls, self.accounts)
+
+    def prompts(self) -> PromptRegistry:
+        """Return the loaded prompt registry.
+
+        Loaded once, on first use, and held for the life of the container. The
+        version recorded against a model call has to be a claim about the text
+        that was actually sent, and a registry that could be reloaded would make
+        it a claim about a file that may since have changed (ADR-058).
+
+        Raises:
+            PromptRegistryInvalidError: If a prompt or schema this application
+                ships is missing or inconsistent.
+        """
+        self._prompts.load()
+        return self._prompts
+
+    async def extract_memories(self) -> ExtractMemories:
+        """Build the memory extraction use case.
+
+        Async because it needs ``ExecuteAiTask``, which needs the provider,
+        which needs a key from the credential store.
+        """
+        section = self.config.memory
+        return ExtractMemories(
+            self._uow_factory,
+            self.memory_proposals,
+            self.conversations,
+            self.messages,
+            self.accounts,
+            StructuredAiTask(await self.execute_ai_task()),
+            self.prompts(),
+            self._clock,
+            self._ids,
+            ExtractionPolicy(
+                min_confidence=section.min_confidence,
+                max_proposals=section.max_proposals_per_conversation,
+                message_limit=section.context_message_limit,
+                max_message_chars=section.max_message_chars,
+            ),
+            self._events,
+        )
+
+    def accept_memory_proposal(self) -> AcceptMemoryProposal:
+        """Build the acceptance use case.
+
+        The only route into long-term memory. Not async, unlike extraction: a
+        decision needs no model, which is the point of separating the two
+        (ADR-059).
+        """
+        return AcceptMemoryProposal(
+            self._uow_factory,
+            self.memory_proposals,
+            self.memories,
+            self.conversations,
+            self.chats,
+            self.accounts,
+            self._clock,
+            self._ids,
+            self._events,
+        )
+
+    def reject_memory_proposal(self) -> RejectMemoryProposal:
+        """Build the rejection use case."""
+        return RejectMemoryProposal(
+            self._uow_factory,
+            self.memory_proposals,
+            self.accounts,
+            self._clock,
+            self._events,
+        )
+
+    def delete_memory(self) -> DeleteMemory:
+        """Build the forget use case."""
+        return DeleteMemory(self._uow_factory, self.memories, self.accounts, self._clock)
+
+    def build_memory_context(self) -> BuildMemoryContext:
+        """Build the retrieval use case that **records** what it selects.
+
+        What a prompt assembler calls. The counters it writes are the evidence
+        that will eventually justify or refute the ranking (ADR-060).
+        """
+        return BuildMemoryContext(
+            self._uow_factory,
+            self.memories,
+            self.chats,
+            self.accounts,
+            self._clock,
+            self._selection_rules(),
+            self.config.memory.max_candidates,
+            self._events,
+        )
+
+    def get_memory_context(self) -> GetMemoryContext:
+        """Build the retrieval use case that records nothing.
+
+        What ``tgassist memory context`` calls. Looking at what would be sent is
+        not using it, and an inspection that inflated the counters would corrupt
+        the measurement it exists to expose.
+        """
+        return GetMemoryContext(
+            self._uow_factory,
+            self.memories,
+            self.chats,
+            self.accounts,
+            self._clock,
+            self._selection_rules(),
+            self.config.memory.max_candidates,
+        )
+
+    def _selection_rules(self) -> SelectionRules:
+        """Return the bounds a memory context is assembled within."""
+        section = self.config.memory
+        return SelectionRules(
+            token_budget=section.context_token_budget,
+            max_memories=section.context_max_memories,
+        )
+
+    def build_prompt_context(self, *, record: bool = True) -> BuildPromptContext:
+        """Build the prompt assembly use case.
+
+        Args:
+            record: Whether the retrieval it performs is counted against the
+                memories it selects. True for a real generation; False when a
+                prompt is only being inspected (ADR-060).
+        """
+        return BuildPromptContext(
+            self._uow_factory,
+            self.build_memory_context() if record else self.get_memory_context(),
+            self.messages,
+            self.chats,
+            self.accounts,
+            self.prompts(),
+            self._assembly_rules(),
+        )
+
+    def accept_suggestion(self) -> AcceptSuggestion:
+        """Build the acceptance use case.
+
+        Records agreement and **executes nothing**. It is given no gateway and
+        no scheduler, so it could not act on its own conclusion (ADR-062).
+        """
+        return AcceptSuggestion(
+            self._uow_factory, self.suggestions, self.accounts, self._clock, self._events
+        )
+
+    def dismiss_suggestion(self) -> DismissSuggestion:
+        """Build the dismissal use case."""
+        return DismissSuggestion(
+            self._uow_factory, self.suggestions, self.accounts, self._clock, self._events
+        )
+
+    def get_suggestion(self) -> GetSuggestion:
+        """Build the suggestion lookup."""
+        return GetSuggestion(self._uow_factory, self.suggestions, self.accounts)
+
+    def list_suggestions(self) -> ListSuggestions:
+        """Build the suggestion listing: the queue, or one chat's history."""
+        return ListSuggestions(self._uow_factory, self.suggestions, self.accounts)
+
+    async def generate_suggestion(self) -> GenerateConversationSuggestion:
+        """Build the suggestion use case.
+
+        Async because it needs the AI boundary, which needs the provider, which
+        needs a key from the credential store. **Nothing it produces is sent**:
+        a suggestion is a draft for a person to read (ADR-061).
+        """
+        return GenerateConversationSuggestion(
+            self.build_prompt_context(),
+            StructuredAiTask(await self.execute_ai_task()),
+            self.prompts(),
+            self._uow_factory,
+            self.suggestions,
+            self.accounts,
+            self._clock,
+            self._ids,
+            self._events,
+        )
+
+    def _assembly_rules(self) -> AssemblyRules:
+        """Return the bounds a prompt is assembled within."""
+        section = self.config.suggestion
+        return AssemblyRules(
+            token_budget=section.prompt_token_budget,
+            message_limit=section.recent_message_limit,
+            max_message_chars=section.max_message_chars,
+            minimum_messages=section.minimum_messages,
+        )
+
+    def get_memory(self) -> GetMemory:
+        """Build the memory lookup."""
+        return GetMemory(self._uow_factory, self.memories, self.accounts)
+
+    def list_memories(self) -> ListMemories:
+        """Build the memory listing."""
+        return ListMemories(self._uow_factory, self.memories, self.accounts)
+
+    def get_memory_proposal(self) -> GetMemoryProposal:
+        """Build the proposal lookup."""
+        return GetMemoryProposal(self._uow_factory, self.memory_proposals, self.accounts)
+
+    def list_memory_proposals(self) -> ListMemoryProposals:
+        """Build the proposal listing."""
+        return ListMemoryProposals(self._uow_factory, self.memory_proposals, self.accounts)
+
+    def sync_status(self) -> GetSyncStatus:
+        """Build the synchronisation status query.
+
+        Reads stored state only. A live run in another process is not something
+        a one-shot command could observe without a control channel between
+        processes, and inventing one to answer a question nobody asked would be
+        the wrong trade.
+        """
+        return GetSyncStatus(
+            self._uow_factory, self.sync_cursors, self.chats, self.sessions, self.accounts
+        )
+
     def repository[R](self, factory: RepositoryFactory[R], uow: UnitOfWork) -> R:
         """Build a repository bound to an open unit of work.
 
@@ -514,7 +1107,18 @@ class Container:
             MigrationFailedError: If a migration fails.
         """
         await self.verify_secret_store()
-        return await self.start_database(migrate=migrate)
+        # Before the database, because it is the cheapest check and the one
+        # whose failure is entirely our fault: a prompt this application ships
+        # being missing or inconsistent is a packaging defect, and finding it
+        # while somebody waits for a suggestion is finding it at the worst
+        # moment (ADR-026 section 7).
+        self.prompts()
+        status = await self.start_database(migrate=migrate)
+        # After the database, because the handler writes to it, and here rather
+        # than at each call site so that every path which ingests messages --
+        # backfill, live updates, the CLI -- segments them the same way.
+        self.subscribe_segmentation()
+        return status
 
     async def start_database(self, *, migrate: bool | None = None) -> SchemaStatus:
         """Open the database and bring its schema to the expected revision.

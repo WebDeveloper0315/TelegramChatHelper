@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "memory_proposals",
+  "description": "What the extraction prompt is permitted to return. The model supplies a category, a value, a confidence and a quotation -- and nothing else. Identifiers, timestamps, provenance and status are decided by the application, so there is no field here for the model to put them in (ADR-058).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["proposals"],
+  "properties": {
+    "proposals": {
+      "type": "array",
+      "description": "Candidate facts. An empty array is a correct answer: most conversations contain nothing worth remembering.",
+      "minItems": 0,
+      "maxItems": 25,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["category", "value", "confidence", "evidence"],
+        "properties": {
+          "category": {
+            "type": "string",
+            "description": "The closed set from DOMAIN_MODEL section 5.9. Closed because categories are what a user filters and eventually auto-approves by.",
+            "enum": [
+              "identity",
+              "location",
+              "occupation",
+              "interest",
+              "preference",
+              "relationship",
+              "important_date",
+              "plan",
+              "shared_experience",
+              "open_question",
+              "constraint",
+              "other"
+            ]
+          },
+          "value": {
+            "type": "string",
+            "description": "The fact itself, one short sentence. Bounded because it goes into later prompts, where length is a budget everything else competes for.",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "confidence": {
+            "type": "number",
+            "description": "Self-reported, and poorly calibrated (AI_MODELS section 15). Used as a coarse filter and nothing more. Bounded here so that a value outside the range is caught as a malformed answer rather than compared against a threshold as though it meant something.",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "evidence": {
+            "type": "string",
+            "description": "The verbatim text this was read from. Required, never optional: the only way to check an extraction without re-running it is to read what it was based on. The application additionally checks that this text actually appears in the conversation.",
+            "minLength": 1,
+            "maxLength": 2000
+          }
+        }
+      }
+    }
+  }
+}

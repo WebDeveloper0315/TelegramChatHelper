@@ -189,9 +189,8 @@ erDiagram
         timestamp started_at
         timestamp ended_at
         int message_count
-        int is_open
-        text initiated_by
-        text dominant_language
+        timestamp created_at
+        timestamp updated_at
     }
 
     messages {
@@ -400,15 +399,14 @@ erDiagram
     }
 
     sync_cursors {
-        int id PK
+        int chat_id PK
         int account_id FK
-        int chat_id FK UK
         int oldest_synced_message_id
         int newest_synced_message_id
         int backfill_complete
+        timestamp backfill_horizon
         timestamp last_sync_at
-        text last_error
-        int consecutive_failures
+        timestamp updated_at
     }
 
     notifications {
@@ -440,16 +438,22 @@ erDiagram
     ai_calls {
         int id PK
         int account_id FK
-        text provider_name
+        int chat_id FK
+        text vendor
         text model_identifier
+        text data_boundary
         text prompt_id
         text prompt_version
         text task_kind
         int input_tokens
         int output_tokens
-        real estimated_cost
+        text estimated_cost
+        text cost_currency
         int latency_ms
         text outcome
+        text finish_reason
+        text response_digest
+        text response_text
         timestamp created_at
     }
 
@@ -610,10 +614,22 @@ Columns: `id`, `account_id`, `telegram_chat_id`, `chat_type`, `contact_id`,
 
 ### `conversations`
 
-- Index: `(chat_id, started_at DESC)`, `(account_id, is_open)`
-- Partial unique: at most one row per `chat_id` with `is_open = 1`
-- FK: `chat_id → chats(id) ON DELETE CASCADE`
-- Check: `ended_at IS NULL OR ended_at >= started_at`
+Bounded episodes of interaction, **derived from messages**. Created by migration
+`0009`, and the only table in this schema whose rows this application deletes as
+a matter of course: a stale conversation is a wrong answer about messages that
+are still there, not history.
+
+Columns: `id`, `account_id`, `chat_id`, `started_at`, `ended_at`,
+`message_count`, `created_at`, `updated_at`.
+
+- **Messages carry no `conversation_id`, and there is no join table.** A message belongs to the conversation whose `[started_at, ended_at]` contains its `sent_at`. `messages` is append-only and its repository has no update path (ADR-046); storing the link would reopen that, and would make every rebuild an O(messages) write instead of an O(conversations) one (ADR-056).
+- **FK: `(account_id, chat_id) → chats(account_id, id) ON DELETE CASCADE`** — composite, so a conversation in one account's chat cannot be attached to another's (ADR-043). It reuses the `uq_chats_account_id_id` index migration `0005` created.
+- **Unique: `(account_id, chat_id, started_at)`.** This *is* the non-overlap guarantee: each conversation is a contiguous run, so two beginning at the same instant is the only way two could overlap. It replaces version 1.0's partial unique index on `is_open`.
+- Index: `(account_id, chat_id, started_at, id)` — the listing, and the keyset tiebreaker.
+- Check: `ended_at >= started_at`, and `ended_at` is **not nullable**. A conversation derived from messages that already exist always has a last one; version 1.0 made it nullable to mean "still open", and openness is now asked of the entity against an instant rather than stored (ADR-056).
+- Check: `message_count > 0`. An empty conversation is a row that should have been deleted, and permitting it would let a segmentation bug survive as data.
+- **No `is_open`, `initiated_by` or `dominant_language`.** The first is derived; the other two are deferred to the milestones that read them.
+- **A requirement on whatever references this table next.** Summaries, plans and analyses attach to a Conversation from Milestone 8, and these rows are deleted whenever re-segmentation leaves one describing no messages. Those foreign keys must cascade, or that delete has to start refusing.
 
 ### `messages`
 
@@ -715,6 +731,40 @@ Append-only.
 - Check: `recommended_action IN ('send','review','clarify','write_manually','wait')`
 - `context_snapshot` stores identifiers of the memories, summary and messages used — **not their content**, which would duplicate data and complicate deletion.
 
+### `suggestions`
+
+Things a model proposed, awaiting a person's decision. **Nothing in this
+application acts on a row here** — accepting one records agreement and executes
+nothing (ADR-062). Created by migration `0014`.
+
+- FKs: `account_id → accounts(id)`, and **composite** `(account_id, chat_id) →
+  chats`, `(account_id, conversation_id) → conversations`, `(account_id,
+  ai_call_id) → ai_calls`, so a suggestion cannot be about another account's
+  chat (ADR-043). **All `ON DELETE CASCADE`, and the contrast with `memories` is
+  deliberate**: a memory is approved knowledge that outlives the exchange it came
+  from, so its provenance is `SET NULL`; a suggestion is a draft *about* a
+  conversation and means nothing once that conversation is gone.
+- **Partial index `(account_id, created_at, id) WHERE status = 'pending'`** for
+  the queue. A queue is by definition what has not been decided, and an index
+  carrying every decided row would grow without bound while serving nothing.
+- Index `(account_id, chat_id, created_at, id)`, **not** partial: reviewing a
+  conversation means seeing what was dismissed as well as what was kept.
+- Check: `status IN ('pending','accepted','dismissed')`. No other states —
+  `superseded` and `expired` are transitions, and this aggregate has exactly one.
+- Check: `proposal_type IN ('reply_draft')`.
+- Check: `(status = 'pending') = (decided_at IS NULL)` and `decided_at >=
+  created_at`. **No `updated_at`**: nothing edits a suggestion, because an edited
+  draft is not what the model suggested, and the record exists to say what it
+  suggested when somebody agreed with it.
+- `chat_id` is **NOT NULL**; `conversation_id` is nullable and **has no writer
+  today** — generation reads a chat's recent messages rather than a segmented
+  conversation, so it is always NULL. Stated here rather than discovered later.
+- `description` is what a person reads; `payload` is JSON for a machine that
+  does not exist yet. Nothing reads `payload`, and nothing validates it beyond
+  its being a JSON object.
+- The single mutation is conditional — `UPDATE ... WHERE status = 'pending'` —
+  so a second decision changes no row even if two arrive at once.
+
 ### `behavior_recommendations`
 
 - Index: `(conversation_id, created_at DESC)`
@@ -753,8 +803,26 @@ Registry of embedding models ever used, so vectors from different models are nev
 
 ### `sync_cursors`
 
-- Unique: `chat_id`
-- FK: `chat_id → chats(id) ON DELETE CASCADE`
+How far each chat's history backfill has got. Created by migration `0008`, and
+the only table whose *write timing* is the feature: it is written in the same
+transaction as the messages it accounts for, which is the whole of what makes an
+interrupted backfill resumable (ADR-050).
+
+Columns: `chat_id`, `account_id`, `oldest_synced_message_id`,
+`newest_synced_message_id`, `backfill_complete`, `backfill_horizon`,
+`last_sync_at`, `updated_at`.
+
+- **Primary key `chat_id`**, not a surrogate beside a unique index. Exactly one cursor per chat, so the invariant is the key — the reasoning ADR-038 applied to `user_profiles` and `0007` applied to `telegram_sessions`. This supersedes the surrogate `id` in the diagram above (ADR-054).
+- **FK: `(account_id, chat_id) → chats(account_id, id) ON DELETE CASCADE`** — composite, so a cursor for one account's chat cannot be attached to another's (ADR-043). It reuses the `uq_chats_account_id_id` index migration `0005` created for exactly this, so no new index on `chats` was needed.
+- `oldest_synced_message_id` is where the next fetch continues from. **A Telegram message identifier, not a timestamp**: Telegram pages history by identifier, and identifiers are unique and totally ordered within a chat, which timestamps are not (ADR-054). NULL means nothing is stored yet, which is also what "start at the newest" means to the gateway.
+- Check: `(oldest_synced_message_id IS NULL) = (newest_synced_message_id IS NULL)` — both ends of the range or neither. A floor with no ceiling describes a range whose extent nobody can state.
+- Check: `oldest_synced_message_id IS NULL OR oldest_synced_message_id <= newest_synced_message_id`.
+- Check: `chat_id > 0`, `account_id > 0`, and both identifiers positive when present.
+- `backfill_horizon` records what `backfill_complete` *meant*. The two are read together: a run configured to reach further back reopens the cursor rather than reporting success (ADR-054).
+- **No index beyond the primary key.** The only query is by chat, which the key serves. The scheduler's "which chats are pending" query arrives with the scheduler, and its index should be chosen by it (§20).
+- **No `created_at`**: nothing asks when a chat was first synchronised, and `last_sync_at` is the time that means something.
+- `consecutive_failures` and `last_error` from `DOMAIN_MODEL.md` §5.22 are **not** created. The first drives backoff and notifications, neither of which exists; the second was dropped by ADR-050.
+- Access is through a repository **scoped at construction** (ADR-039), and that repository never commits — a cursor committed on its own would advance past messages that had not been written.
 
 ### `notifications`
 
@@ -770,9 +838,135 @@ Registry of embedding models ever used, so vectors from different models are nev
 
 ### `ai_calls`
 
-- Index: `(account_id, created_at DESC)`, `(provider_name, created_at DESC)`
-- **Contains no prompt or response content** (`SECURITY.md` §9)
+One row per model invocation, including the ones that failed and the ones that
+were refused. Created by migration `0010`.
+
+- Index: `(account_id, created_at DESC)` -- the only order a cost report is read
+  in. No index on the vendor: one provider is configured at a time, so an index
+  on it would have one distinct value.
+- Foreign keys: `account_id -> accounts` (cascade), and a **composite**
+  `(account_id, chat_id) -> chats(account_id, id)` (cascade). Composite so a
+  call in one account cannot name another account's chat (ADR-043); cascading
+  because a record derived from a deleted chat is residue of that chat, and
+  because SET NULL is not available on a composite key -- it nulls every column
+  in it, including the NOT NULL `account_id` (ADR-057 §10).
+- **No `UPDATE` and no `DELETE` path exists in any repository.** Append-only,
+  the same discipline `messages` has (ADR-046, ADR-057 §5).
+- **Contains no prompt content, under any setting** (`SECURITY.md` §9).
+  `response_digest` is a truncated SHA-256, which is what deterministic replay
+  compares; `response_text` is null unless `ai.store_responses` is on, which the
+  production profile refuses (ADR-057 §6).
+- `estimated_cost` is **TEXT, not REAL**. Money in fractions of a cent summed
+  over many rows is exactly where binary floating point drifts. Check:
+  `(estimated_cost IS NULL) = (cost_currency IS NULL)`.
+- `input_tokens` / `output_tokens` are nullable, and NULL means *unreported* --
+  which is not zero. Zero is a claim that a call was free.
+- Check: `(outcome = 'success') = (finish_reason IS NOT NULL)`. A successful
+  call is one the model answered, so it knows why the model stopped; a failed
+  one never got that far.
+- Check: `response_text IS NULL OR response_digest IS NOT NULL`.
+- Check: `data_boundary IN ('local','external')`, and `outcome` restricted to
+  the seven values in `DOMAIN_MODEL.md` §5.25.
+- No `updated_at`. An AI call is an immutable record of an instant, and the
+  absence of the column is what says so.
 - Subject to log retention, not conversation retention
+
+### `memory_proposals`
+
+One row per candidate fact a model extracted and a person has not yet decided
+about. **Nothing here is believed.** Created by migration `0011`.
+
+- Index: `(account_id, created_at DESC)` — the review queue's order.
+- **Unique: `(account_id, conversation_id, category, value)`.** Re-running
+  extraction over a conversation must cost nothing and change nothing. The
+  application checks for duplicates first; this index is what makes that true
+  rather than usually true, because the read and the write are separate
+  transactions (ADR-058 §9).
+- Foreign keys: `account_id -> accounts` (cascade), and **two composite keys** —
+  `(account_id, conversation_id) -> conversations` and
+  `(account_id, ai_call_id) -> ai_calls`, both cascading. Composite so a
+  proposal cannot cite another account's conversation or audit trail (ADR-043);
+  cascading because a claim about a deleted conversation is residue of it, and
+  because a proposal whose provenance had been deleted would be a fact with no
+  visible origin — the state proposals exist to prevent.
+- **No `UPDATE` and no `DELETE` path exists in any repository.** With no update
+  path, `pending` is the only state a stored row can hold.
+- `evidence` is **NOT NULL**. The verbatim text the fact was read from, which is
+  the only way to check an extraction without re-running it. The application
+  additionally verifies it appears in the conversation before writing the row.
+- `confidence` is **REAL**, not text — unlike a cost. Nothing sums confidences;
+  the only operation is a comparison against a threshold. Check:
+  `confidence >= 0 AND confidence <= 1`.
+- `category` and `status` are both check-constrained to their closed sets.
+  `accepted` and `rejected` are named for Slice 9c; only `pending` is written
+  today.
+- `prompt_id` / `prompt_version` are duplicated from `ai_calls` deliberately:
+  "which proposals came from the prompt we changed last week" is asked of *this*
+  table, and joining through an audit table for a routine query would make the
+  audit table load bearing.
+- `decided_at` moves with `status`: a check refuses a decided proposal with no
+  timestamp and a pending one with a timestamp. No `decided_by` — every decision
+  is a person's, because there is no other way to make one, so the column would
+  record a constant. No `updated_at`: a proposal has exactly one transition.
+
+Two unique indexes on existing tables — `uq_conversations_account_id_id` and
+`uq_ai_calls_account_id_id` — exist so the composite foreign keys above can
+reference them. Both are created by `0011`, the migration that needs them,
+rather than retrofitted into `0009` and `0010`: an applied migration is history.
+
+### `memories`
+
+Facts a person has approved for long-term retention. **Nothing reaches this
+table without a decision.** Created by migration `0012`.
+
+- Index: `(account_id, created_at DESC)`. No index on `contact_id` yet — "what
+  do we know about this person" is retrieval's question, and the index it wants
+  should be chosen by that query rather than guessed a milestone early
+  (§20).
+- **Unique: `proposal_id`** (partial, where not null) — one memory per accepted
+  proposal, so "acceptance creates exactly one memory" is a constraint rather
+  than a rule, including when two decisions race. Partial because the column is
+  nullable, and several memories may have lost their proposal.
+- **Unique: `(account_id, contact_id, category, key)`** (partial, where not
+  deleted and the contact is known) and **`(account_id, category, key)`**
+  (partial, where not deleted and the contact is unknown). Two indexes because
+  SQL treats NULLs as distinct: without the second, identical facts from group
+  conversations would both be stored.
+- `key` is a deterministic normalisation of `value`, derived by the application
+  and never supplied by a model (ADR-059 §2). It deduplicates; it does not
+  detect contradictions.
+- Foreign keys: `account_id -> accounts` (cascade), composite
+  `(account_id, contact_id) -> contacts` (cascade — purging a contact removes
+  everything about them, `PRIVACY.md` §7), and **`proposal_id`,
+  `conversation_id` and `ai_call_id` all `SET NULL`**. The one place in this
+  schema where SET NULL is right: `ai_calls` and `memory_proposals` cascade from
+  `chats`, so without it deleting a chat would silently erase approved
+  knowledge. What is lost is the trail, not the fact.
+- **No `UPDATE` path exists in any repository beyond the soft delete.** A
+  memory is immutable; correcting one means forgetting it and accepting a new
+  proposal.
+- `deleted_at` is a timestamp, not a flag: retention has to ask "deleted before
+  when". Deleting frees the key, so the same fact can be accepted again.
+- `importance` (REAL, NOT NULL, default `0.5`) — a person's judgement of what
+  the fact is worth, set at acceptance. **Ranked above `confidence`**: a human
+  view of relevance outranks a machine's view of truth (ADR-060 §2).
+- `retrieval_count` (INTEGER, NOT NULL, default `0`) and `last_retrieved_at` —
+  bookkeeping *about* the fact rather than part of it, which is what lets them
+  change while the memory stays immutable. Incremented in SQL over the whole
+  selection in one statement, so two contexts built at once cannot lose a count.
+  Two checks keep them consistent: they move together, and nothing can have been
+  retrieved before it existed.
+- **No `updated_at`** — nothing updates a memory. No `is_pinned` or
+  `valid_from`/`valid_until`: both are ranking policies nothing implements. No
+  `memory_revisions` table: revisions record edits, and there are none.
+- **`ix_memories_account_id_contact_id_created_at`** — chosen by the retrieval
+  query rather than guessed. Retrieval asks for one account's live memories
+  about one contact, newest first, so the index leads with the `WHERE` columns
+  and follows with the order a candidate cap takes from. Partial on
+  `deleted_at IS NULL`: a forgotten memory should occupy no space in an index
+  every context walks. There is no index on `importance`, `confidence` or
+  `category` — ranking happens in memory over a set already bounded to one
+  contact, and no index serves a five-key lexicographic order.
 
 ### `plugins` / `plugin_data`
 
@@ -866,14 +1060,21 @@ Initial migration sequence:
 | `0006` | `messages` — the immutable factual record | **Applied** |
 | `0007` | `telegram_sessions` — where an account stands with Telegram | **Applied** |
 | — | Milestone 2.7 (chat and contact synchronisation) added **no migration** | — |
+| `0008` | `sync_cursors` — how far each chat's backfill has got | **Applied** |
 | next | `settings`, `audit_log` | Milestone 2 |
-| `0008` | `conversations`, `attachments`, `sync_cursors` | Milestone 3 |
-| `0009` | `messages_fts` and synchronisation triggers | Milestone 3 |
-| `0010` | `memories`, `memory_proposals`, `memory_revisions`, `goals` | Milestone 5 |
+| `0009` | `conversations` — bounded episodes, derived from messages | **Applied** |
+| `0010` | `ai_calls` — one row per model invocation | **Applied** |
+| `0011` | `memory_proposals` — candidate facts awaiting a decision | **Applied** |
+| `0012` | `memories`, and `decided_at` on `memory_proposals` | **Applied** |
+| `0013` | `importance`, `retrieval_count`, `last_retrieved_at` and the retrieval index | **Applied** |
+| `0014` | `suggestions` — what the assistant proposed, awaiting a decision | **Applied** |
+| next | `attachments` | Milestone 3 |
+| next | `messages_fts` and synchronisation triggers | Milestone 3 |
+| next | `memories`, `memory_proposals`, `memory_revisions`, `goals` | Milestone 5 |
 | `0011` | `relationship_profiles`, `style_profiles` | Milestone 6 |
 | `0012` | `embedding_models`, `embeddings` | Milestone 7 |
 | `0013` | `analyses`, `conversation_summaries`, `conversation_plans`, `reply_suggestions`, `behavior_recommendations` | Milestone 8 |
-| `0014` | `ai_providers`, `ai_calls` | Milestone 8 |
+| next | `ai_providers` — a routing record, once there are two providers to route between (ADR-057 §2) | Milestone 8 |
 | `0015` | `notifications`, `retention_policies` | Milestone 10 |
 | `0016` | `plugins`, `plugin_data` | Milestone 12 |
 
@@ -1138,7 +1339,7 @@ Targets are provisional and become binding in `PERFORMANCE_BUDGETS` at Milestone
 2. **Foreign keys enforced** on every connection.
 3. **Never stored in the database:** passwords, API keys, authentication codes, session tokens, TDLib encryption keys. Secrets live in the `SecretStore` (ADR-021); the database holds only their names.
 4. Phone numbers are stored as salted hashes.
-5. `ai_calls` stores metadata only, never prompt or response content.
+5. `ai_calls` stores metadata only. Never prompt content, under any setting; the response only as a digest, unless `ai.store_responses` is enabled outside production (ADR-057 §6).
 6. Database files are created with owner-only permissions and verified at startup (ADR-022).
 7. Full-database encryption is a Phase 2 capability with a single implementation site (ADR-022).
 8. Backups written outside the application data directory are encrypted by default.

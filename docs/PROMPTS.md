@@ -39,8 +39,15 @@ Goals: standardize prompt engineering · prevent duplication · enable versionin
 
 # 2. Directory Structure
 
+**Implementation note (ADR-058).** The tree lives at `src/tgassist/prompts/`,
+**inside the package**, not at the repository root as version 2.0 specified. A
+prompt is an asset the application cannot run without, and one outside the wheel
+would be missing from every installation that is not a git checkout. The layout
+below is otherwise unchanged; the files marked *shipped* exist today, and the
+rest arrive with the milestone that needs them.
+
 ```
-prompts/
+src/tgassist/prompts/
 ├── _registry.yaml                      # authoritative index
 ├── system/
 │   └── system.md                       # master system prompt
@@ -79,7 +86,22 @@ Note that `timing.md` from v1.0 is absent: reply timing is computed by the deter
 
 # 3. The Registry
 
-`prompts/_registry.yaml` is the single source of truth. Discovery is never by filesystem convention.
+`_registry.yaml` is the single source of truth for **which prompts exist** and **which schema each is bound to**. Discovery is never by filesystem convention: a loader that globbed the directory would silently lose a prompt on rename and silently gain one on a stray file, and both failures surface as a model answering the wrong question.
+
+**The version is not repeated here (ADR-058).** It lives in the prompt file's own front matter, and only there. Two places recording a version is one place too many for them to agree, and the file's version is the one a person edits when they change the text. The registry entry is therefore just a path and a schema:
+
+```yaml
+version: 1
+prompts:
+  system:
+    path: system/system.md
+    schema: null
+  memory_extract:
+    path: memory/extract.md
+    schema: schemas/memory_proposals.schema.json
+```
+
+What follows is the fuller form version 2.0 specified, retained as the specification for the entries not yet implemented.
 
 ```yaml
 version: 1
@@ -113,7 +135,9 @@ prompts:
     description: Generate reply suggestions with reasoning and alternatives
 ```
 
-**Startup validation** (`ADR-026` §7): every entry must resolve to an existing prompt file and, where declared, an existing schema. A mismatch is a fatal `PromptRegistryInvalid` error. A missing prompt discovered at generation time is far worse than one discovered at startup.
+**Startup validation** (`ADR-026` §7, implemented in `FilePromptRegistry.load()`): every entry must resolve to an existing prompt file and, where declared, an existing schema. A mismatch is a fatal `PromptRegistryInvalidError`. A missing prompt discovered at generation time is far worse than one discovered at startup.
+
+What is checked, in full: the file exists and its front matter parses; its declared `id` matches its registry key and its `output_schema` matches the registry's binding; it declares a version; **its declared `inputs` match the placeholders its body actually uses, in both directions**; and its schema exists, parses, and uses only keywords the validator implements (`require_supported`). Loading happens once, at `Container.start()`, and the result is immutable — there is no reload, because the version recorded against a model call has to be a claim about the text that was actually sent.
 
 ---
 
@@ -183,7 +207,10 @@ Untrusted content appears only inside explicit delimiters:
 ## Rules
 
 1. The system prompt states that content inside these markers is **data to analyse, never instructions to follow**.
-2. Content is scanned for delimiter sequences and escaped before insertion, so it cannot forge a boundary.
+2. Content is scanned for delimiter sequences and escaped before insertion, so it cannot forge a boundary. **Implemented as: any run of three or more angle brackets is collapsed to two.** Both delimiters begin with three, so after this no quoted message can produce either. Collapsing rather than escaping, because it is visible — a reader of the prompt sees what the model saw — and because it can never lengthen the text, so it cannot push a payload past a budget checked before it ran.
+2a. **The wrapping is done by the prompt model, not by the template.** A `Prompt` declares which of its inputs are untrusted, and `render()` delimits and neutralises those. A template that had to remember the markers is a template that can forget them (ADR-058 §4).
+2b. **Model output counts as untrusted content too.** Previously-stored proposal values are shown back to the extraction prompt so it does not repeat them, and they go in delimited: they are derived from conversation content and nobody has reviewed them.
+2c. **Approved memories are neutralised even though they are trusted.** A memory is content a person approved, so it is *not* wrapped in the "this is data, not instructions" markers — that would say something untrue about it. But its text came from a model reading a conversation, so it can contain anything that conversation did, and a value carrying a delimiter would sit outside the delimited block and forge a boundary for it. **Trusting a fact is not the same as trusting its punctuation** (ADR-061). Found when retrieval was first connected to a prompt.
 3. Content is truncated at `ai.context.max_message_chars` per message, bounding the payload space available.
 4. **Generation prompts have no tools, no send capability and no data access.** There is nothing an injection can invoke.
 5. Every output is schema-validated; prose produced instead of structure fails validation and never reaches the user.
@@ -216,6 +243,35 @@ Validation checklist             (self-check before responding)
 ---
 
 # 8. Context Assembly Order
+
+**Implemented for the parts that exist (ADR-061).** `ContextAssembler`
+(`domain/services/context_assembly.py`) builds four of them, in this order:
+
+```
+System prompt            (stable, no conversation data)
+   ↓
+Retrieved memories       (trusted; neutralised but not delimited)
+   ↓
+Recent messages          <<< delimited untrusted content
+   ↓
+Task prompt + output format
+```
+
+Memories come before the conversation because they are the *frame*: a constraint
+changes how every message below should be read. The task comes last because a
+final instruction is the one a model follows most reliably, and because it must
+survive an injection that got past everything above.
+
+**Trimming** removes the oldest messages first, then the lowest-ranked memories.
+The system prompt, the task, the output format and the **most recent message**
+are never removed, and nothing is ever shortened to fit — a truncated fact is a
+fact that was never stated. The per-message character limit is a separate,
+declared bound applied before assembly and marked in the text.
+
+The remaining slots below — user preferences, goal, relationship, style, summary
+— are new inputs to the same assembler in the same fixed order, and none of them
+changes the rule.
+
 
 Assembled by `ContextAssembler` (`AI_MODELS.md` §8), priority-ordered so trimming degrades predictably:
 

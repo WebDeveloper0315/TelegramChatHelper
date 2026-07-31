@@ -5,14 +5,15 @@ Telegram; :class:`AuthorizationHandler` is the only way a credential reaches the
 gateway.
 
 `TelegramGateway` is declared one slice at a time (ADR-051). It now covers
-lifecycle, authorization, the operator's own identity, and reading chats,
-contacts and history. Updates and sending arrive with the code that calls them:
-a protocol listing methods no caller uses cannot be verified by a contract
-suite, and a fake would have to invent behaviour for them.
+lifecycle, authorization, the operator's own identity, reading chats, contacts
+and history, and the live update stream. Sending arrives with the code that
+calls it: a protocol listing methods no caller uses cannot be verified by a
+contract suite, and a fake would have to invent behaviour for them.
 """
 
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator
 from enum import StrEnum
 from typing import Final, Protocol, runtime_checkable
 
@@ -28,6 +29,7 @@ from tgassist.domain.model.telegram import (
     HistoryPage,
     PasswordHint,
     TelegramChatInfo,
+    TelegramUpdate,
     TelegramUser,
 )
 
@@ -40,6 +42,14 @@ DEFAULT_CHAT_LIMIT: Final = 200
 #: practical page size, and with the transaction granularity the sync engine
 #: will use (``TELEGRAM_ARCHITECTURE.md`` section 8.4).
 DEFAULT_HISTORY_LIMIT: Final = 100
+
+#: How many updates to hold before backpressure reaches TDLib.
+#:
+#: Generous enough that an ordinary ingestion pause -- one transaction, tens of
+#: milliseconds -- never stalls the dispatch loop, and small enough that a
+#: consumer which has genuinely stopped is noticed rather than absorbed into
+#: memory. Configured at ``telegram.update_queue_size``.
+DEFAULT_UPDATE_QUEUE_SIZE: Final = 1000
 
 #: How many address-book entries to resolve when a caller does not say.
 #:
@@ -216,6 +226,42 @@ class TelegramGateway(Protocol):
         """
         ...
 
+    def updates(self) -> AsyncGenerator[TelegramUpdate]:
+        """Yield what Telegram reports without being asked, in arrival order.
+
+        The stream begins filling at :meth:`connect`, **before** anything starts
+        consuming it, and it is buffered. That ordering is the whole of why a
+        run cannot lose an update to its own start-up: whatever arrives while
+        chats are being synchronised and history is being back-filled is already
+        held, and is delivered when a consumer first asks (ADR-055).
+
+        Contract, guaranteed by every implementation:
+
+        1. **Arrival order is preserved.** Telegram's order is the only order
+           there is; nothing here re-sorts.
+        2. **At most one consumer.** The stream is a queue, not a broadcast, so
+           a second iterator would not see a copy -- it would take turns, and
+           each would silently miss what the other took.
+        3. **The buffer is bounded, and full means slow rather than lost.** A
+           consumer that falls behind eventually stops the dispatch loop, which
+           stops the receive thread, which makes TDLib buffer. Backpressure
+           reaches the far end rather than the queue growing without limit.
+        4. **Unknown update kinds never appear and never stop the stream.** They
+           are counted (:attr:`unhandled_updates`) and dropped, because a
+           TDLib version that added a kind must not take the application down.
+        5. **Iteration ends when the gateway disconnects**, and updates still
+           queued at that moment are abandoned. Recovering them is the caller's
+           catch-up pass on the next run, not a durable queue here (ADR-055).
+        6. **Closing releases the consumer slot.** A generator rather than a
+           plain iterator for exactly this reason: a caller that takes a few
+           updates and stops must be able to let go, or nothing could ever
+           stream again.
+
+        Raises:
+            TdlibNotRunningError: If there is no connection.
+        """
+        ...
+
     async def get_contact(self, user_id: TelegramUserId) -> TelegramUser | None:
         """Return one Telegram user, or ``None`` if this account cannot see them.
 
@@ -287,6 +333,7 @@ __all__ = [
     "DEFAULT_CHAT_LIMIT",
     "DEFAULT_CONTACT_LIMIT",
     "DEFAULT_HISTORY_LIMIT",
+    "DEFAULT_UPDATE_QUEUE_SIZE",
     "AuthorizationHandler",
     "RetryDecision",
     "TelegramGateway",

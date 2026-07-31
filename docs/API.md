@@ -486,15 +486,39 @@ and `ai_processing_mode` (ADR-044).
 
 ## `ConversationRepository`
 
+*Implemented in Milestone 3.0. Scoped per account at construction (ADR-039), so
+no method takes an account identifier.*
+
 ```python
-async def add(conversation: Conversation) -> Conversation
-async def update(conversation: Conversation) -> Conversation
-async def get(account_id: AccountId, conversation_id: ConversationId) -> Conversation | None
-async def get_open(account_id: AccountId, chat_id: ChatId) -> Conversation | None
-async def list_by_chat(account_id: AccountId, chat_id: ChatId, *,
-                       cursor: str | None, limit: int) -> Page[Conversation]
-async def close(account_id: AccountId, conversation_id: ConversationId, ended_at: datetime) -> None
+class ConversationRepository(Protocol):
+    @property
+    def account_id() -> AccountId
+    async def get(conversation_id: ConversationId) -> Conversation | None
+    async def list_by_chat(chat_id: ChatId, request: PageRequest) -> Page[Conversation]
+    async def list_from(chat_id: ChatId,
+                        started_at: datetime | None = None) -> tuple[Conversation, ...]
+    async def latest_before(chat_id: ChatId, instant: datetime) -> Conversation | None
+    async def add(conversation: Conversation) -> None
+    async def update(conversation: Conversation) -> None
+    async def delete(conversation_id: ConversationId) -> None
 ```
+
+**`get_open` and `close` are gone.** Whether a conversation may still grow
+depends on how long ago it ended -- on *now* -- so it is a question asked of an
+entity with an instant, not a column to query or a transition to record
+(ADR-056). "The newest conversation in this chat" is the first page of
+`list_by_chat`.
+
+**`list_from` and `latest_before` are new**, and both exist for the segmentation
+pass: the first reads the window it is about to rewrite, the second tells it
+where that window starts. A pass that opened its window mid-conversation would
+see its first message with nothing before it, call it a boundary, and split an
+episode at whatever instant the caller named.
+
+**`delete` exists here and on no other repository.** Every other aggregate
+records something somebody decided; a Conversation records something this
+application computed from messages that are still there, so a stale one is a
+wrong answer rather than history.
 
 ## `MessageRepository`
 
@@ -654,7 +678,7 @@ Condensed; all follow the §7 common contract.
 | `BehaviorRepository` | `add`, `get_latest` |
 | `AnalysisRepository` | `add`, `get_cached`, `invalidate_by_prompt_version`, `invalidate_by_subject` |
 | `EmbeddingRepository` | `upsert`, `get`, `delete_by_owner`, `list_by_model`, `list_stale` |
-| `SyncCursorRepository` | `get`, `upsert`, `record_failure`, `reset` |
+| `SyncCursorRepository` | `get`, `add`, `update`, `save` — **implemented**, Milestone 2.8. `upsert` is called `save`; `reset` is `save` with a fresh cursor, so no chat is ever left with messages and no bookmark; `record_failure` awaits the backoff policy that would read it (ADR-054) |
 | `NotificationRepository` | `add`, `list_active`, `mark_read`, `dismiss`, `purge_old` |
 | `AIProviderRepository` | `list_enabled`, `get_default_for`, `upsert`, `set_enabled`, `update_capabilities` |
 | `AICallRepository` | `add`, `aggregate_cost`, `list_recent`, `purge_older_than` |
@@ -920,7 +944,7 @@ class TelegramGateway(Protocol):
     ) -> tuple[TelegramUser, ...]: ...                                        # implemented
 
     # Updates
-    def updates(self) -> AsyncIterator[TelegramUpdate]: ...
+    def updates(self) -> AsyncIterator[TelegramUpdate]: ...              # implemented
 
     # Writing — the only send path in the system
     async def send_message(self, chat_id: TelegramChatId, text: str,
@@ -949,6 +973,16 @@ boundary can (`TELEGRAM_ARCHITECTURE.md` §2.4).
 for an **empty** page — a short page is not proof, because Telegram returns short
 pages for reasons of its own. That is the whole reason the boundary is returned
 rather than derived.
+
+**`updates()` is fed by the dispatch loop, not by a second consumer of the
+receive stream.** The gateway already owns the only consumer of
+`TdjsonClient.receive()` (ADR-051); the loop maps `updateNewMessage` into a
+`NewMessage` and offers it to a bounded queue that `updates()` drains. The
+stream begins filling at `connect()`, before anything consumes it, which is why
+a run cannot lose an update to its own start-up (ADR-055).
+
+One consumer at a time, enforced rather than documented: the queue holds one
+item per update, so a second iterator would take turns rather than see a copy.
 
 **`get_contact` and `list_contacts` are new** relative to version 1.0, and
 they are two calls rather than one because they answer over two different
@@ -1023,70 +1057,131 @@ The gateway is a **parameter**, not a constructor dependency: it holds a live co
 
 # 11. AI Ports
 
-## 11.1 `LLMProvider`
+## 11.1 `AiProvider`
+
+**Responsibility.** The sole boundary to a language model. Builds the vendor's request, parses its response, and normalises its failures. Contains no business logic, no persistence and no privacy decisions.
+
+**Declared one slice at a time (ADR-051).** Two members, because a capability is a property of the *model* rather than a class of client: one endpoint answers a completion, a classification and a structured extraction, and splitting the port would mean several adapters over one endpoint (ADR-057 §1).
 
 ```python
-class Capability(Enum):
-    JSON_SCHEMA = "json_schema"
-    TOOL_CALLING = "tool_calling"
-    STREAMING = "streaming"
-    SYSTEM_PROMPT = "system_prompt"
-    TOKEN_COUNTING = "token_counting"
-    VISION = "vision"
+@runtime_checkable
+class AiProvider(Protocol):
+    @property
+    def model(self) -> AiModel: ...                              # implemented
 
-class LLMProvider(Protocol):
-    def provider_name(self) -> str: ...
-    def model_identifier(self) -> ModelIdentifier: ...
-    def capabilities(self) -> frozenset[Capability]: ...
-    def context_window(self) -> int: ...
-    def data_boundary(self) -> DataBoundary: ...          # local | external
-
-    async def generate(self, request: GenerationRequest) -> GenerationResult: ...
-    async def stream_generate(self, request: GenerationRequest) -> AsyncIterator[GenerationChunk]: ...
-    async def count_tokens(self, text: str) -> int | None: ...   # None when unsupported
-    async def health_check(self) -> HealthStatus: ...
+    async def generate(self, request: AiRequest) -> AiResponse: ...   # implemented
 ```
 
 ```python
-@dataclass(frozen=True)
-class GenerationRequest:
-    system: str | None
-    messages: Sequence[PromptMessage]
-    output_schema: JSONSchema | None
-    max_output_tokens: int
-    temperature: float
-    timeout_seconds: float
-    prompt_id: str
-    prompt_version: PromptVersion
+@dataclass(frozen=True, slots=True)
+class AiRequest:
+    content: str                      # untrusted -- never joined into instructions
+    prompt: PromptVersion
+    task_kind: str
+    instructions: str | None = None   # the system prompt, if the task has one
+    max_output_tokens: int = 4096
+    temperature: float = 0.0          # deterministic by default
+    timeout_seconds: float = 60.0
 
-@dataclass(frozen=True)
-class GenerationResult:
+@dataclass(frozen=True, slots=True)
+class AiResponse:
     text: str
-    parsed: dict | None          # populated when output_schema was supplied and validated
-    input_tokens: int | None
-    output_tokens: int | None
-    finish_reason: FinishReason
-    model_identifier: ModelIdentifier
-    latency_ms: int
+    finish_reason: FinishReason       # stop | length | content_filter | other
+    usage: TokenUsage                 # input/output counts, None where unreported
+    model: AiModel                    # what actually answered, which may be a dated snapshot
 ```
 
 Rules:
 
-1. `capabilities()` is **verified** by `ai check`, never trusted from configuration (ADR-020 §6).
-2. `count_tokens()` may return `None`. Business logic must tolerate this and fall back to conservative estimation.
-3. `data_boundary()` is consulted before every call; an `external` provider is never invoked for a chat whose `ai_processing_mode` is `local_only` or `disabled` (ADR-024).
-4. Provider exceptions are normalized to `ERROR_HANDLING.md` §6 types.
-5. Every call is instrumented into `ai_calls`, including failures.
+1. `model.data_boundary` is consulted before every call. An `external` model is never invoked for a chat whose `ai_processing_mode` is `local_only` or `disabled`, nor for content that names no chat at all (ADR-024, ADR-057 §3).
+2. `content` is untrusted and is placed in the user turn. An adapter that joined it into `instructions` would make prompt injection a system-prompt override (`AI_MODELS.md` §12).
+3. Provider exceptions are normalized to `AiTimeoutError`, `AiRateLimitedError`, `AiProviderError` and `AiResponseError` (`ERROR_HANDLING.md` §6). A caller never sees a vendor's exception type.
+4. `usage` fields are `None` when the vendor did not report them. `None` is *unreported*; zero would be a claim that a call was free.
+5. The returned `model` is what answered, not what was asked for -- a vendor may route an alias to a dated snapshot, and an expensive call has to be traceable to the exact model that made it.
+6. Timeouts are applied by the **caller**, not trusted to the adapter, so a provider that ignores its own timeout cannot hang the application.
+7. Every call is instrumented into `ai_calls`, including failures and refusals.
 
-## 11.2 `StructuredOutputValidator`
+**Implementations.** `AnthropicProvider` (over an injectable `HttpTransport`, so the adapter is exercised in full without a socket) and `ScriptedAiProvider` (shipped, deterministic, the default; ADR-057 §8).
+
+**Not yet declared.** Streaming, token counting, health checks, capability discovery and embeddings. Each will be declared by the slice that has a caller for it. An embedding is not text, and no honest signature covers both.
+
+## 11.1.1 `ExecuteAiTask`
+
+The only place a model is invoked. Every AI feature calls this and inherits the privacy gate, the timeout, the cost accounting and the audit record (ADR-057 §3).
 
 ```python
-class StructuredOutputValidator(Protocol):
-    def validate(self, payload: str, schema: JSONSchema) -> ValidationOutcome: ...
-    def build_repair_prompt(self, payload: str, errors: Sequence[ValidationError]) -> str: ...
+class ExecuteAiTask:
+    async def execute(
+        self,
+        *,
+        content: str,
+        prompt: PromptVersion,
+        task_kind: str,
+        instructions: str | None = None,
+        chat_id: int | None = None,
+        account_id: AccountId | None = None,
+        max_output_tokens: int | None = None,
+        temperature: float | None = None,
+        timeout_seconds: float | None = None,
+    ) -> AiTaskResult: ...
 ```
 
-Applied to **every** model response regardless of the mechanism used to obtain it. One repair attempt; a second failure raises `SchemaViolationError` (ADR-020 §4).
+It **interprets nothing**. No parsing, no schema validation, no repair. Those belong to the task that knows what shape it asked for; put here, every task's schema would land in the one component every task shares.
+
+The gate, in full:
+
+| chat mode | local model | external model |
+| --- | --- | --- |
+| `disabled` | refused | refused |
+| `local_only` | allowed | refused |
+| `cloud_allowed` | allowed | allowed |
+| *no chat named* | allowed | **refused** |
+
+A refusal is recorded as an `AiCall` with outcome `refused` before the error is raised, and the error names the record. An audit that contained only the calls that were allowed could not show that a call was blocked.
+
+## 11.1.2 `AiCallRepository`
+
+```python
+class AiCallRepository(Protocol):
+    @property
+    def account_id(self) -> AccountId: ...
+
+    async def add(self, call: AiCall) -> None: ...
+    async def get(self, call_id: AiCallId) -> AiCall | None: ...
+    async def list_recent(self, request: PageRequest) -> Page[AiCall]: ...
+```
+
+No `update`, no `delete`. The absence of both is the append-only guarantee (ADR-057 §5), the same discipline `MessageRepository` has.
+
+## 11.1.3 `HttpTransport`
+
+```python
+class HttpTransport(Protocol):
+    async def send(self, request: HttpRequest) -> HttpResponse: ...
+```
+
+An infrastructure seam, not a domain port. It exists so the real vendor adapter can be tested in full -- request body, headers, response parsing, stop-reason mapping, usage -- without a network. The shipped implementation is `UrllibTransport`, stdlib `urllib` on a worker thread; no HTTP dependency is added (ADR-057 §11).
+
+## 11.2 Structured output
+
+Not a port: a pure domain service (`domain/services/structured_output.py`), because validating a shape needs nothing but the shape.
+
+```python
+def validate(text: str, schema: JsonSchema) -> ValidationOutcome: ...
+def build_repair_prompt(text: str, violations: Sequence[str]) -> str: ...
+def require_supported(definition: Mapping[str, Any], *, schema_id: str) -> None: ...
+def parse(text: str) -> Any | None: ...
+```
+
+Applied to **every** model response regardless of how it was obtained. One repair attempt; a second failure raises `SchemaViolationError` (ADR-020 §4).
+
+Rules:
+
+1. **Shape only.** Required fields, types, enumerations, numeric ranges, lengths. It has no opinion about whether a confidence is high enough or a fact is worth storing -- that is the calling use case's policy, and a validator that knew about it would change every time a feature did (ADR-058 §5).
+2. **A deliberately small subset of JSON Schema.** `SUPPORTED_KEYWORDS` is what is implemented; `require_supported()` refuses anything else **when a schema is loaded**, so an unimplemented keyword is a startup failure rather than a constraint that silently passes.
+3. `parse()` tolerates exactly one habit -- a Markdown code fence -- and repairs nothing else. No quote fixing, no trailing-comma removal, no scanning for the first brace: a guess that parses is worse than a failure that does not.
+4. There is **no partial result.** An invalid payload returns `None` with its violations; a caller that could reach a half-valid payload would eventually use one.
+5. `build_repair_prompt()` returns the model's own answer to it with the violations named, and forbids adding content -- a repair that changed the facts would be a second, unreviewed extraction.
 
 ## 11.3 `EmbeddingProvider`
 
@@ -1117,19 +1212,268 @@ class VectorStore(Protocol):
 
 Rules: vectors from different models are never compared; `search()` filters by model automatically; results carry a similarity score used by `MemoryRanker` alongside recency and importance (`VECTOR_SEARCH.md` §5).
 
-## 11.5 `PromptRepository`
+## 11.5 `PromptRegistry`
+
+**Declared one slice at a time (ADR-051).** Two members, because two is what has a caller.
 
 ```python
-class PromptRepository(Protocol):
-    def get(self, prompt_id: str) -> PromptTemplate: ...
-    def render(self, prompt_id: str, variables: Mapping[str, Any]) -> RenderedPrompt: ...
-    def schema_for(self, prompt_id: str) -> JSONSchema: ...
-    def version_of(self, prompt_id: str) -> PromptVersion: ...
-    def list_all(self) -> list[PromptInfo]: ...
-    def validate_registry(self) -> RegistryValidation: ...
+@runtime_checkable
+class PromptRegistry(Protocol):
+    def get(self, prompt_id: str) -> Prompt: ...                    # implemented
+    def schema_for(self, prompt_id: str) -> JsonSchema | None: ...  # implemented
 ```
 
-Rules: `render()` **raises** on a missing declared variable rather than substituting empty text (ADR-026 §3); `validate_registry()` runs at startup and a mismatch is fatal; untrusted conversation content is inserted only through delimited slots (`SECURITY.md` §12).
+Rendering is **on the `Prompt`**, not on the registry: it is a pure function of a template and its variables, and putting it in the domain is what lets it be tested without a filesystem.
+
+```python
+@dataclass(frozen=True, slots=True)
+class Prompt:
+    id: str
+    version: str            # from the file's front matter -- the only place it lives
+    purpose: str
+    inputs: tuple[str, ...]
+    untrusted: tuple[str, ...]
+    schema_id: str | None
+    body: str
+
+    def render(self, variables: Mapping[str, str]) -> RenderedPrompt: ...
+    @property
+    def version_ref(self) -> PromptVersion: ...
+```
+
+Rules:
+
+1. `render()` **raises** on a missing declared variable rather than substituting empty text. A prompt silently missing its context section produces fluent, confident, ungrounded output (ADR-026 §3).
+2. It also raises on a variable the prompt does not declare, and a `Prompt` whose declared inputs disagree with the placeholders in its body cannot be constructed at all. Both directions, so a template and its declaration cannot drift apart unnoticed.
+3. **Untrusted content is delimited and neutralised by `render()`**, not by the template. Any run of three or more angle brackets is collapsed to two before insertion, so no message can forge a boundary (`SECURITY.md` §12, ADR-058 §4).
+4. Everything is validated **when the registry loads**, at startup, and a mismatch is a fatal `PromptRegistryInvalidError`. By the time a caller can reach `get()`, every prompt is known to parse, to declare what it uses, and to name a schema that exists and is checkable.
+5. **Immutable once loaded.** No reload, no setter: the version recorded against a model call has to be a claim about the text that was actually sent.
+
+**Not yet declared.** `list_all()` (no caller until a diagnostic command wants one) and `validate_registry()` (loading *is* validating, so a separate method would be a second way to do the same thing).
+
+**Implementation.** `FilePromptRegistry`, over `tgassist/prompts/` -- inside the package rather than at the repository root, because a prompt outside the wheel is a prompt an installed application does not have (ADR-058 §3).
+
+## 11.5.1 `MemoryProposalRepository`
+
+```python
+class MemoryProposalRepository(Protocol):
+    @property
+    def account_id(self) -> AccountId: ...
+
+    async def add(self, proposal: MemoryProposal) -> None: ...
+    async def get(self, proposal_id: MemoryProposalId) -> MemoryProposal | None: ...
+    async def list_recent(self, request: PageRequest) -> Page[MemoryProposal]: ...
+    async def list_for_conversation(self, conversation_id: ConversationId) -> tuple[MemoryProposal, ...]: ...
+```
+
+`decide()` is the **one** mutation, and it is a named method with its restriction in the signature rather than a general `update`:
+
+```python
+    async def decide(
+        self, proposal_id: MemoryProposalId, status: ProposalStatus, now: datetime
+    ) -> bool: ...
+```
+
+It names `pending` in its `WHERE` clause and reports whether it changed a row, so a second decision — or two racing — cannot both succeed. Nothing returns a proposal to `pending`, so a decision cannot be undone (ADR-059 §3).
+
+`list_for_conversation()` returns **every** proposal, including rejected ones: a rejected proposal is kept precisely so the same fact is not offered again.
+
+## 11.5.1a `MemoryRepository`
+
+```python
+class MemoryRepository(Protocol):
+    @property
+    def account_id(self) -> AccountId: ...
+
+    async def add(self, memory: Memory) -> None: ...
+    async def get(self, memory_id: MemoryId) -> Memory | None: ...
+    async def get_by_proposal(self, proposal_id: MemoryProposalId) -> Memory | None: ...
+    async def list_active(self, request: PageRequest) -> Page[Memory]: ...
+    async def delete(self, memory_id: MemoryId, now: datetime) -> bool: ...
+```
+
+No `update`. A memory is immutable: correcting one means forgetting it and accepting a new proposal, because an edit in place would keep the provenance while changing the fact (ADR-059 §5).
+
+`delete()` is soft — a timestamp, not a removal — and is a *named* operation with one meaning, so no caller can reach it while intending something else. It returns whether a live memory was deleted, so "forgotten now" and "was already forgotten" are distinguishable without a second query, and deleting twice is not an error.
+
+`get()` returns deleted memories; `list_active()` does not. "Show me what you deleted" is a question a person is entitled to ask of their own data; "what do you know about me" is not answered by something you told it to forget.
+
+```python
+    async def list_for_contact(self, contact_id: ContactId | None, *, limit: int) -> tuple[Memory, ...]: ...
+    async def mark_retrieved(self, memory_ids: Sequence[MemoryId], now: datetime) -> int: ...
+```
+
+`list_for_contact()` is the retrieval read and **never crosses contacts**. `None` means the memories about *nobody in particular* — the ones from conversations with no single counterpart — and not "everybody": a group chat sees only those, and a private chat only that person's (ADR-060 §6). Live memories only.
+
+`mark_retrieved()` is the second exception to "no update", and the same kind as `delete()`: a named operation with one meaning. It changes *bookkeeping about* a memory, not the fact, which is why a memory stays immutable while its counters move. One statement over the whole selection, incremented in SQL so concurrent contexts cannot lose a count.
+
+There is still no `search` and no vector operation. Semantic retrieval is a later slice and will need a port shaped by an embedding index rather than by this one.
+
+## 11.5.1b Review use cases
+
+```python
+class AcceptMemoryProposal:
+    async def execute(self, proposal_id: int, *, account_id: AccountId | None = None) -> AcceptanceResult: ...
+
+class RejectMemoryProposal:
+    async def execute(self, proposal_id: int, *, account_id: AccountId | None = None) -> MemoryProposal: ...
+
+class DeleteMemory:
+    async def execute(self, memory_id: int, *, account_id: AccountId | None = None) -> bool: ...
+```
+
+Rules:
+
+1. **One transaction.** The decision and the memory it creates are the same event: a committed acceptance with no memory would be a fact the user believes they kept and cannot find.
+2. **Exactly one memory per acceptance**, enforced by a unique index rather than by these classes.
+3. **Rejection creates nothing** and keeps the proposal, so the extractor does not offer the same fact again.
+4. **Neither decision can be repeated or reversed.** An already-accepted proposal is refused with the identifier of the memory it produced — more useful than a bare no.
+5. The contact a memory is about is resolved here, from the conversation's chat. `None` for a chat with no single counterpart.
+6. None of these is `async` for the sake of a model: **deciding needs no AI**, which is the point of having separated extraction from review.
+
+## 11.5.1c `MemorySelector` and the context use cases
+
+Ranking is a **pure domain service** (`domain/services/memory_selection.py`): no repository, no clock, no model.
+
+```python
+def rank(memories: Sequence[Memory]) -> tuple[Memory, ...]: ...
+
+class MemorySelector:
+    def select(self, memories: Sequence[Memory]) -> Selection: ...
+```
+
+Five ordering keys, lexicographic, no weights: **category priority → importance → confidence → recency → identifier** (ADR-060 §2). Every one is a stored fact; none is a tuned number. The budget is spent *after* ranking and never changes it — what does not fit is skipped and the walk continues, and every omission is reported with a reason.
+
+```python
+class GetMemoryContext:
+    async def execute(self, chat_id: int, *, account_id: AccountId | None = None) -> MemoryContext: ...
+
+class BuildMemoryContext(GetMemoryContext):
+    ...
+```
+
+The difference is one thing: `BuildMemoryContext` records the retrieval against the memories it selected, in the same transaction as the read; `GetMemoryContext` records nothing. Two names rather than a flag, because a caller choosing between `build(record=False)` and `build(record=True)` has to know which is which.
+
+Rules:
+
+1. **No model is called.** Retrieval happens before generation and is inspectable on its own.
+2. **Contact scope is the repository's job**, not the selector's, so there is one place to get it wrong.
+3. A truncated candidate set, an over-budget omission and an empty context are three different things, and `MemoryContext` says which.
+4. `MemoryContext.why(memory)` explains a placement in one line — a selection nobody can read is one nobody can disagree with.
+
+## 11.5.1d `ContextAssembler` and the suggestion use cases
+
+Assembly is a **pure domain service** (`domain/services/context_assembly.py`).
+
+```python
+class ContextAssembler:
+    def assemble(self, memories: Sequence[Memory], messages: Sequence[Message]) -> PromptContext: ...
+```
+
+`PromptContext` carries what will be sent (`render_memories()`,
+`render_conversation()`), what the budget removed and why, the token estimate,
+and `memory_keys` — the keys supplied, against which attribution is checked.
+
+Rules:
+
+1. **It writes no prose.** The assembler decides *what* is included and *in what
+   order*; the prompt file decides *what it means and what to do about it*
+   (ADR-061 §4). Not one imperative sentence in the service reaches a model.
+2. The order is fixed: system prompt → memories → conversation → task and output
+   format.
+3. Trimming removes the oldest messages first, then the lowest-ranked memories.
+   The system prompt, the task, the format and the most recent message are never
+   removed, and **nothing is ever shortened to fit**.
+4. Memories are **neutralised but not delimited**; the conversation is delimited
+   by `Prompt.render`, which owns the markers (ADR-058 §4).
+
+```python
+class BuildPromptContext:
+    async def execute(self, chat_id: int, *, account_id: AccountId | None = None) -> AssembledPrompt: ...
+
+class GenerateConversationSuggestion:
+    async def execute(self, chat_id: int, *, account_id: AccountId | None = None) -> Suggestion: ...
+```
+
+`BuildPromptContext` is the deterministic half and asks nothing — it is what
+makes a prompt inspectable before it is paid for. `GenerateConversationSuggestion`
+adds the call, through `StructuredAiTask`, and the attribution check.
+
+**Nothing is sent and nothing is stored.** A `Suggestion` is a return value:
+there is no table, no aggregate and no identifier, because nothing yet decides
+about one. The only write is the `AiCall` that `ExecuteAiTask` records.
+
+## 11.5.1e `StructuredAiTask`
+
+```python
+class StructuredAiTask:
+    async def execute(self, *, content: str, instructions: str | None, prompt: PromptVersion,
+                      task_kind: str, schema: JsonSchema,
+                      chat_id: int | None = None, account_id: AccountId | None = None) -> StructuredAnswer: ...
+```
+
+Wraps `ExecuteAiTask` with the one rule every structured task shares: validate,
+and on failure hand the model its own answer back **exactly once** (ADR-020 §4).
+It exists because there are now two such tasks and that rule must not be able to
+become "one repair here and two there" (ADR-061 §6). The gate, the timeout, the
+accounting and the audit record all still belong to `ExecuteAiTask`.
+
+## 11.5.2 `ExtractMemories`
+
+```python
+class ExtractMemories:
+    async def execute(
+        self, conversation_id: int, *, account_id: AccountId | None = None
+    ) -> ExtractionReport: ...
+```
+
+The pipeline: load the conversation -> render the prompt -> `ExecuteAiTask` -> validate (one repair) -> filter -> persist -> publish `MemoryProposalsCreated`.
+
+Rules:
+
+1. **No proposal bypasses validation**, and no validated candidate bypasses the three filters: grounded evidence, confidence threshold, not already proposed.
+2. The model supplies four fields. Identifier, timestamp, conversation, AI call, prompt version and status are assigned here.
+3. Every discard is **counted** in the report, never silently dropped.
+4. The model call sits inside **no** transaction (ADR-034, ADR-058 §10).
+5. The privacy gate is inherited from `ExecuteAiTask`, not reimplemented.
+
+## 11.5.1f `SuggestionRepository` and the review use cases
+
+**Milestone 10b.** The review queue: every generated suggestion is stored, and
+none of them does anything until a person decides about it (ADR-062).
+
+```python
+class SuggestionRepository(Protocol):
+    async def add(self, suggestion: Suggestion) -> Suggestion: ...
+    async def get(self, suggestion_id: SuggestionId) -> Suggestion | None: ...
+    async def list_pending(self, page: PageRequest) -> Page[Suggestion]: ...
+    async def list_by_chat(self, chat_id: ChatId, page: PageRequest) -> Page[Suggestion]: ...
+    async def decide(
+        self, suggestion_id: SuggestionId, status: SuggestionStatus, now: datetime
+    ) -> bool: ...
+```
+
+**There is no `update`, and no `execute`, `send` or `schedule`.** The repository
+owns exactly one mutation — `pending` to a terminal state — and `decide` is
+conditional (`WHERE status = 'pending'`), returning `False` when the row was
+already decided. The absence of an operation is a stronger guarantee than a rule
+about not calling one, and a contract test asserts the port declares nothing
+else.
+
+`list_pending` excludes decided suggestions; `list_by_chat` includes them.
+
+**Use cases.**
+
+| Use case | Signature | Notes |
+|---|---|---|
+| `AcceptSuggestion` | `execute(suggestion_id, *, account_id=None) -> Suggestion` | Records agreement. **Executes nothing** — it is given no gateway and no scheduler, and a test asserts on its constructor. Publishes `SuggestionAccepted`. |
+| `DismissSuggestion` | `execute(suggestion_id, *, account_id=None) -> Suggestion` | Keeps the row as dismissed; deletes nothing. Publishes `SuggestionDismissed`. |
+| `GetSuggestion` | `execute(suggestion_id, *, account_id=None) -> Suggestion \| None` | |
+| `ListSuggestions` | `execute(page, *, chat_id=None, account_id=None) -> Page[Suggestion]` | Without `chat_id`, the queue; with it, that chat's history including decided ones. |
+
+A second decision raises `SuggestionAlreadyDecided`, which names the decision
+that was already made and when. The guarantee is enforced twice: the entity
+refuses, and the conditional write survives a race the entity cannot see.
 
 ## 11.6 AI Service Ports
 
@@ -1240,6 +1584,8 @@ Use cases orchestrate ports. Each has a single `execute()` and defines one trans
 | `RecomputeRelationship` / `RecomputeStyleProfile` | Deterministic metric refresh |
 | `SetGoal` | Creates or activates a goal, deactivating the previous one |
 | `GenerateSuggestion` | Assembles context, plans, generates, calibrates confidence, persists |
+| `AcceptSuggestion` / `DismissSuggestion` | **Implemented**, Milestone 10b. Decide about a generated suggestion. Records the decision and **acts on nothing** (§11.5.1f) |
+| `GetSuggestion` / `ListSuggestions` | **Implemented**, Milestone 10b. Read the review queue, or one chat's history |
 | `RecommendTiming` | Deterministic behaviour advice |
 | `SendMessage` | **The only send path.** Requires approved suggestion or user text |
 | `SearchMessages` / `SearchMemories` | Retrieval |

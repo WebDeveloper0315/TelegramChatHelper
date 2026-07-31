@@ -39,7 +39,7 @@ Each decision must have one of the following statuses:
 - Rejected
 
 **ADR-001 through ADR-010 are Accepted.**
-**ADR-011 through ADR-039, ADR-041 through ADR-046, and ADR-050 through ADR-053 are Proposed and require explicit approval.**
+**ADR-011 through ADR-039, ADR-041 through ADR-046, and ADR-050 through ADR-062 are Proposed and require explicit approval.**
 
 **ADR-040, ADR-047, ADR-048 and ADR-049 are Accepted and implemented.** ADR-011 through ADR-030 were approved for implementation at the close of the architecture stabilization session; ADR-031 through ADR-039 arose during implementation and await review.
 
@@ -4451,11 +4451,39 @@ Cons
 
 ---
 
+### As Implemented
+
+Slice 6 built the backfill. Decisions 1, 2, 5 and 6 held exactly as written; the
+cursor moves in the same transaction as its batch, one transaction per page,
+TDLib keeps gap recovery, and `last_error` stayed dropped.
+
+**Decision 3 is implemented as of slice 7.** `MessagesIngested` is published
+once per committed batch, from both the backfill and live synchronisation, with
+one field this decision did not name: `source`, which says whether a batch came
+from `backfill`, `catch_up` or `live`. A subscriber that treated fifty thousand
+back-filled rows like one arriving message would do fifty thousand times the
+work it meant to, and `count` alone does not distinguish them.
+
+**Decision 4's ingestion serialiser is satisfied without a queue.** Slice 7
+found that the two producers never run concurrently: a live run catches up and
+*then* drains, in one task, and a backfill is a separate command. A single
+consumer task already serialises every write, and a queue with workers in front
+of one connection (ADR-034) would be the same guarantee with more moving parts.
+The decision stands; the machinery it anticipated turned out not to be needed.
+If a second concurrent producer ever appears, this is where to add it.
+
+What the implementation *did* need, and this decision did not say, is recorded
+as ADR-054: what the cursor's key is, what it stores, and what "complete" means
+when a run stops at a configured horizon rather than at the beginning of a chat.
+
+---
+
 ### Related Decisions
 
 ADR-031 (synchronous event delivery), ADR-034 (single connection), ADR-045
 (ingestion idempotency — what makes an overlapping batch a no-op), ADR-046
-(append-only messages), ADR-001 (TDLib, and therefore who owns gap recovery).
+(append-only messages), ADR-001 (TDLib, and therefore who owns gap recovery),
+ADR-054 (the cursor's identity, value and terminating conditions).
 Corrects `DOMAIN_MODEL.md` §5.22.
 
 ---
@@ -4917,6 +4945,2033 @@ ADR-045 (idempotent message writes, which this mirrors for chats and contacts),
 ADR-052 (the operator is never a contact), ADR-051 (the port grows one slice at
 a time — this slice added `get_contact` and `list_contacts`).
 
+
+---
+
+# ADR-054
+
+## Title
+
+A Sync Cursor Is Keyed by Its Chat, Stores a Message Identifier, and Records the Horizon It Reached
+
+Status
+
+Proposed
+
+Date
+
+2026-07-30
+
+---
+
+### Context
+
+ADR-050 decided *when* a cursor is written — in the same transaction as the
+messages it accounts for — and that one page is one transaction. Implementing
+the backfill in slice 6 found three questions it did not answer, each with a
+plausible wrong answer.
+
+**What is the key?** `DATABASE.md`'s diagram gives `sync_cursors` a surrogate
+`id` with a unique `chat_id` beside it. `DOMAIN_MODEL.md` §5.22 lists both `id`
+and `chat_id` among its attributes and states the invariant "exactly one Cursor
+per Chat" separately.
+
+**What does the cursor store?** §5.22 names `oldest_synced_message_id` without
+saying why a message identifier rather than a timestamp, and the choice is not
+obvious: a timestamp is what a *user* would think in, and a horizon is expressed
+in days.
+
+**What does "complete" mean?** §8.3 gives three terminating conditions — the
+beginning of the chat, the horizon, the per-chat cap — and `backfill_complete`
+is a single boolean. A run that stopped at a 365-day horizon and a run that
+reached the beginning of a chat both set it, and a later run configured to reach
+further back cannot tell them apart.
+
+---
+
+### Decision
+
+**1. The chat identifier is the primary key.** There is exactly one cursor per
+chat, so a surrogate would be a second name for one row — the reasoning ADR-038
+applied to `user_profiles` and migration `0007` applied to `telegram_sessions`.
+`account_id` is carried beside it, not as part of the key but so the foreign key
+can be **composite**: `(account_id, chat_id) → chats(account_id, id)`, which is
+what makes a cursor for one account's chat unattachable to another's (ADR-043).
+
+This supersedes the shape in `DATABASE.md`'s diagram.
+
+**2. The cursor value is a Telegram message identifier**, not a timestamp and
+not an opaque token. Three properties decide it:
+
+- Telegram pages history **by message identifier**. A timestamp cursor would
+  need converting on every resume, through a call that can land on a different
+  message when two share a second.
+- Message identifiers are unique and totally ordered **within a chat**, which is
+  exactly one cursor's scope. Timestamps are neither, so a timestamp cursor
+  either re-reads or skips at every boundary depending on whether the comparison
+  is inclusive.
+- The identifier is ours to hold. An opaque continuation token would make
+  resumability depend on that token surviving a restart and a library upgrade,
+  neither of which Telegram promises. `getChatHistory` has no such token anyway.
+
+**3. Both ends of the range are stored, and either both are set or neither is.**
+`newest_synced_message_id` is established by the first batch and never lowered.
+It is not read by this slice, and it is stored anyway because it records a
+**historical fact that cannot be recomputed**: what the top of the stored range
+was when we synced. Deferring it would mean a later migration plus a value only
+Telegram could supply, and only if the chat had not moved on. A check constraint
+refuses a cursor with one end and not the other, because a floor with no ceiling
+describes a range whose extent nobody can state.
+
+**4. `backfill_complete` is stored beside `backfill_horizon`, and they are read
+together.** "Complete" means *complete for that horizon*. A run configured to
+reach further back than its predecessor reopens the cursor and continues from
+the same floor; everything above it is already stored. A run configured to reach
+*less* far back changes nothing and deletes nothing.
+
+**5. `consecutive_failures` is not implemented.** It exists to drive exponential
+backoff and, past a threshold, to disable a chat and raise a Notification.
+Neither exists, so the counter would be written and never consulted. Unlike
+`newest_synced_message_id` it records nothing historical — it starts at zero
+whenever it is added — so deferring it costs a migration and nothing else.
+
+**6. The per-chat cap is not implemented; the horizon is.** `PROJECT_SPEC.md`
+§4.1 names both. The cap needs a count of stored messages per chat, which needs
+a repository method and an index that should be chosen by the query using it
+(`DATABASE.md` §20). The horizon already bounds every run, and `--max-batches`
+bounds any one of them.
+
+**7. The batch size is `telegram.backfill_batch_size`, default 100.** Aligned
+with TDLib's practical history page size, so one batch is one round trip rather
+than a fraction of one. At the documented per-chat cap that is roughly 500 short
+transactions rather than one long one. **Two measurements would justify changing
+it**, and neither can be taken yet: the p99 duration of a backfill transaction
+against the p95 latency a UI read tolerates while one is running, and the share
+of a batch's wall-clock spent in `getChatHistory` rather than in SQLite. If the
+first is too high the number goes down; if the second dominates, it goes up.
+
+---
+
+### Alternatives Considered
+
+**A surrogate key with a unique `chat_id`.** What the diagram specified. It buys
+nothing: no child table references a cursor, so there is no foreign key that a
+narrower key would simplify, and the unique index would be the real key with an
+integer beside it.
+
+**A cursor per account rather than per chat.** Smaller, and wrong: chats are
+backfilled independently and at different depths, so one bookmark could only
+record the least-advanced of them.
+
+**A cursor per account and source.** Anticipates a second source of history.
+There is one, and a key shaped for a second would be a guess about what
+distinguishes them.
+
+**A timestamp cursor.** Reads naturally next to a horizon expressed in days.
+Rejected on the three properties above; the horizon is a *filter* applied to
+fetched messages, which is a different job from a cursor and needs no ordering
+guarantee.
+
+**Advancing the cursor after the commit.** One line simpler. It is also the
+single defect this whole slice exists to prevent: a crash between the two leaves
+messages stored and the bookmark behind them, and the next run re-reads a range
+it already has. Harmless here only because writes are idempotent — and relying
+on that would make idempotency load-bearing for correctness rather than for
+efficiency.
+
+**Advancing the cursor before persistence.** Fails in the direction that loses
+data: a crash leaves the bookmark past messages nobody stored, and the next run
+skips them permanently.
+
+**One transaction for the whole backfill.** Considered and rejected in ADR-050;
+implementation confirmed it, because the loop holds the connection across a
+network call to Telegram between every page.
+
+**A single `backfill_complete` with no horizon.** Would make raising the
+configured horizon a no-op that looks like success, which is the worst kind.
+
+---
+
+### Consequences
+
+**Positive**
+
+- Resumability needed no repair logic and no reconciliation pass. It is a
+  property of the transaction boundary, and the test that proves it throws an
+  exception one statement before the commit.
+- The cursor cannot describe a range it does not have: the check constraint and
+  the entity both refuse one end without the other.
+- Raising the horizon resumes rather than restarts.
+- Migration `0008` adds one table and no index beyond its key, because the only
+  query is by that key.
+
+**Negative**
+
+- `newest_synced_message_id` is written and not yet read. Justified in decision
+  3, and it is one column.
+- The backfill is unbounded in count. A chat with 200 000 messages inside the
+  horizon fetches all of them, one batch at a time. `--max-batches` is the
+  manual bound until the cap arrives.
+- A cursor per chat means a run over an account with many chats is a loop of
+  loops, and there is no scheduler ordering it. `sync history` takes chats in
+  listing order.
+
+---
+
+### Related Decisions
+
+ADR-050 (when the cursor is written, and one page per transaction — this
+completes it), ADR-034 (one transaction at a time, which is why a batch is
+bounded), ADR-038 (one row per parent means the parent's key is the key),
+ADR-043 (composite ownership), ADR-045 (idempotent message writes, which make a
+re-read cheap rather than wrong), ADR-053 (synchronisation never overrules the
+operator — a backfill refuses a chat with `sync_enabled` off).
+Supersedes the `sync_cursors` shape in `DATABASE.md` §3.
+
+
+---
+
+# ADR-055
+
+## Title
+
+Live Updates Are Dispatched by the One Receive Loop, Buffered from Connect, and Consumed Serially
+
+Status
+
+Proposed
+
+Date
+
+2026-07-30
+
+---
+
+### Context
+
+Slice 3 established that **one dispatch loop is the sole consumer of
+`TdjsonClient.receive()`** (ADR-051), because the queue holds one item per
+update and a second consumer would split the stream rather than duplicate it.
+Slice 7 has to deliver those updates to the application without breaking that.
+
+Four questions had to be answered, and each has a plausible wrong answer.
+
+**Where does dispatch belong?** The gateway already owns the loop. But
+`API.md` §10 constraint 1 says the gateway never writes to the database, so it
+cannot be what ingests.
+
+**What is the start-up order, and why can it not lose an update?** A backfill
+walks *downwards* from the oldest stored message. Anything arriving while it
+runs is above the top of the stored range, so backfill will never fetch it. If
+the update consumer starts after the backfill, that window is a permanent hole.
+
+**How much concurrency?** ADR-034 permits one transaction at a time for the
+whole application.
+
+**What happens to an update kind nothing consumes?** TDLib has hundreds and adds
+more with every release.
+
+---
+
+### Decision
+
+**1. The dispatch loop feeds a queue; `updates()` drains it.** The gateway maps
+`updateNewMessage` into a `NewMessage` DTO and offers it to a bounded
+`asyncio.Queue`; `updates()` is an async iterator over that queue. There is
+still exactly one consumer of `client.receive()`, and the architectural test
+that asserts it is unchanged.
+
+Ingestion belongs to an **application use case**, `SyncLive`, which consumes
+`updates()` and writes. The gateway emits; the application persists. That split
+is what lets live synchronisation be tested against a fake gateway and a real
+database, exactly as the backfill is.
+
+**2. The queue starts filling at `connect()`, before anything consumes it.**
+This is the whole answer to "why can the ordering not lose an update". The order
+is: authenticate → connect (**the queue begins filling here**) → sync chats →
+back-fill → catch up → drain. Whatever arrives during the middle three steps is
+already held and is delivered the moment the drain begins.
+
+**3. A live run catches up before it drains.** The queue covers a *running*
+process; it cannot cover one that was not running. So a live run first pages
+forward from `newest_synced_message_id` until it meets the stored range. This is
+the reader that field was recorded for (ADR-054), and without it a restart would
+leave a permanent hole between the last run's newest message and the first
+update the new run happens to see.
+
+**4. Updates are processed serially, one transaction each.** Per-chat or pooled
+concurrency would contend for the one connection ADR-034 permits and buy nothing
+but nondeterministic ordering. Correctness over throughput, as the goal says.
+
+**5. An unknown update kind is counted and dropped; the loop continues.** So is
+a `updateNewMessage` whose payload this version cannot map. A TDLib release that
+adds a kind must not be able to stop the loop, because a stopped loop leaves
+every waiter hanging on a state that can no longer change.
+
+**6. Backpressure, not loss, while running.** A full queue stops the dispatch
+loop, which stops draining `client.receive()`, whose own bounded queue fills,
+which stops the receive thread, which leaves TDLib holding the backlog (§7.1).
+Nothing is dropped anywhere along that chain.
+
+**7. During shutdown, queued updates are dropped and counted.** `disconnect()`
+sets a closing flag first, after which the dispatch loop drops rather than waits
+— a loop blocked on a queue nobody will drain again is a shutdown that hangs.
+What is lost is bounded by the queue and recovered by the next run's catch-up.
+
+**8. Shutdown order lives at the composition root.** `Container.run_live_sync`
+cancels the consumer, lets its in-flight transaction roll back through the unit
+of work's own exit path, and only then lets the caller close the gateway and the
+database. It is there rather than in a use case because joining an
+infrastructure supervisor to an application use case is what a composition root
+is *for*, and an architectural test refuses the alternative.
+
+**9. `MessagesIngested` is published after the commit, never inside it.** A
+handler observing a fact that then rolled back would be acting on something that
+never happened. A process that dies between the commit and the publication keeps
+the messages and loses the event, which is the right way round: the `EventBus`
+is explicitly neither durable nor transactional (contract points 4 and 6), and
+anything that must survive is a database write.
+
+---
+
+### Alternatives Considered
+
+**A second consumer of `client.receive()` for updates.** The obvious shape, and
+wrong for the reason ADR-051 already gave: the queue holds one item per update,
+so two consumers take turns and each silently misses what the other took.
+
+**The gateway writing to the database.** Removes a hop. Rejected: it breaks
+`API.md` §10 constraint 1, and it would make live synchronisation testable only
+against a real TDLib.
+
+**A dedicated dispatcher class between the gateway and the use case.** A third
+component to route one update kind to one consumer. It would be an abstraction
+over a single `if`.
+
+**Draining updates before the backfill, or instead of a catch-up.** Draining
+first would work for a running process and still leave the restart hole; the
+catch-up is what closes it, and it is needed either way.
+
+**An unbounded update queue.** No backpressure to design. Rejected: a consumer
+that stops turns memory into the failure mode, and the failure appears far from
+its cause.
+
+**Dropping the oldest update when the queue is full.** Bounded memory and
+silent loss, which is the combination this project avoids everywhere else.
+
+**Per-chat parallelism.** Genuinely appealing — different chats are independent.
+Rejected on ADR-034: one connection means the transactions serialise anyway, so
+the only thing gained is a nondeterministic order to reason about.
+
+**Failing the run on an unknown update.** Would surface TDLib drift immediately.
+It would also mean a Telegram feature release could stop the application, which
+is a far worse failure than an uncounted update.
+
+**Restarting the consumer on any failure, forever.** Rejected: a permanently
+broken consumer becomes an endless log. It restarts a bounded number of times
+(`telegram.live_max_restarts`, default 5) and then reports the failure.
+
+---
+
+### Consequences
+
+**Positive**
+
+- One ingestion path. Backfill, catch-up and live updates all go through
+  `IngestMessages`, so the idempotency rule has one home and a duplicate update
+  costs nothing.
+- Ordering is deterministic and testable: arrival order in, arrival order out,
+  asserted against both gateway implementations.
+- A restart loses nothing that Telegram still has. The catch-up closes the gap
+  the queue cannot.
+- Shutdown is one method and one order, and cancelling mid-update leaves the
+  database consistent because the transaction boundary already guaranteed it.
+
+**Negative**
+
+- A slow consumer eventually stalls the dispatch loop, which delays *state*
+  reporting as well as messages. Acceptable while nothing waits on a state
+  change during a live run; a metric on queue depth (§10.3) is the warning.
+- `sync status` reads stored state only. A live run in another process is not
+  observable without a control channel between processes, which nothing needs
+  yet.
+- The catch-up is bounded (`telegram.catch_up_pages`, default 20). A chat that
+  received more than that while the process was down needs a backfill re-run,
+  and the report says so rather than walking forward indefinitely.
+- Exactly-once persistence is a property of the *database*, not of the stream.
+  An update delivered twice is stored once because of the partial unique index
+  (ADR-045); the stream itself promises at-least-once.
+
+---
+
+### Related Decisions
+
+ADR-051 (one consumer of the receive stream — this extends it rather than
+contradicting it), ADR-048 (the receive thread), ADR-050 (batch boundaries and
+event granularity — decisions 3 and 4 are settled here), ADR-054 (the cursor
+`newest_synced_message_id` the catch-up reads), ADR-034 (one transaction at a
+time, which is why processing is serial), ADR-031 (synchronous event delivery),
+ADR-045 (idempotent writes, which is what makes a duplicate update free),
+ADR-011 (the dependency rule, which decides where the supervisor is joined).
+
+
+---
+
+# ADR-056
+
+## Title
+
+A Conversation Is a Time Range with a Matched Identity, and Membership Is Not Stored
+
+Status
+
+Proposed
+
+Date
+
+2026-07-30
+
+---
+
+### Context
+
+`DOMAIN_MODEL.md` §5.7 defines a Conversation and gives the segmentation rule —
+a gap of `conversation_gap_minutes`, a cap of `conversation_max_messages` — and
+states that "re-segmenting a Chat from its messages yields identical
+boundaries". Implementing that found four questions it does not answer, and one
+place where it contradicts a decision made since.
+
+**How does a message know which conversation it is in?** The obvious answer is
+a `conversation_id` column on `messages`. But `Message` is append-only and
+`MessageRepository` has no update path *at all* — ADR-046 made that structural
+rather than conventional, on the grounds that a guarantee which exists only as
+a convention is one somebody eventually breaks.
+
+**What keeps an identity stable?** Segmentation recomputes boundaries from
+scratch. If each computed segment simply took a fresh identifier, every rebuild
+would replace every conversation in the chat with an identical-looking new one,
+and anything that had referenced one would point at a row that no longer exists.
+Milestone 8's summaries, plans and analyses all attach to a Conversation.
+
+**What does `is_open` mean once segmentation is a re-derivation?** §5.7 gives
+Conversation an `is_open` flag and `ended_at` that is "null while open", and
+`DATABASE.md` gives a partial unique index enforcing at most one open
+conversation per chat. But a conversation derived from messages that already
+exist always has a last one.
+
+**How much of a chat does a new message force to be recomputed?** Everything,
+or something smaller that is still provably correct.
+
+---
+
+### Decision
+
+**1. Membership is the time range. Messages carry no `conversation_id`, and
+there is no join table.** A message belongs to the conversation whose
+`[started_at, ended_at]` contains its `sent_at`.
+
+Two things make that exact rather than approximate. Conversations within a chat
+do not overlap — enforced by a unique `(account_id, chat_id, started_at)`,
+because each is a contiguous run and two cannot begin at the same instant. And a
+boundary requires a gap, so no instant falls inside two of them.
+
+It also keeps a rebuild cheap: fifty thousand messages produce a few hundred
+conversation rows, and only those are written. A stored link would mean
+rewriting fifty thousand rows to say what a handful of timestamps already say.
+
+**2. Identity is matched, not generated.** Each computed segment claims **the
+stored conversation that owns the plurality of its messages**; a stored
+conversation may be claimed by at most one segment, the earliest in order; ties
+break to the lowest identifier. A segment that claims nothing gets a new
+conversation; a stored conversation nothing claimed is deleted.
+
+Both tie-breaks exist to make the result a function of the arguments alone.
+Without them a rebuild could produce different identities on two runs over the
+same data, which is the failure the whole rule exists to prevent.
+
+The rule is four lines and gets the four interesting cases right: **extension**
+(the last conversation keeps its identity and grows), **a new episode** (created;
+earlier ones untouched), **merge** (the larger contributor's identity survives,
+the other is deleted), **split** (the earlier half keeps the identity, the later
+is new — because a stored conversation can only be claimed once).
+
+**3. `is_open` is derived, not stored, and `ended_at` is not nullable.** Whether
+a conversation may still grow depends on how long ago it ended — on *now*. A
+stored flag would be true when written and wrong an hour later, with no job to
+correct it. `Conversation.is_open_at(now, gap)` asks the question against a
+supplied instant.
+
+This supersedes `DOMAIN_MODEL.md` §5.7's `is_open` attribute and
+`DATABASE.md`'s partial unique index on it. The unique
+`(account_id, chat_id, started_at)` replaces that index and enforces something
+stronger: non-overlap, which is what membership-by-range depends on.
+
+**4. Re-segmentation is windowed.** A boundary depends only on the gap to the
+message before it, so a new message can change nothing earlier than the
+conversation it follows. A pass therefore re-segments from the start of the
+conversation returned by `latest_before(chat, since)` and leaves everything
+before it alone. Widening to that conversation's *start* rather than its end is
+necessary: a window opening mid-conversation would see its first message with
+nothing before it, call it a boundary, and split an episode at whatever instant
+the caller happened to name.
+
+**5. What is stored, and what is not.** Stored: `started_at`, `ended_at`,
+`message_count`. The first two are the membership rule and the listing order;
+the third is what the cap rule and the listing need, and counting rows per
+conversation for a listing is a query that would otherwise need its own index.
+
+Not stored: `is_open` (decision 3); `initiated_by`, which is recomputable from
+the first message's sender and which nothing reads until relationship metrics;
+`dominant_language`, which needs language detection this slice may not
+introduce; `first_message_id` and `last_message_id`, which the two timestamps
+already locate.
+
+**6. The rule stays the documented one — an inactivity gap plus a message cap.**
+Deterministic because it reads only `sent_at` and a count, both immutable once
+stored, over a total order — `(sent_at, telegram_message_id, id)` — whose every
+component is immutable too.
+
+**7. Whoever commits, announces.** `IngestMessages.execute` publishes
+`MessagesIngested`; `ingest_within` does not, because its caller owns the
+commit. Segmentation subscribes at the composition root, so every path that
+stores messages segments them the same way and neither component imports the
+other.
+
+---
+
+### Alternatives Considered
+
+**A `conversation_id` column on `messages`.** The conventional design, and it
+would need an update path on an append-only aggregate — reopening exactly what
+ADR-046 closed. It would also make every rebuild an O(messages) write.
+
+**A `conversation_messages` join table.** Keeps messages immutable, at the cost
+of storing a fact two timestamps already imply and of a second thing for the
+segmentation transaction to get wrong. Same O(messages) rebuild cost.
+
+**Identity from the first message.** Simple, and it fails on the case backfill
+produces constantly: a message arriving *before* the current first one moves the
+key, so an extended conversation looks like a new one and the old is deleted.
+Plurality matching handles that and costs a `Counter`.
+
+**Identity from `(chat_id, started_at)` as the primary key.** Same failure, plus
+a primary key that changes.
+
+**Rebuilding the whole chat on every ingest.** Correct and simple. Rejected: a
+live message would recompute fifty thousand messages' worth of boundaries, and
+the guarantee that earlier conversations are untouched would hold only because
+the answer happened to be the same rather than because nothing looked at them.
+
+**Calendar-day segmentation.** Cuts an evening exchange at midnight, and needs a
+timezone Telegram does not report.
+
+**Sender-change segmentation.** Turns an ordinary back-and-forth into dozens of
+conversations.
+
+**Telegram reply chains.** `Message` has no `reply_to_message_id` — deliberately
+— most messages are not replies, and a reply to a month-old message would splice
+two episodes a person would never call one.
+
+---
+
+### Consequences
+
+**Positive**
+
+- Segmentation is a pure function plus a matching rule, and both are testable
+  without a database. "Running it twice changes nothing" is a test, not a hope.
+- A rebuild writes conversation rows only, so it stays cheap however long the
+  chat is.
+- `Message` keeps its append-only discipline intact. Nothing about a stored
+  message changes when it is segmented.
+- Non-overlap is a unique index rather than a rule anybody has to remember.
+
+**Negative**
+
+- A conversation describes the messages that existed when segmentation last ran.
+  `message_count` and `ended_at` go stale if messages are ingested with
+  `conversation.segment_on_ingest` off, and `conversation rebuild` is the fix.
+- Reading a conversation's messages is a range query rather than an indexed
+  lookup by key. It is served by the index the history listing already needed,
+  so the cost is a scan bounded by the conversation's own length.
+- Changing `gap_minutes` or `max_messages` changes boundaries for every chat on
+  the next rebuild, and a summary attached to an old boundary would be attached
+  to a conversation that no longer means the same thing. Milestone 8 must decide
+  what a boundary change does to what hangs off it; this decision only makes the
+  change visible rather than silent.
+- The identity match is a plurality vote, which is exact for extension and
+  creation and a *judgement* for merge and split. Two conversations merged
+  50/50 give the identity to the lower identifier. That is deterministic, and it
+  is a choice rather than a truth.
+
+---
+
+### Related Decisions
+
+ADR-046 (messages are append-only — the reason membership is not stored on
+them), ADR-043 (composite ownership, applied to `conversations`), ADR-038 (one
+row per parent means the parent's key is the key — *not* applied here, because a
+chat has many conversations), ADR-050 (one event per committed batch, which is
+what segmentation subscribes to), ADR-031 (synchronous delivery, which is why a
+failing subscriber cannot break ingestion), ADR-034 (one transaction at a time,
+which is why a pass is one unit of work).
+Supersedes `DOMAIN_MODEL.md` §5.7's `is_open` and `DATABASE.md`'s partial unique
+index on it.
+
+
+---
+
+# ADR-057
+
+## Title
+
+One Provider Port, One Execution Use Case, and an AI Call That Records a Digest Rather Than an Answer
+
+Status
+
+Proposed
+
+Date
+
+2026-07-30
+
+---
+
+### Context
+
+Everything after this milestone -- memory extraction, summaries, reply
+suggestion, emotion assessment -- invokes a model. Each of them needs the same
+five things: the privacy gate checked, a timeout applied, tokens and cost
+counted, failures normalised, and a record written. Built once per feature,
+those five would be built five times and would drift, and the one that drifted
+would be the privacy gate.
+
+`DOMAIN_MODEL.md` §5.24 describes an AI Provider as a *stored configuration
+record* with a `capabilities` set discovered by `ai check`, `is_default_for`
+routing and a `priority`. §5.25 describes an AI Call and says it **never stores
+prompt or response content**. `PROJECT_SPEC.md` §4.2 requires every AI feature
+to degrade rather than break when no provider is configured. ADR-024 makes the
+data boundary a per-chat permission. ADR-029 §6 requires cost and latency to be
+measurable from the first milestone.
+
+Implementing that raised five questions those documents do not settle.
+
+**How many ports?** The obvious decomposition is one per capability --
+completion, embedding, classification -- because that is how the vendors'
+own SDKs are shaped.
+
+**What is a provider, in the code?** §5.24 reads as a row in a table with a
+priority and a routing policy. Nothing in this milestone routes anything.
+
+**How is deterministic replay possible if nothing about the response is
+stored?** Two runs of the same prompt at temperature 0 should be comparable,
+and §5.25 forbids keeping what would make them comparable in the obvious way.
+
+**What is the fake provider, and where does it live?** Tests need a provider
+that answers without a network. So does a fresh installation with no API key.
+
+**What may the execution use case interpret?** A use case that parsed what came
+back would put the shape of every future task inside the one component every
+future task shares.
+
+---
+
+### Decision
+
+**1. One port, `AiProvider`, with two members: `model` and `generate`.** A
+capability is a property of the model, not a class of client. Anthropic's
+Messages API answers a completion, a classification and a structured extraction
+through one endpoint; splitting the port would mean three adapters over one
+endpoint, and a caller choosing between them by guessing which one the vendor
+implemented.
+
+The port declares what this slice's caller needs and nothing else (ADR-051).
+When embeddings arrive they will need a second port, because an embedding is
+not text and no honest signature covers both -- and that port will be declared
+by the slice that has a caller for it.
+
+**2. `AiModel` is a value object, not a stored `AiProvider` record.** What a
+call needs to know is which model answered and what using it implied. That is
+data, not an aggregate: it has no lifecycle, nothing transitions it, and there
+is nothing to look it up by. §5.24's table -- `capabilities`, `is_default_for`,
+`priority`, `is_enabled` -- is a *routing* record, and routing is a decision for
+the milestone that has two providers to route between. Configuration names one
+model; the container builds it.
+
+The `data_boundary` is derived from the **vendor**, not read from
+configuration. A cloud model is external however a settings file describes it,
+and a boundary a user could edit would put the privacy guarantee in a file.
+
+**3. `ExecuteAiTask` is the only place a model is invoked, and it interprets
+nothing.** It resolves the account, reads the chat's `ai_processing_mode`,
+refuses or proceeds, applies the timeout, calls the provider, and records what
+happened. It returns the response text verbatim. No parsing, no schema, no
+repair. Those belong to the task that knows what shape it asked for.
+
+The gate is a table, and the fourth row is the one worth stating:
+
+| chat mode | local model | external model |
+| --- | --- | --- |
+| `disabled` | refused | refused |
+| `local_only` | allowed | refused |
+| `cloud_allowed` | allowed | allowed |
+| *no chat named* | allowed | **refused** |
+
+Content that names no chat carries no permission, and in a local-first
+application the absence of a permission is not a permission.
+
+**4. A refusal is recorded, not merely raised.** "Why did nothing happen"
+deserves an answer, and an audit that only contains the calls that were allowed
+cannot show that a call was blocked. The refusal record spends no tokens and
+carries no finish reason; the raised error names the record's identifier.
+
+**5. `AiCall` is append-only, and the repository has no `update` and no
+`delete`.** The same structural discipline as `Message` (ADR-046): an audit
+record that nothing can edit needs no rule saying not to edit it. The cost is
+computed by `AiCall.record` from the model's rates rather than supplied, so no
+caller can write a number the rates do not support.
+
+**6. The response is stored as a truncated SHA-256 digest. The text itself is
+stored only when `ai.store_responses` is on, which the production profile
+refuses.** This resolves the tension between deterministic replay and §5.25's
+prohibition, and it resolves it in the direction §5.25 chose: what replay
+actually needs is *did these two runs produce the same answer*, and a digest
+answers that without the answer being readable. Storing the text is a
+diagnostic, arranged exactly as `logging.diagnostic_mode` already is -- opt-in,
+refused by the production profile, and visible in configuration rather than
+implied.
+
+The prompt is never stored, under any setting. It is reconstructible from the
+prompt version and the message rows, and storing it would duplicate message
+content into a table with a different retention class.
+
+**7. `PromptVersion` is required on every call, from the first one.** A prompt
+version costs one column now. Without it, the first time an output changes
+there is no way to tell whether the model changed or the prompt did -- and that
+question is asked *after* the change, about data that was already being
+collected when it happened. It is not a field that can be added retroactively.
+
+**8. The scripted provider is shipped source, not a test fixture.** It lives in
+`infrastructure/ai/scripted.py` and the container builds it when
+`ai.vendor = fake`, which is the default. Two consequences, both intended: a
+fresh installation has a working AI boundary that costs nothing and reaches no
+network, and the provider the tests exercise is the provider that ships. It is
+deterministic by construction -- answers and failures are queued, latency is a
+parameter, token counts are `len(text) // 4`. Nothing in it samples randomness.
+
+**9. Costs are stored as text, not as `REAL`.** Money in fractions of a cent,
+accumulated over many rows, is exactly where binary floating point drifts.
+`Decimal` in the domain, `String` in the column.
+
+**10. `ai_calls.chat_id` is part of a composite foreign key that cascades.**
+Composite so that a call in one account cannot name another account's chat
+(ADR-043). Cascading because a record derived from a chat the user deleted is
+residue of that chat, and every other child of `chats` already cascades for
+that reason -- and because SET NULL is not available on a composite key at all:
+it nulls every column in the key, including the NOT NULL `account_id`.
+
+**11. The real adapter takes an injected `HttpTransport`.** A one-method seam
+with a stdlib `urllib` implementation. It adds no dependency, and it lets the
+contract suite exercise the real adapter in full -- body, headers, parsing, stop
+reason, usage -- without opening a socket.
+
+---
+
+### Alternatives Considered
+
+**A port per capability (`CompletionProvider`, `EmbeddingProvider`, ...).**
+Rejected for this slice. It is the shape the SDKs suggest, not the shape the
+callers need, and there is exactly one caller. It would also force a decision
+now about a capability nobody has written a use case for.
+
+**A stored `ai_providers` table, as §5.24 describes.** Rejected until there are
+two providers to choose between. A routing table with one row is a routing
+table that has never been exercised, and `is_default_for` cannot be designed
+honestly without knowing what it is choosing between.
+
+**Storing the full response.** Rejected as the default. It reintroduces message
+content -- a model's summary of a conversation is conversation content -- into
+a table whose retention class is logs rather than conversations. Available as a
+diagnostic because reproducing a bad extraction without it is guesswork.
+
+**Storing nothing about the response.** Rejected because deterministic replay
+was a stated objective of this slice and nothing would satisfy it. The digest
+is the smallest thing that does.
+
+**Letting `ExecuteAiTask` parse structured output.** Rejected. Every task's
+schema would land in the one component every task shares, and the first
+malformed response would make the shared component the thing that has to
+change.
+
+**A `retry_count` field and retry inside the use case.** Rejected for now.
+§5.25 lists it; nothing retries yet, and a column nobody writes is a column
+nobody keeps correct. Retry is a decision for the slice that has a task worth
+retrying, and it will need a policy -- which failures, how many, with what
+backoff -- that this slice has no evidence to choose.
+
+**Storing the model's price list alongside each call.** Rejected. The cost is
+stored, so the rates that produced it have no reader. Repricing the vendor's
+catalogue still cannot change a past call, because what it cost was written
+down at the time.
+
+**Adding `httpx`.** Rejected. The transport seam gets the same testability with
+no new dependency, and a dependency added for one adapter is one the whole
+application then carries.
+
+---
+
+### Consequences
+
+**Positive**
+
+- Every later AI feature gets the privacy gate, the timeout, the cost
+  accounting and the audit record by calling one use case, rather than by
+  remembering four things.
+- The privacy gate exists in one place, and its fourth row -- no chat, no cloud
+  -- is a default rather than a check somebody has to add.
+- A fresh installation has a working AI boundary with no key, no network and no
+  cost, and the provider it uses is the one the tests exercise.
+- The real adapter is fully tested without a network, so the first real call is
+  not the first time its request body is exercised.
+- Prompt versions exist from the first call, which is the only time they can be
+  introduced for free.
+- Cost is exact. A spend total is a sum of `Decimal`, not of floats.
+
+**Negative**
+
+- Deleting a chat removes its calls from the spend history. That is the price
+  of not keeping residue of a deleted chat, and it is deliberate.
+- Deterministic replay compares digests, not answers. It can show that two runs
+  differ; it cannot show *how*, without `ai.store_responses` -- which is not
+  available in production.
+- One port means one shape. An embedding model will need a second port, and the
+  slice that adds it will have to decide whether `AiCall` records both.
+- Nothing routes. Configuring a second model means changing configuration, not
+  choosing per task, until the milestone that needs routing arrives.
+- `ExecuteAiTask` returns text. Each caller parses its own output, and the
+  first two callers may well parse it the same way before a shared helper is
+  justified.
+
+---
+
+### Related Decisions
+
+ADR-024 (per-chat AI processing mode — this is the code that reads it),
+ADR-046 (append-only aggregates, applied to `AiCall`), ADR-043 (composite
+ownership, applied to `ai_calls`), ADR-021 (secrets are referenced by name,
+never stored — `api_key_ref`), ADR-051 (ports are declared one slice at a time,
+which is why there is one), ADR-034 (one transaction at a time, which is why
+the record is its own unit of work), ADR-013 (asyncio, which is why the timeout
+is `asyncio.timeout`), ADR-029 §6 (cost and latency measurable from the first
+milestone).
+Refines `DOMAIN_MODEL.md` §5.24 (an `AiModel` value object now, a routing record
+later) and §5.25 (the outcome set, and the digest).
+
+---
+
+# ADR-058
+
+## Title
+
+The Model Proposes and the User Decides: Versioned Prompts, Validated Output, and Immutable Proposals
+
+Status
+
+Proposed
+
+Date
+
+2026-07-30
+
+---
+
+### Context
+
+ADR-057 built the boundary through which a model is reached. This is the first
+thing to go through it, and it is the one that decides what "AI-assisted" means
+for the rest of the project: whether the model writes to the system's memory, or
+suggests things a person writes.
+
+`DOMAIN_MODEL.md` §5.10 already describes a Memory Proposal, and ADR-019
+already says proposals exist to keep hallucinated or injected content out of
+permanent memory. `PROMPTS.md` specifies a prompt registry, front matter and
+untrusted-content delimiters. `ADR-020` requires structured output with one
+repair attempt. None of those had been implemented, and implementing them raised
+five questions the documents do not settle.
+
+**What may a model decide?** The obvious reading of "extract memories" is that
+the model returns memories. But a returned memory has an identifier, a status
+and a provenance, and every one of those is a thing the model could get wrong in
+a way nobody would notice.
+
+**Where does the boundary between validation and interpretation fall?** A schema
+can say a confidence is a number between zero and one. Whether 0.4 is worth a
+person's attention is a different kind of statement, and putting both in one
+component means the component changes whenever either does.
+
+**How is an extracted fact checked at all?** Re-reading the conversation is the
+only real check, and doing that for every proposal defeats the purpose.
+
+**What does one repair attempt cost, and what is it worth?** A second model call
+per extraction, and a second AI call row, on every malformed answer.
+
+**Which transactions does a model call sit inside?** ADR-034 permits one
+transaction at a time for the whole application; a model call takes seconds.
+
+---
+
+### Decision
+
+**1. Extraction produces `MemoryProposal`s, never `Memory`s.** Nothing this
+milestone writes is believed. A proposal enters a review queue as `pending`, and
+there is no code path in this slice that changes that -- Slice 9c adds the one
+transition.
+
+The alternative -- writing what the model extracted and letting the user correct
+it -- fails in a way that is hard to recover from. A wrong memory is not merely
+wrong: it is *retrieved*, put into later prompts and used to justify later
+suggestions, so an error propagates into work the user never connected to the
+extraction that caused it. By then "why does it think that" has no visible
+answer. Proposals invert the default: the worst a bad extraction can do is waste
+a moment of review.
+
+**2. The model supplies four fields and nothing else: category, value,
+confidence, evidence.** The schema sets `additionalProperties: false`, so an
+answer carrying an `id` or a `status` fails validation rather than being
+partially trusted. Identifier, timestamp, conversation, AI call, prompt version
+and status are all assigned by the application.
+
+That is not defensive coding for its own sake. A model that could name an
+identifier could name one already in use, and so overwrite a proposal a person
+had already read; one that could set a status could approve itself.
+
+**3. Prompts are versioned files inside the package, indexed by a registry.**
+No prompt text in Python source (ADR-008). Discovery is by `_registry.yaml`,
+never by globbing a directory: a loader that globbed would silently lose a
+prompt on rename and silently gain one on a stray file, and both surface as a
+model answering the wrong question.
+
+The registry names *which prompts exist* and *which schema each is bound to*.
+The **version lives only in the prompt's own front matter** -- `PROMPTS.md` §3
+puts it in both places, and two places recording a version is one too many for
+them to agree.
+
+Everything is validated when the registry loads, at startup: the file exists,
+its front matter parses, its declared id matches its registry key, it declares a
+version, its declared inputs match the variables its body actually uses in
+**both** directions, and its schema exists, parses and uses only keywords the
+validator implements. A prompt discovered to be broken while a user waits for a
+suggestion is the same defect found at the worst moment (ADR-026 §7).
+
+**4. Untrusted content is delimited and neutralised by the prompt model, not by
+the prompt file.** A template that had to remember the delimiters is a template
+that can forget them. Any run of three or more angle brackets in untrusted text
+is collapsed to two before insertion, so no message can forge a boundary and
+continue as though it were the prompt. Previously-stored proposal values are
+treated as untrusted too: they are model output derived from conversation
+content that nobody has reviewed.
+
+This is a mitigation, not a solution. The architectural answer is that a
+successful injection reaches nothing valuable: the output is schema-validated,
+becomes a proposal rather than a memory, and is shown to a person before it
+counts.
+
+**5. Structured output is validated before anything interprets it, by a
+validator with no business rules.** It checks required fields, types,
+enumerations, numeric ranges and lengths. It does not know what a confidence
+threshold is, what "already proposed" means, or what a conversation is. That
+separation is what lets the same validator serve summaries and reply
+suggestions later without acquiring an argument for each.
+
+**6. The validator implements a deliberately small subset of JSON Schema, and
+refuses any schema using more.** `require_supported` rejects an unknown keyword
+when the schema is *loaded*, so "unsupported" can never mean "silently ignored"
+-- which is the failure that would make a hand-written validator worse than no
+validator. Adding a dependency was the alternative; this is one file, exercised
+by the tests that matter, and the escape hatch is a startup error rather than a
+wrong answer.
+
+**7. Exactly one repair attempt.** A model that answered with prose, or with
+JSON missing a field, is usually right about the content and wrong about the
+format, and telling it precisely what was wrong usually fixes it. Once. A second
+repair is a different failure -- the model has now been told twice -- and costs
+another call to arrive in the same place. The repair returns the model's own
+answer to it, not the original request, and forbids adding facts: a repair that
+changed the content would be a second, unreviewed extraction.
+
+**8. Three deterministic filters run after validation, and the first is the one
+that matters.**
+
+* **Ungrounded evidence.** The quotation must appear in the text the model was
+  shown, compared with whitespace collapsed and case folded. This is the
+  cheapest anti-hallucination check available and it catches the failure that
+  matters most: a fluent, plausible fact about somebody that nobody ever said. A
+  model cannot quote what nobody said. Nothing more forgiving is used -- fuzzy
+  matching would start accepting nearly-right quotations, which is exactly what
+  an invented fact produces.
+* **Low confidence**, below a configured threshold. Self-reported confidence is
+  poorly calibrated (`AI_MODELS.md` §15); it is used as a coarse filter and
+  nothing more is claimed of it.
+* **Already proposed**, against what is stored *including rejected proposals*,
+  and against the batch itself.
+
+Every discard is counted in the report. A run that returned nothing and a run
+that discarded eight invented claims are very different events, and a report
+that could not tell them apart would make a broken prompt look like a quiet
+conversation.
+
+**9. Re-running extraction over a conversation is free, and a unique index makes
+it so.** `(account_id, conversation_id, category, value)` is unique. The
+application checks for duplicates before writing; the index is what makes it
+true rather than usually true, because the read and the write are different
+transactions.
+
+**10. The model call sits inside no transaction.** Read in one, call the model
+in none, write in another. Holding the single application-wide transaction
+across a call that takes seconds would stop everything else in the process,
+including the live update loop. The cost is that the world can change in
+between; what that can produce is a duplicate, which the index refuses -- so the
+worst case is a proposal that is not stored, never a proposal that is wrong.
+
+**11. A proposal is immutable, and terminal states are terminal by absence.**
+`MemoryProposalRepository` has no `update` and no `delete`; `MemoryProposal` has
+no method that returns a changed one. `accepted` and `rejected` exist in the
+enumeration and in the check constraint because Slice 9c writes them -- until
+then they cannot be reached at all, which is a stronger guarantee than a rule
+saying they must not be reached twice.
+
+Slice 9c will add exactly one transition, and it will need a `decided_at`
+column and a named method restricted to pending-to-terminal. Neither is added
+now: a column nobody writes is a column nobody keeps correct.
+
+---
+
+### Alternatives Considered
+
+**Writing memories directly, with an undo.** Rejected. Undo needs the user to
+notice, and the failure mode of a wrong memory is precisely that it is used
+quietly. It also makes every downstream feature depend on state a model wrote.
+
+**Letting the model return an identifier or a status.** Rejected; see decision
+2. The schema refuses the fields rather than the code ignoring them, so an
+attempt is a validation failure rather than a silent discard.
+
+**Taking a `jsonschema` dependency.** Reasonable, and the fallback if the subset
+proves limiting. Rejected for now because the load-time keyword check makes the
+subset safe, and because a dependency added for one validator is one the whole
+application then carries. **This is the decision most worth revisiting** -- if a
+later prompt needs `oneOf` or `$ref`, take the dependency rather than growing
+this file.
+
+**Prompts at the repository root, as `PROMPTS.md` §2 specifies.** Rejected. A
+prompt is an asset the application cannot run without, and one outside the
+package would be missing from every installation that is not a git checkout.
+Same tree, in a place that ships.
+
+**Repeating the version in the registry as well as the front matter.**
+Rejected. Two sources of truth for a version is one too many for them to agree,
+and the file's own version is the one a person edits when they change the text.
+
+**A confidence threshold inside the validator.** Rejected; see decision 5.
+Shape and worth change for different reasons.
+
+**Storing `key`, `contact_id`, `conflicts_with_memory_id` and
+`rejection_reason`** (all named by `DOMAIN_MODEL.md` §5.10). Deferred. Each
+belongs to a capability that does not exist: supersession, memories, conflict
+detection and deciding.
+
+**Retrying a malformed answer more than once.** Rejected; see decision 7.
+
+**Extracting per message rather than per conversation.** Rejected. A fact is
+often assembled across several messages ("I moved to Lisbon" / "for the new
+job"), and per-message extraction would either miss those or attribute them to
+an arbitrary one of the messages involved.
+
+---
+
+### Consequences
+
+**Positive**
+
+- Nothing a model produces can become believed state without a person. That is
+  the project's core principle made structural rather than aspirational.
+- Every proposal can be checked without re-reading the conversation, because it
+  carries the sentence it came from.
+- An extraction is reproducible: given the same conversation and the same
+  answer, the same proposals are stored, and the second run stores nothing.
+- Prompt versions are recorded on both the AI call and the proposal, so "which
+  proposals came from the prompt we changed last week" is answerable.
+- A broken prompt or schema stops the application at startup, on the machine of
+  whoever built it, rather than while a user waits.
+- The four layers -- prompt, execution, validation, interpretation -- can each
+  be replaced without touching the others.
+
+**Negative**
+
+- A malformed answer costs two model calls, both billed and both recorded.
+- The grounding check discards true facts a model paraphrased rather than
+  quoted. That is a deliberate trade: a paraphrase cannot be checked, and the
+  prompt asks explicitly for quotations.
+- The queue can grow without bound. Nothing expires proposals, and
+  `DOMAIN_MODEL.md` §5.10's ninety-day expiry is not implemented.
+- `MemoryProposalsCreated` is published with no subscriber, departing from the
+  rule the earlier slices followed. The consumer is known rather than guessed --
+  the `memory_proposals_pending` notification (§5.23) -- and the alternative is
+  a component that polls the table.
+- The JSON Schema subset is a maintenance liability. It is bounded by the
+  load-time check, but it is still a validator this project owns.
+- The shipped scripted provider cannot produce a valid extraction. Running
+  `tgassist memory extract` with the default `ai.vendor: fake` exercises the
+  whole pipeline and then honestly reports that the answer could not be read.
+
+---
+
+### Related Decisions
+
+ADR-019 (proposals keep hallucinated content out of memory -- this implements
+it), ADR-057 (the execution boundary this is built on), ADR-008 (prompts as
+files), ADR-020 (structured output and one repair), ADR-026 (registry and
+startup validation), ADR-024 (per-chat AI processing mode, inherited through
+`ExecuteAiTask`), ADR-043 (composite ownership, applied to `memory_proposals`),
+ADR-046 (append-only aggregates), ADR-034 (one transaction at a time -- the
+reason the model call sits outside them), ADR-056 (conversations, the unit
+extraction reads).
+Refines `DOMAIN_MODEL.md` §5.10 (the field set and the status set), `PROMPTS.md`
+§2 and §3 (where prompts live, and what the registry records).
+
+---
+
+# ADR-059
+
+## Title
+
+A Memory Is Not a Proposal: Application-Owned Identity, One Irreversible Decision, and No Edits
+
+Status
+
+Proposed
+
+Date
+
+2026-07-30
+
+---
+
+### Context
+
+ADR-058 built the review queue and stopped there deliberately: proposals could
+be created and read, and nothing could act on them. This completes the
+lifecycle, and in doing so it fixes three things for every later milestone —
+what a *memory* is, where its identity comes from, and what a decision about it
+means.
+
+`DOMAIN_MODEL.md` §5.9 already describes a Memory, with `key`, `provenance`,
+`importance`, `is_pinned`, decay, revisions and a five-state lifecycle. §5.10
+describes a Proposal with `approved` / `superseded` / `expired` states and an
+auto-approval rule. `PRIVACY.md` §6 and `CLAUDE.md` both require that a user can
+delete what the application remembers.
+
+Implementing the review step raised five questions those documents do not
+settle.
+
+**Where does a memory's key come from?** §5.9 makes
+`(account, contact, category, key)` unique among live memories and says that
+constraint "is what makes deduplication tractable" — but never says who chooses
+the key. The obvious source is the model that proposed the fact, and the obvious
+source is wrong.
+
+**What does "terminal" mean when the terminal state has consequences?** A
+rejection changes nothing but a status. An acceptance creates a Memory that is
+then read, quoted, and eventually acted upon.
+
+**Is a memory editable?** §5.9 says a value change creates a `MemoryRevision`,
+which presumes editing exists.
+
+**What is a fact from a group chat about?** Every memory is "about a Contact",
+and a group conversation has no single counterpart.
+
+**What happens to a memory when the conversation it came from is deleted?**
+`ai_calls` and `memory_proposals` both cascade from `chats`, so a chat deletion
+would take a memory's whole provenance with it — or the memory itself.
+
+---
+
+### Decision
+
+**1. `Memory` and `MemoryProposal` are different aggregates, in different
+tables, with different identifiers.** A proposal is what a model said; a memory
+is what a person decided to believe. Every later feature that asks "what do we
+know about this person" reads a table nothing can write to without a decision,
+and that is the whole architecture of the feature.
+
+A memory takes a **new** identifier at acceptance rather than inheriting the
+proposal's. They have different lifetimes — the proposal is a permanent record
+of an extraction, the memory can be forgotten — and one identifier for both
+would make the first indistinguishable from the second in every later
+reference.
+
+**2. The key is a deterministic normalisation of the value, derived by the
+application.** Case folded, punctuation dropped, whitespace collapsed,
+truncated to 120 characters. "Lives in Lisbon." and "lives  in lisbon" produce
+one key; the value keeps its original form for a person to read.
+
+The model never supplies it. A key is an *identity*, and identity is the one
+thing this project has consistently refused to let a model own (ADR-058 §2):
+a model that could name a key could collide with an existing memory and so
+silently prevent a true fact from being stored, or claim the identity of one
+already there.
+
+**What this buys:** storing the same fact twice is structurally impossible, so
+accepting the same fact from two overlapping conversations yields one memory.
+
+**What it does not buy, and this is the important part:** it does **not**
+detect a contradiction. "Lives in Lisbon" and "Lives in Porto" normalise to
+different keys, so both are stored. Deciding which is true is *conflict
+detection*, not deduplication, and it needs either a model or a person —
+`MemoryConflictDetector` in `DOMAIN_MODEL.md` §6 is where it belongs. This
+limitation is deliberate, and it is the price of not letting a model name the
+subject of a fact.
+
+**3. A decision is made once, and two independent things enforce it.** The
+entity refuses `decided()` on anything but a pending proposal — the check that
+can explain itself — and the repository's one update names `pending` in its
+`WHERE` clause and reports how many rows it changed — the check that survives
+two decisions racing. A check-then-write could be overtaken between the steps;
+a conditional write cannot.
+
+**There is no undo and no reopen.** Reversing an acceptance would have to decide
+what becomes of a Memory that has since been read, quoted and acted upon;
+reopening a rejection would mean a fact a person declined could appear anyway.
+Both situations are already recoverable by ordinary means — forget the memory,
+or accept the fact next time it is proposed — and neither needs a mechanism
+capable of rewriting a decision.
+
+**4. Acceptance creates exactly one Memory, in the same transaction as the
+decision.** A committed acceptance with no memory would be a fact the user
+believes they kept and cannot find; a memory with a pending proposal would be
+knowledge nobody approved.
+
+"Exactly one" is a **unique index on `memories.proposal_id`**, not a rule the
+use case keeps. Rules can be forgotten by the next caller.
+
+**5. A Memory is immutable and has no edit method.** Correcting one means
+forgetting it and accepting a new proposal. An edit in place would keep the
+identifier and the provenance while changing the fact, so the AI call it cites
+would no longer be the call that produced what it now says — and the provenance
+is the only thing that makes a stored claim checkable.
+
+That also removes the need for `MemoryRevision` in this milestone: revisions
+record edits, and there are none.
+
+**6. Deletion is soft, and it is the one mutation.** `deleted_at` is a
+timestamp rather than a flag, because retention has to ask "deleted before
+when" and a boolean cannot answer that (the reasoning `Contact` already
+follows). The repository has no `update`; it has a named `delete` with one
+meaning, so no caller can reach it while intending something else.
+
+Deleting **frees the key**, so the same fact can be accepted again. That is the
+only route to a correction, and it is why the uniqueness index is partial on
+`deleted_at IS NULL`.
+
+**7. `contact_id` is resolved at acceptance, from the conversation's chat, and
+is nullable only for chats with no single counterpart.** A proposal is about a
+*conversation*; a memory is about a *person*. The resolution belongs at the
+moment of acceptance because that is when a fact becomes something the
+application believes about somebody.
+
+Two partial unique indexes rather than one, because SQL treats NULLs as
+distinct: without the second, two identical facts from group conversations
+would both be stored.
+
+**8. Provenance is `SET NULL`, not `CASCADE`, and it is all-or-nothing.** This
+is the one place in the schema where SET NULL is right. `ai_calls` and
+`memory_proposals` both cascade from `chats`, so without it deleting a chat
+would silently erase approved memories — and a memory is user-approved
+knowledge that does not stop being known because the exchange it came from was
+deleted. What is lost is the trail, not the fact.
+
+The entity therefore permits a memory with **no** trail and refuses one with
+half a trail: a partial provenance is a state nothing can produce and nothing
+could interpret.
+
+**9. Confidence is kept as the model reported it.** A person accepting a fact is
+saying "this is worth keeping", not "the model was certain". Raising it to 1.0
+on acceptance would flatten two different claims into one and lose the one that
+came from a machine.
+
+---
+
+### Alternatives Considered
+
+**A model-supplied key.** The natural design — ask the model for a short label
+like `home_city`, and supersession follows for free. Rejected: it hands
+identity to the component this whole feature exists to distrust, and the labels
+are unstable across prompt versions, so the same fact would collide with itself
+after a prompt change. It is also the only rejected option that would have
+*worked* for supersession, which is why the limitation in decision 2 is stated
+plainly rather than buried.
+
+**A UUID or a random key.** Rejected: it makes the uniqueness constraint
+vacuous. Every fact would be distinct from every other, so accepting the same
+proposal twice from two conversations would produce two memories, and §5.9's
+"deduplication is tractable" would stop being true.
+
+**A hash of the normalised value.** Same deduplication behaviour as the chosen
+scheme, and rejected only for readability: a user told that two facts collided
+can see why when the key is `lives in lisbon` and cannot when it is
+`8f437e53`. The key is shown by `memory show`, so it is user-facing.
+
+**The category as the key** (one fact per category per person). Rejected as too
+coarse: a person has many interests.
+
+**A `MemoryStatus` enum.** Rejected. `deleted_at IS NULL` is the whole of
+"active", and a status column beside a timestamp would be two sources of truth
+for one fact — the mistake ADR-056 corrected for `Conversation.is_open`.
+`superseded` and `archived` are transitions, and this milestone has one.
+
+**Hard deletion.** Rejected for now: retention needs to know what was deleted
+and when, and a purge is a bulk operation belonging to Milestone 10 rather than
+a repository method here.
+
+**Editing a memory in place.** Rejected; see decision 5.
+
+**`decided_by`.** Rejected. Every decision in this milestone is a person's —
+there is no other way to make one — so the column would record a constant.
+Auto-approval is the feature that gives it a second value, and it can add it.
+
+**Storing `contact_id` on the proposal.** Rejected: a proposal is about a
+conversation, and resolving the person at extraction time would make the
+extractor depend on the chat graph for a field only acceptance uses.
+
+---
+
+### Consequences
+
+**Positive**
+
+- Nothing a model produces becomes believed state without a person, and now
+  there is a complete path for a person to say yes or no.
+- Every memory carries the provenance to check it: the proposal, the
+  conversation and the AI call.
+- Accepting the same fact twice is impossible, whether from one conversation or
+  several.
+- A decision cannot be repeated or reversed, including under concurrency.
+- Deleting a chat does not silently erase approved knowledge.
+- A user can forget anything the application remembers, satisfying the standing
+  privacy commitment from the moment memories first exist.
+
+**Negative**
+
+- **Contradictions accumulate.** Nothing detects that two live memories
+  disagree; the queue and the memory list will both eventually contain stale
+  facts. This is the largest known gap, and conflict detection should be
+  scheduled soon after retrieval.
+- Correcting a memory takes two steps — forget, then accept a fresh proposal —
+  and the second is only possible if the fact is proposed again.
+- A memory that lost its trail cannot be audited. The alternative was losing
+  the memory.
+- Proposals never expire, so the queue still only grows. §5.10's ninety-day
+  rule remains unimplemented.
+- `importance`, `is_pinned`, decay and every retrieval-shaped field are absent,
+  so nothing yet ranks or selects memories. That is Slice 9d.
+
+---
+
+### Related Decisions
+
+ADR-019 (proposals keep hallucinated content out of memory — this is the other
+half), ADR-058 (the queue this decides about), ADR-046 (append-only aggregates —
+`Memory` extends the discipline to one that can be forgotten but not changed),
+ADR-043 (composite ownership, applied to `memories`), ADR-039 (account-scoped
+repositories), ADR-034 (one transaction at a time — the decision and its
+consequence share it), ADR-056 (`Conversation.is_open`: the precedent for
+refusing a stored flag beside a timestamp), ADR-041 (locally generated
+identifiers).
+Refines `DOMAIN_MODEL.md` §5.9 (the field set, the lifecycle and where the key
+comes from) and §5.10 (the status set).
+
+---
+
+# ADR-060
+
+## Title
+
+Memory Retrieval Is Deterministic Before It Is Semantic
+
+Status
+
+Proposed
+
+Date
+
+2026-07-30
+
+---
+
+### Context
+
+ADR-059 gave the application durable knowledge. Nothing read it. This decides
+how a memory reaches a prompt, and it is the last piece before AI output starts
+depending on stored state.
+
+`VECTOR_SEARCH.md`, `AI_MODELS.md` §9 and Milestone 7 all assume the answer is
+embeddings: embed each memory, embed the conversation, retrieve by cosine
+similarity. That is the industry default and it is probably where this ends up.
+Building it now would nonetheless be a mistake, for a reason that has nothing to
+do with whether it works.
+
+**There would be nothing to compare it against.** "Semantic retrieval improved
+the suggestions" is a claim with no denominator unless something simpler was
+measured first. A vector index shipped as the first implementation is a vector
+index whose value is assumed rather than shown — and whose failures are
+invisible, because there is no baseline behaving differently to notice them
+against.
+
+Five questions had to be settled, and none of them is about embeddings.
+
+**What decides the order?** Anything that reads like relevance is a weighting,
+and a weighting is a set of numbers somebody invented.
+
+**What happens when the chosen memories do not fit?** A context has a token
+budget, and the budget will bite long before the memory count does.
+
+**When is a retrieval recorded?** Retrieval is a read that has a write
+side-effect, which cuts against every discipline established since ADR-046.
+
+**Does retrieval cross contacts?** A memory about one person reaching a
+conversation with another is the single worst failure this feature can have.
+
+**Is `Memory` still immutable?** ADR-059 says it is, and retrieval increments a
+counter on it.
+
+---
+
+### Decision
+
+**1. Retrieval is deterministic, and it is a baseline rather than an
+endpoint.** Given the same memories and the same budget, the selector returns
+the same memories in the same order, every time. No embeddings, no similarity,
+no model.
+
+The purpose is measurement. When semantic retrieval arrives it will be run
+against the same inputs and judged against this, which is possible because this
+side is pure and exhaustively pinned down by tests. It also forces the parts a
+semantic version still needs and cannot borrow from a model: the token budget,
+the order a context degrades in, and the record of what was left out.
+
+**2. Ranking is lexicographic over five stored facts. No weights.**
+
+| # | Key | Why here |
+| --- | --- | --- |
+| 1 | **Category priority** | Ordered by what it costs to get wrong. A `constraint` the person asked for is first, because ignoring one is worse than saying nothing. `open_question` next: the likeliest thing to need saying. Then time-sensitive facts (`plan`, `important_date`), because a durable fact is equally true next week and a plan is not. Then identity, then durable context, then how to talk to them, then what to talk about. `other` last. |
+| 2 | **Importance** | A person's judgement of what is worth knowing, set when they accepted the fact. |
+| 3 | **Confidence** | The model's estimate of whether it is *true*. Below importance deliberately: a machine's view of truth does not outrank a human's view of relevance, and self-reported confidence is poorly calibrated (`AI_MODELS.md` §15). |
+| 4 | **Recency** | When the fact was *accepted*, newest first. |
+| 5 | **Identifier** | Arbitrary but total, so ordering never depends on what the database returned. |
+
+**Rejected: a weighted score** summing normalised keys. It reads as principled
+and is not — the weights would be invented, no test could show one set beats
+another, and changing one silently reorders everything. A lexicographic order is
+explainable one comparison at a time: *this came first because it is a
+constraint and that is a preference*.
+
+**Rejected: recency alone.** It is the one ranking that needs no justification
+and answers no question: the most recently learned fact about somebody is not
+usually the most useful one, and a constraint learned a year ago outranks an
+interest learned yesterday.
+
+**Rejected: random sampling.** Cheap, unbiased, and unusable. Two runs over
+unchanged data would produce different contexts, so no suggestion could be
+explained by re-reading what was sent, no prompt version could be compared
+against another, and no semantic retriever could ever be shown to beat it —
+the comparison would be against noise. It also fails the one thing a baseline
+must do: be the *same* baseline tomorrow.
+
+**Rejected: asking a model which memories to use.** Superficially the most
+capable option — a model reading the conversation could pick the relevant
+facts, which is exactly what this ranking cannot do. Rejected on three counts.
+It is a model call *inside* retrieval, so assembling a prompt would require a
+prompt, and the cost of a suggestion would double before anything was
+suggested. It is non-deterministic, so it forfeits everything above. And it
+puts the decision about what the model sees in the hands of the model, which is
+the inversion this project has refused at every level since ADR-019: a model
+that selects its own context can quietly exclude the constraint it is about to
+break.
+
+**Rejected: retrieving inside repository queries.** A `MemoryRepository` that
+ranked and budgeted while reading — returning "the memories for this context"
+rather than "the memories for this contact" — would look tidier at the call
+site and would be a mistake. Ranking would become untestable without a
+database; the rule would live where a query planner rather than a person could
+read it; and the contract suite could no longer check the two implementations
+against identical behaviour, because the behaviour would include a policy the
+in-memory fake would have to reimplement. The repository answers *what exists*;
+the selector decides *what is used*.
+
+**3. `last_retrieved_at` is not a ranking input.** Ranking by it would make a
+retrieved memory rank higher and therefore be retrieved again — a feedback loop,
+not a relevance signal. It is recorded precisely so that the *absence* of
+retrieval is visible: a memory nobody has used is evidence about the ranking,
+and a ranking that promoted its own past choices could never produce that
+evidence.
+
+**4. The budget is spent after ranking, and never changes it.** Ranking decides
+priority; the budget decides fit. A memory too long for what remains is
+**skipped and the walk continues**, so one long fact near the top does not empty
+the context beneath it. Order among the selected is untouched, and every
+omission is reported with its reason.
+
+**Rejected: stopping at the first thing that does not fit.** Simpler, and wastes
+most of a budget on one long memory.
+
+**Rejected: shortening a memory to make it fit.** A truncated fact is a
+different fact, and the selector has no business inventing one.
+
+**Rejected: model-based compression.** It would put a model call inside
+retrieval, which is exactly what this slice exists to avoid.
+
+**5. Retrieval accounting happens in the same transaction as the read, and only
+when the context is actually built.** Two use cases, and the difference is the
+whole reason there are two:
+
+* `BuildMemoryContext` selects **and counts**. What a prompt assembler calls.
+* `GetMemoryContext` selects and counts nothing. What `tgassist memory context`
+  calls, because looking at what *would* be sent is not using it — an
+  inspection that inflated the counters would corrupt the measurement it exists
+  to expose.
+
+The count is incremented **in SQL** (`retrieval_count + 1`) over all selected
+rows in one statement, so two contexts built at once cannot lose an increment
+and a context of twenty memories costs one write. It happens **before** the
+model call rather than after: the memories were used whether or not the model
+then succeeded, and an accounting that depended on the outcome would
+under-report exactly the expensive failures.
+
+**6. Retrieval never crosses contacts, and the partition is strict in both
+directions.** A private chat retrieves that contact's memories. A chat with no
+single counterpart retrieves the memories about *nobody in particular* — the
+ones extracted from group conversations — and nobody else's. A private chat does
+**not** see contactless memories either: a fact from a group conversation is not
+a fact about this person.
+
+Enforced by the repository rather than the selector, so there is one place to
+get it wrong. `contact_id IS NULL` rather than `= NULL`, because the second
+matches nothing in SQL and would make every group chat's context permanently
+empty.
+
+**7. `Memory` is still immutable; retrieval writes bookkeeping, not the fact.**
+This refines ADR-059 rather than contradicting it. What cannot change is the
+*claim*: category, key, value, confidence, provenance. What can change is what
+is known *about* the claim — how often it has been used. `mark_retrieved` is a
+named operation with one meaning, exactly like `delete`, rather than a general
+`update`.
+
+**8. Importance is set at acceptance and not changed.** `memory accept
+--importance low|normal|high|critical`, defaulting to normal. The moment
+somebody is looking at a fact is the moment they can judge it, and adding a
+setter now would be a second interface for a decision nobody has yet wanted to
+revise. Whether it should stay immutable is an open question — a fact's
+importance genuinely changes with circumstances — and it needs a real interface
+to be worth answering.
+
+**8a. The token estimate is four characters per token, and its error is
+bounded and stated.** No tokeniser library: the exact count depends on the
+model's own tokeniser, which is the provider's business and cannot be consulted
+before the call — a budget that needed it could not be enforced.
+
+The approximation is good enough because of what it is used for. Measured
+against a byte-pair tokeniser, four characters per token **over-estimates**
+ordinary English prose by roughly 5–15% (English averages nearer 4.5 characters
+per token), and **under-estimates** text that tokenises badly: non-Latin
+scripts, long unbroken identifiers, and heavy punctuation can reach two or three
+times the estimate in the worst cases.
+
+Two things make that acceptable. The error is *systematic* rather than random,
+so the same text always costs the same and a budget decision stays reproducible.
+And the budget is small relative to any model's context window — a few hundred
+tokens against tens of thousands — so even a threefold under-estimate does not
+approach a limit that would truncate the request. What it can do is make a
+context slightly larger or smaller than intended, which is a cost question
+rather than a correctness one.
+
+The estimate is defined once, in the domain, and the scripted provider's token
+accounting delegates to it — two rules of thumb that disagreed would let a
+context that fitted the budget cost more than the fake charged for.
+
+**9. The index is chosen by the query.** Retrieval issues exactly one read:
+one account's live memories about one contact, newest first. So the index leads
+with those columns and is partial on `deleted_at IS NULL` — a forgotten memory
+should occupy no space in an index every context walks. There is no index on
+importance, confidence or category: ranking happens in memory over a set already
+bounded to one contact, and no index serves a five-key lexicographic order.
+
+---
+
+### Consequences
+
+**Positive**
+
+- Retrieval is observable before anything depends on it. `tgassist memory
+  context` shows the selection, the order, the reason for each placement, the
+  token cost and every omission — with no model involved.
+- The ranking is explainable to a user one comparison at a time, and therefore
+  arguable. A ranking nobody can disagree with cannot improve.
+- Semantic retrieval now has something to beat, on inputs already fixed by
+  tests.
+- The token budget, the degradation order and the omission record are built once
+  and are not embedding-specific.
+- Nothing about retrieval can leak one person's memories into another's
+  conversation.
+
+**Negative**
+
+- **There is no notion of what the conversation is about.** A context is the
+  same whatever is being discussed. That is the largest limitation, and it is
+  precisely what embeddings fix.
+- **Category priority is a judgement.** It is defensible and it is explained,
+  but it was not measured, and a real corpus may show it wrong.
+- **Retrieval bias by category is now structural.** A `constraint` will almost
+  always be in the context and a `shared_experience` will often be squeezed out,
+  regardless of the conversation.
+- **Stale facts rank as well as fresh ones.** Nothing expires, nothing decays
+  and nothing detects contradictions (ADR-059), so a memory that stopped being
+  true keeps its place.
+- Two long facts whose first 120 characters agree collapse to one key and the
+  second is refused at acceptance. Conservative, but the message does not
+  explain itself.
+
+---
+
+### Future evolution toward embeddings
+
+Deliberately shaped so that adding them is additive rather than a rewrite.
+
+1. **The `MemorySelector` interface is what a semantic selector implements.**
+   `select(memories) -> Selection`. A semantic version takes the same
+   candidates plus a query vector and returns the same shape, so the budget,
+   the omission reporting and the CLI need no change.
+2. **The candidate read is already separate from the ranking.** Today
+   `list_for_contact` returns everything about one contact; a vector index would
+   return the top *k* by similarity, and the ranking would run on those. The
+   ordering keys still apply — similarity becomes a *sixth* key or a filter
+   before the first, and which of those it should be is exactly the question
+   this baseline lets us answer.
+3. **The measurement is already collected.** `retrieval_count` and
+   `last_retrieved_at` accumulate under deterministic retrieval starting now, so
+   when semantic retrieval arrives there is a before.
+4. **What must not be inherited:** the temptation to rank by embedding score
+   alone. Similarity answers *what is this conversation about*; it says nothing
+   about what it costs to omit a constraint. The likely end state is hybrid —
+   category priority first, similarity within it — and that is a decision for
+   the slice that has the numbers.
+
+---
+
+### Related Decisions
+
+ADR-059 (memories, and their immutability — refined here for bookkeeping),
+ADR-058 (proposals, and the categories retrieval ranks by), ADR-043 (composite
+ownership), ADR-034 (one transaction at a time — the read and the accounting
+share it), ADR-057 (the AI boundary a context will eventually be sent through),
+ADR-056 (the precedent for a pure domain rule with an application layer that
+gives it identity and persistence).
+Refines `DOMAIN_MODEL.md` §5.9 (`importance`, `retrieval_count`,
+`last_retrieved_at`) and defers `VECTOR_SEARCH.md` in its entirety.
+
+---
+
+# ADR-061
+
+## Title
+
+Prompt Assembly Separates Context Selection from Prompt Rendering
+
+Status
+
+Proposed
+
+Date
+
+2026-07-30
+
+---
+
+### Context
+
+Everything built since Slice 9a produces something nothing consumes. Memories
+are extracted, reviewed, stored and retrieved; no model has ever been shown one.
+This is the slice where they arrive in a prompt, and it therefore has to settle
+what a prompt *is* in this application.
+
+Five questions, and the first four are all versions of the same one: who decides
+what?
+
+**What order do the parts appear in?** The obvious answer is "whatever reads
+well", which is not an answer.
+
+**What happens when the whole thing does not fit?** Something has to go, and
+whichever thing that is will be the thing this application systematically
+under-uses.
+
+**How does a reader know why a suggestion said what it said?** A prompt that is
+assembled and then discarded leaves a suggestion with no explanation but its own
+fluency.
+
+**Where does the wording live?** The assembler has the data and the template has
+the prose, and either could plausibly own the other.
+
+**What does the provider know about any of this?** ADR-057 said a provider
+receives text; a suggestion feature is the first thing with enough structure to
+be tempted to leak some of it downward.
+
+---
+
+### Decision
+
+**1. The order is fixed: system prompt, memories, conversation, task and output
+format.**
+
+| Part | Why there |
+| --- | --- |
+| **System prompt** | It is what everything after it is read under, and it contains no conversation data at all, so it never varies. |
+| **Memories** | They are the *frame*. A constraint like "do not mention the old job" changes how every message below should be read, and a model that met the messages first has already formed a reading by the time it learns the rule. |
+| **Conversation** | Delimited, untrusted, oldest to newest — bracketed by trusted rules above and the actual instruction below, so an injection attempt is surrounded rather than trailing. |
+| **Task and output format** | Last, and closest to the answer. A model's final instruction is the one it follows most reliably, and it is the one that must survive an injection that got past everything above. |
+
+**Rejected: an order chosen for readability**, and **rejected: letting the model
+decide what to read first** (tool-style retrieval, or "here is everything, use
+what you need"). Both make the prompt unreproducible, and an unreproducible
+prompt makes every later comparison meaningless — between prompt versions,
+between retrieval strategies, between deterministic and semantic retrieval.
+
+**2. Trimming has one direction, and two things are never removed.**
+
+**Never removed:** the system prompt, the task, the output format, and the
+**most recent message**. Without the last, there is nothing to respond to, and a
+"suggestion" built without it is a guess about a conversation the model cannot
+see.
+
+**First to go: the oldest messages.** In a chronological record, recency *is*
+relevance: the oldest turn is the one whose absence changes the answer least.
+
+**Then the lowest-ranked memories.** This is the ordering the goal warned
+against choosing without justification, so here it is. Memories arriving at the
+assembler have **already survived a budget** — retrieval ranked them and spent
+its own allowance, so each one was deliberately chosen. The message history is
+bulk, kept because it is cheap to keep. Dropping a curated fact about somebody
+costs more than dropping a line of small talk from an hour ago.
+
+**Rejected: dropping whichever item is largest.** Unpredictable from outside,
+and it would systematically discard exactly the detailed memories most worth
+having. **Rejected: truncating a memory or a message to make it fit.** A
+truncated fact is a fact that was never stated. (The per-message character
+limit is a different thing: a declared bound applied before assembly, and
+marked in the text so the model can tell.)
+
+**3. Attribution is required, checked, and reported.** The prompt supplies each
+memory with its key; the model returns `used_memory_keys`; the application
+**verifies every returned key against the keys actually supplied**. A key that
+was not supplied is a fabricated attribution — the model claiming to have used
+something it was never given — and it is discarded and counted rather than
+shown.
+
+The check is the same idea as extraction's evidence grounding (ADR-058): a model
+cannot cite what it was not given. What it catches is narrow but real, because a
+suggestion that claims grounding it does not have is worse than one that claims
+none — the first invites trust.
+
+**What attribution does not prove** is that a memory reported as used actually
+influenced the text. Nothing available here can prove that. What it buys is a
+reader who can ask "why did it say that?" and be shown the exact facts that were
+in front of the model.
+
+**Rejected: an opaque prompt** — assembling, sending and discarding. It would
+make every suggestion unexplainable, and `tgassist chat suggest` exists largely
+to make the opposite true.
+
+**4. The assembler decides *what* and *in what order*; the template decides
+*what it means and what to do about it*.** Not one imperative sentence in
+`context_assembly.py` reaches a model: it emits neutral data lines
+(`- [key] category: value`) and a labelled transcript. Every instruction,
+constraint and output-format description is in `chat/suggestion.md`, versioned
+as an asset (ADR-008).
+
+**Rejected: a template that decides retrieval** — a prompt file with the power
+to ask for more memories would make retrieval unreviewable and untestable.
+**Rejected: an assembler that embeds wording** — the prompt version recorded
+against a call would then be a claim about only half the text that was sent.
+
+**5. The provider receives a rendered prompt and a schema, and nothing else.**
+No `Memory`, no `Chat`, no domain type crosses the port. `StructuredAiTask`
+takes text plus a `JsonSchema`; `AiProvider` takes an `AiRequest`. A provider
+that knew what a memory was could not be replaced by one that did not.
+
+**6. The one-repair loop moved into `StructuredAiTask`.** ADR-058 put it inside
+`ExtractMemories`, where it was the only structured task. There are now two, and
+"exactly one repair" must not be able to become "one here and two there". The
+loop is shared; everything about *what* is asked stays with each caller.
+
+**7. Two use cases, because the deterministic half is worth reading alone.**
+`BuildPromptContext` retrieves and assembles and asks nothing. It is what makes
+the prompt inspectable before it is paid for, and it is where a future prompt
+diff will be taken. `GenerateConversationSuggestion` adds the call and the
+attribution check.
+
+**8. Nothing is stored.** A suggestion is a return value. There is no
+`suggestions` table, no aggregate and no identifier, because nothing yet decides
+about a suggestion — and a row nobody reads is a row nobody keeps correct. The
+only thing written is the `AiCall` that `ExecuteAiTask` writes for any call.
+
+---
+
+### Consequences
+
+**Positive**
+
+- A suggestion can be explained completely: the memories supplied, the ones
+  retrieval left out, the ones the budget trimmed, the transcript, the prompt
+  version, the token estimate and the model's own attribution — all in one
+  command, with nothing sent anywhere.
+- The prompt is byte-for-byte reproducible from stored data, so a prompt version
+  can be compared against the next one, and a deterministic retriever against a
+  semantic one.
+- Retrieval quality is now *observable*: "it suggested the wrong thing because
+  the wrong memories were retrieved" is a claim somebody can check.
+- The provider stays ignorant. Nothing about memories, chats or contacts has
+  crossed the AI port.
+- Two callers now share one repair rule, so it cannot drift.
+
+**Negative**
+
+- **Attribution is self-reported.** A model can say it used a memory it
+  ignored, or ignore one it lists. The fabrication check catches only the case
+  where the key was never supplied.
+- **The token estimate is a rule of thumb.** Four characters per token
+  under-counts for some languages, so a prompt that fits the budget may exceed
+  the real one. Bounded, since the budget is small relative to a context window.
+- **The trim order is a judgement.** It is argued rather than measured, and a
+  real corpus may show that dropping an old message costs more than dropping a
+  memory.
+- **The prompt grows with the memory count.** Twenty memories and twenty
+  messages is a large prompt for a small suggestion, and nothing yet decides
+  that a particular memory is irrelevant to *this* conversation. That is
+  retrieval's gap (ADR-060), and it is now visible in the cost of every call.
+- **Nothing is stored**, so there is no history of what was suggested. The next
+  slice needs one.
+
+---
+
+### Future evolution
+
+1. **A `Suggestion` aggregate**, when there is something to decide about one.
+   The moment a person can accept, edit or dismiss a suggestion, it needs an
+   identifier and a row — and the shape is already fixed by what
+   `GenerateConversationSuggestion` returns.
+2. **More context types.** `PROMPTS.md` §8 lists user preferences, the
+   conversation goal, the relationship profile, the style profile and a rolling
+   summary. Each is a new slot in the same assembler, in the same fixed order,
+   trimmed by the same rule. None of them changes this decision.
+3. **Semantic retrieval** plugs in underneath without touching the assembler:
+   it changes which memories arrive, not what happens to them.
+4. **Multiple candidate suggestions** would change the schema and the CLI, not
+   the assembly. The prompt already asks for one deliberately: a person choosing
+   between three drafts is doing more work than a person editing one.
+
+---
+
+### Related Decisions
+
+ADR-060 (retrieval, which supplies the memories and whose ranking order the
+assembler preserves), ADR-058 (prompts as versioned assets, untrusted-content
+delimiting, and the one-repair rule this slice generalised), ADR-057 (the AI
+boundary, unchanged), ADR-020 (structured output), ADR-008 (prompts as files),
+ADR-024 (the per-chat gate, inherited rather than reimplemented), ADR-034 (one
+transaction at a time — retrieval, the message read and the call are three
+separate ones and none spans the model call).
+Implements `PROMPTS.md` §8's assembly order for the parts that exist.
+
+---
+
+# ADR-062
+
+## Title
+
+AI Suggestions Require Explicit Human Review
+
+Status
+
+Proposed
+
+Date
+
+2026-07-31
+
+---
+
+### Context
+
+Slice 9e produced a working suggestion: a chat, its memories, an assembled
+prompt, a model, a draft on the screen. The draft then vanished. It existed for
+the length of one command, was reviewable only by whoever happened to be
+watching the terminal, and left no record that it had ever been made.
+
+That is a problem in two directions.
+
+**Backwards**, there is no measurement. "Is the generator any good?" is answered
+by counting what people kept against what they threw away, and neither number
+existed. So is "did the prompt change help?" and "is retrieval picking the right
+memories?" -- every question about quality needs a decision to have been
+recorded.
+
+**Forwards**, there is a temptation. The obvious next feature is sending, and
+the obvious cheap way to build it is to have generation send. Every autonomous
+system that has embarrassed its owner got there by exactly that increment: the
+draft was good, so the review became a formality, so the review became optional,
+so the review disappeared. This project has refused that inversion three times
+already -- ADR-019 for memories, ADR-058 for extraction, ADR-059 for approval --
+and this is the fourth and most consequential, because a wrong memory is private
+and a wrong message is not.
+
+---
+
+### Decision
+
+**1. Every generated suggestion is stored, and generation publishes
+``SuggestionsCreated``.** A suggestion that existed only as a return value was
+observable to one person for one moment. Storing it makes "observable before any
+action" a property of the system rather than of who was watching.
+
+**2. A ``Suggestion`` is an aggregate with the same shape as a
+``MemoryProposal``: created pending, decided exactly once, no undo, no reopen,
+no edit.** The repetition is deliberate and worth stating as a pattern rather
+than a coincidence. *A model produces a candidate; a person decides; the
+decision is final and recorded.* Three aggregates now follow it, and a fourth
+should be suspicious of itself if it does not.
+
+**3. Accepting executes nothing.** ``AcceptSuggestion`` changes a status,
+publishes a fact, and returns. It is not a stub to be filled in: the use case is
+**given nothing that could act**. No gateway, no scheduler, no provider, no
+executor -- and a test asserts on its constructor signature, so wiring one in is
+a change somebody has to make deliberately and defend.
+
+The repository is shaped the same way. It has ``add``, ``get``,
+``list_pending``, ``list_by_chat`` and ``decide``, and no ``execute``, ``send``
+or ``schedule``. The absence of an operation is a stronger guarantee than a rule
+about not calling one.
+
+**4. Three fields for three audiences.** ``title`` for a list, ``description``
+for the **person deciding**, ``payload`` for a **machine that does not exist
+yet**. For a reply draft, the description *is* the draft, because that is the
+thing being judged.
+
+The split is what keeps review possible as the kinds of suggestion multiply: a
+reviewer decides about a title and a description whatever ``proposal_type``
+says, so a new kind needs new payload handling and **no new review**. It also
+means no reviewer ever has to read JSON to decide.
+
+**5. The queue is what has not been decided; a chat's history is everything.**
+``list_pending`` excludes decided suggestions -- a queue is by definition what
+is outstanding -- and ``list_by_chat`` includes them, because a listing that hid
+the dismissals would make a generator that is usually wrong look like one that
+is rarely used.
+
+**6. Everything cascades from the chat.** Unlike a memory, whose provenance is
+``SET NULL`` because approved knowledge outlives the exchange it came from
+(ADR-059), a suggestion is a draft *about* a conversation and means nothing once
+that conversation is gone.
+
+---
+
+### Alternatives Considered
+
+**Automatic execution -- generation sends the reply.** Rejected, and it is the
+decision this ADR exists to make. It would make the model's output an action
+rather than a proposal, and every control built since Slice 9a -- the privacy
+gate, schema validation, attribution checking, the review queue itself --
+protects a person's *decision*. Remove the decision and they protect nothing.
+The concrete failure is easy to state: the first message sent to a real person
+that should not have been is not recoverable by any amount of good architecture.
+
+**Auto-approval -- accept above a confidence threshold.** Rejected, and it is
+the more tempting version because it sounds measured. Self-reported model
+confidence is poorly calibrated (`AI_MODELS.md` §15), so the threshold would be
+a number nobody could justify; and the suggestions it would auto-approve are
+exactly the fluent, confident ones, which are also the ones a person is least
+likely to catch afterwards. `DOMAIN_MODEL.md` §5.10 foresees auto-approval for
+*memories* under narrow conditions; a memory is private and reversible, and a
+message is neither.
+
+**Editable suggestions.** Rejected. An edited suggestion is one whose recorded
+text is not what the model produced, which destroys the only thing the record is
+for: knowing what was actually suggested when somebody agreed with it. It would
+also quietly corrupt the measurement -- a generator whose output is always
+edited before acceptance looks, in the numbers, like a generator whose output is
+always accepted. A person who wants to send something different is writing their
+own message, which needs no aggregate.
+
+**Reopening decisions.** Rejected, for the reason ADR-059 gave and one more:
+here there is nothing to recover. Dismissing loses nothing (generate another),
+and accepting did nothing (so changing your mind costs nothing). A reopen
+mechanism would add a way to rewrite history in exchange for no capability.
+
+**Background execution -- a worker that acts on accepted suggestions.**
+Rejected for this slice and worth naming precisely, because it is the shape the
+next mistake would take. The objection is not that automation is wrong; it is
+that a background worker makes "accepted" mean something different from what the
+person clicking accept was told it meant. If acting automatically is ever
+wanted, it must be a separate, explicit, per-chat opt-in whose name says what it
+does -- not a consequence of a decision made under a different description.
+
+**Deleting dismissed suggestions.** Rejected. A record containing only what was
+agreed with cannot show what the generator is getting wrong, which is the
+measurement that decides whether a prompt needs rewriting.
+
+**A table per suggestion type.** Rejected while there is one type. It would put
+review behind a type switch, and review is the part that must stay uniform.
+Revisit if a payload ever needs to be queried rather than read.
+
+---
+
+### Consequences
+
+**Positive**
+
+- Every suggestion the system has ever made is inspectable, alongside the AI
+  call, the prompt version and the cost that produced it.
+- The generator can now be *measured*: kept against thrown away, per prompt
+  version.
+- "Nothing acts automatically" is structural. The use cases hold nothing that
+  could act, the repository offers no operation that could, and a test asserts
+  both.
+- A decision cannot be repeated or reversed, including under concurrency.
+- Adding a second kind of suggestion needs no new review path.
+
+**Negative**
+
+- **The queue only grows.** Nothing expires suggestions, and a person who
+  generates and never reviews accumulates rows indefinitely. Retention owns
+  this, and it is now the third unbounded queue in the system.
+- **`payload` is an unvalidated blob** beyond being a JSON object. The schema
+  that produced it is known at generation time and not checked at read time; a
+  future executor will have to validate what it finds.
+- **`conversation_id` has no writer.** The column exists because the field was
+  specified; generation reads a chat's recent messages rather than a segmented
+  conversation, so it is always NULL today.
+- **"Accepted" means only "agreed with".** A person who accepts and then does
+  nothing leaves a row that looks like a completed action and was not. Until
+  something acts, the status is a note to oneself.
+- Three aggregates now implement the same decision semantics separately.
+
+---
+
+### Related Decisions
+
+ADR-019 (proposals keep model output out of believed state), ADR-058 (extraction
+proposes), ADR-059 (a decision is made once, and terminal states are terminal --
+this repeats its shape deliberately), ADR-061 (the assembly and generation this
+stores the output of), ADR-057 (the AI call a suggestion cites), ADR-043
+(composite ownership), ADR-034 (one transaction at a time -- a decision is one),
+ADR-039 (account-scoped repositories).
 
 ---
 

@@ -11,9 +11,14 @@ The shape
 
 One asyncio task -- the *dispatch loop* -- is the sole consumer of
 ``TdjsonClient.receive()``, mirroring the single-owner rule the receive thread
-already follows (ADR-048). It updates the two state fields and wakes anything
-waiting. Everything else here reads those fields; nothing else touches the
-stream.
+already follows (ADR-048). It updates the two state fields, hands message
+updates to a bounded queue, and wakes anything waiting. Everything else here
+reads those fields; nothing else touches the stream.
+
+``updates()`` drains that queue. It is deliberately **not** a second consumer of
+``client.receive()``: the queue holds one item per update, so two consumers
+would split the stream rather than duplicate it, and each would silently miss
+what the other took (ADR-051, ADR-055).
 
 Requests are sent with ``client.request()`` from the caller's own task, not from
 the dispatch loop. A submission that awaited its reply inside dispatch would
@@ -36,13 +41,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
 from tgassist.domain.errors import (
     AuthorizationError,
+    DomainValidationError,
     TdlibNotRunningError,
     TdlibRequestFailedError,
     TelegramError,
@@ -58,7 +64,9 @@ from tgassist.domain.model.secret import SecretValue
 from tgassist.domain.model.session import AuthorizationState, ConnectionState
 from tgassist.domain.model.telegram import (
     HistoryPage,
+    NewMessage,
     TelegramChatInfo,
+    TelegramUpdate,
     TelegramUser,
     require_credential,
 )
@@ -66,6 +74,7 @@ from tgassist.domain.ports.telegram_gateway import (
     DEFAULT_CHAT_LIMIT,
     DEFAULT_CONTACT_LIMIT,
     DEFAULT_HISTORY_LIMIT,
+    DEFAULT_UPDATE_QUEUE_SIZE,
     AuthorizationHandler,
     RetryDecision,
 )
@@ -91,6 +100,13 @@ MAX_AUTHORIZATION_STEPS: Final = 32
 #: TDLib's code for "no such thing", used for a chat or user this account
 #: cannot see, and for a chat list with nothing more to load.
 _NOT_FOUND: Final = 404
+
+#: How long the dispatch loop sleeps while the update queue is full.
+#:
+#: A poll rather than a condition variable because the loop must also stay
+#: responsive to ``_closing``, and short enough that a consumer catching up is
+#: not made to wait for the loop to notice.
+_QUEUE_POLL_SECONDS: Final = 0.01
 
 _logger = get_logger(__name__)
 
@@ -186,16 +202,21 @@ class TdlibGateway:
         "_account_id",
         "_auth_lock",
         "_client",
+        "_closing",
         "_dispatch",
+        "_dropped",
+        "_queue_size",
         "_settings",
         "_started",
         "_startup_timeout",
         "_state_timeout",
+        "_streaming",
         "_unhandled",
+        "_updates",
         "_view",
     )
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - three collaborators and three tunables
         self,
         account_id: AccountId,
         client: TdjsonClient,
@@ -203,6 +224,7 @@ class TdlibGateway:
         *,
         state_timeout: float = DEFAULT_STATE_TIMEOUT,
         startup_timeout: float = DEFAULT_STARTUP_TIMEOUT,
+        update_queue_size: int = DEFAULT_UPDATE_QUEUE_SIZE,
     ) -> None:
         """Bind to an account, a client and the parameters TDLib requires."""
         self._account_id = account_id
@@ -210,11 +232,16 @@ class TdlibGateway:
         self._settings = settings
         self._state_timeout = state_timeout
         self._startup_timeout = startup_timeout
+        self._queue_size = update_queue_size
         self._view = _AuthorizationView()
         self._dispatch: asyncio.Task[None] | None = None
+        self._updates: asyncio.Queue[TelegramUpdate | None] | None = None
         self._started = False
+        self._closing = False
+        self._streaming = False
         self._auth_lock = asyncio.Lock()
         self._unhandled = 0
+        self._dropped = 0
 
     # -- Identity and observation -----------------------------------------
 
@@ -232,6 +259,17 @@ class TdlibGateway:
         does *not* grow during a login would be the surprising one.
         """
         return self._unhandled
+
+    @property
+    def dropped_updates(self) -> int:
+        """Return how many updates were abandoned because shutdown had begun.
+
+        Non-zero only after :meth:`disconnect` starts. During normal running the
+        queue applies backpressure instead of dropping, so a non-zero count here
+        means exactly one thing: updates arrived while we were stopping, and the
+        next run's catch-up pass is what recovers them (ADR-055).
+        """
+        return self._dropped
 
     async def authorization_state(self) -> AuthorizationState:
         """Return where this account stands with Telegram's login flow."""
@@ -267,6 +305,12 @@ class TdlibGateway:
         if self._started:
             return
 
+        # The queue exists before the dispatch loop does, so no update can
+        # arrive with nowhere to go. Everything from this moment on is held
+        # until a consumer asks -- which is why a run cannot lose an update to
+        # its own start-up (ADR-055).
+        self._updates = asyncio.Queue(maxsize=self._queue_size)
+        self._closing = False
         await self._client.start()
         self._started = True
         self._dispatch = asyncio.create_task(self._dispatch_loop(), name="tgassist-td-dispatch")
@@ -286,7 +330,17 @@ class TdlibGateway:
             raise
 
     async def disconnect(self) -> None:
-        """Stop the client and release the native handle. Idempotent."""
+        """Stop the client and release the native handle. Idempotent.
+
+        Sets ``_closing`` **first**. From that moment the dispatch loop drops
+        updates rather than waiting for room, because a loop blocked on a full
+        queue that nobody will ever drain again is a shutdown that hangs. What
+        is dropped is counted, and the next run's catch-up pass is what recovers
+        it (ADR-055).
+        """
+        self._closing = True
+        self._end_stream()
+
         dispatch, self._dispatch = self._dispatch, None
         if dispatch is not None:
             dispatch.cancel()
@@ -543,6 +597,63 @@ class TdlibGateway:
             if not _is_absent(exc):
                 raise error_mapping.translate_failure(exc, operation="load_chats") from exc
 
+    # -- The update stream -------------------------------------------------
+
+    async def updates(self) -> AsyncGenerator[TelegramUpdate]:
+        """Yield what Telegram reported, in arrival order, until disconnected.
+
+        One consumer. A second would not see a copy of the stream: the queue
+        holds one item per update, so the two would take turns and each would
+        silently miss what the other took. Asking for a second is refused rather
+        than left to be discovered as missing messages.
+
+        Raises:
+            TdlibNotRunningError: If there is no connection, or if something is
+                already consuming the stream.
+        """
+        queue = self._updates
+        if not self._started or queue is None:
+            msg = "updates requires a connected gateway"
+            raise TdlibNotRunningError(msg, user_message="Not connected to Telegram.")
+        if self._streaming:
+            msg = "The update stream already has a consumer"
+            raise TdlibNotRunningError(
+                msg, user_message="Something is already reading Telegram updates."
+            )
+
+        self._streaming = True
+        try:
+            while True:
+                update = await queue.get()
+                if update is None:
+                    return
+                yield update
+        finally:
+            self._streaming = False
+
+    def _offer(self, update: TelegramUpdate) -> None:
+        """Hand one update to the queue, or drop it if we are shutting down.
+
+        Called from the dispatch loop, which is not a coroutine at this point --
+        so a full queue cannot be awaited here. It is put without waiting and,
+        when there is no room, the loop is asked to wait for room instead
+        (:meth:`_dispatch_loop`), which is what turns a slow consumer into
+        backpressure rather than into loss.
+        """
+        queue = self._updates
+        if queue is None or self._closing:
+            self._dropped += 1
+            return
+        queue.put_nowait(update)
+
+    def _end_stream(self) -> None:
+        """Wake a consumer waiting on a queue that will receive nothing more."""
+        queue = self._updates
+        if queue is None:
+            return
+        with contextlib.suppress(asyncio.QueueFull):
+            queue.put_nowait(None)
+
     # -- The dispatch loop -------------------------------------------------
 
     async def _dispatch_loop(self) -> None:
@@ -553,23 +664,65 @@ class TdlibGateway:
         change, which is worse than any single malformed update.
         """
         while True:
+            await self._await_room()
             frame = await self._client.receive()
             if frame is None:
                 self._view.closed = True
                 self._view.known.set()
                 self._view.announce()
+                self._end_stream()
                 return
             self._handle(frame)
 
+    async def _await_room(self) -> None:
+        """Wait until the update queue can take another item.
+
+        Waiting *before* reading the next frame rather than after mapping one is
+        what makes backpressure reach the far end: the loop stops consuming
+        ``client.receive()``, whose own bounded queue then fills, which stops the
+        receive thread, which leaves TDLib holding the backlog (section 7.1).
+        Nothing is dropped anywhere along that chain.
+        """
+        queue = self._updates
+        while queue is not None and queue.full() and not self._closing:
+            await asyncio.sleep(_QUEUE_POLL_SECONDS)
+
     def _handle(self, frame: dict[str, Any]) -> None:
-        """Route one update. Only its ``@type`` is ever logged."""
+        """Route one update. Only its ``@type`` is ever logged.
+
+        An unrecognised kind is counted and dropped, never raised. A TDLib
+        release that adds an update type must not be able to stop this loop, and
+        a loop that stopped would leave every waiter hanging on a state that can
+        no longer change (ADR-055).
+        """
         kind = mapping.frame_type(frame)
         if kind == "updateAuthorizationState":
             self._on_authorization(frame)
         elif kind == "updateConnectionState":
             self._on_connection(frame)
+        elif kind == "updateNewMessage":
+            self._on_new_message(frame)
         else:
             self._unhandled += 1
+
+    def _on_new_message(self, frame: dict[str, Any]) -> None:
+        """Offer an arriving message to the stream.
+
+        A frame this version cannot map is counted rather than raised, for the
+        same reason an unknown ``@type`` is: one malformed message must not end
+        the stream for every other one.
+        """
+        payload = frame.get("message")
+        if not isinstance(payload, dict):
+            self._unhandled += 1
+            return
+        try:
+            message = mapping.message_from(payload)
+        except DomainValidationError:
+            _logger.debug("telegram_unmappable_message")
+            self._unhandled += 1
+            return
+        self._offer(NewMessage(message=message))
 
     def _on_authorization(self, frame: dict[str, Any]) -> None:
         """Record a new authorization state, or the reason there cannot be one."""

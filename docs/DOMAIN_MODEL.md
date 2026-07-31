@@ -321,17 +321,26 @@ Synchronisation records every kind of chat but sets `sync_enabled` only for the 
 
 ## 5.7 Conversation
 
+*Implemented in Milestone 3.0. Corrected by ADR-056.*
+
 **Responsibility.** A bounded episode of interaction within a Chat. The unit of summarisation, planning and analysis. Its existence keeps prompt context proportional to a coherent exchange rather than to an entire chat history.
 
-**Attributes.** `id`, `account_id`, `chat_id`, `started_at`, `ended_at`, `message_count`, `is_open`, `initiated_by` (`operator` | `contact`), `dominant_language`, `created_at`, `updated_at`.
+**Derived, not reported.** Every other entity here records something a person or Telegram decided. A Conversation records something this application *computed* from stored messages, which is why it has no external identifier, why it can be recomputed at any time, and why deleting a stale one loses nothing.
+
+**Attributes.** `id`, `account_id`, `chat_id`, `started_at`, `ended_at`, `message_count`, `created_at`, `updated_at`.
+
+**Membership is the time range.** A Message belongs to the Conversation whose `[started_at, ended_at]` contains its `sent_at`. Messages carry **no** `conversation_id` and there is no join table: `Message` is append-only and its repository has no update path at all (ADR-046), so assigning a conversation to a stored message would be exactly the mutation that discipline forbids — and since conversations do not overlap, the range already *is* the membership (ADR-056).
 
 **Invariants.**
-- A Conversation belongs to exactly one Chat and never spans Chats.
-- At most one Conversation per Chat has `is_open = true`.
-- Conversations do not overlap in time within a Chat.
-- `ended_at` is null while open.
+- A Conversation belongs to exactly one Chat and never spans Chats, enforced by a composite foreign key rather than by a check (ADR-043).
+- Conversations do not overlap in time within a Chat. Enforced by a unique `(account_id, chat_id, started_at)`: each is a contiguous run, so two beginning at the same instant is the only way they could overlap.
+- `ended_at` is never null and never before `started_at`. A Conversation is derived from messages that already exist, so it always has a last one.
+- `message_count` is at least one. An empty Conversation is a row that should have been deleted.
+- **Identity survives re-segmentation.** A recomputed segment claims the stored Conversation owning the plurality of its messages; a stored one may be claimed by at most one segment, the earliest, with ties to the lowest identifier (ADR-056). Without that rule a rebuild would replace every Conversation with an identical-looking new one.
 
-**Segmentation rule (deterministic, no AI).** A new Conversation begins when the gap since the previous message exceeds `conversation_gap_minutes` (default 360), or when the open Conversation exceeds `conversation_max_messages` (default 200). Segmentation is pure and re-runnable: re-segmenting a Chat from its messages yields identical boundaries.
+**Segmentation rule (deterministic, no AI).** A new Conversation begins when the gap since the previous message exceeds `conversation.gap_minutes` (default 360), or when the current one reaches `conversation.max_messages` (default 200). It is a pure function of `sent_at` and a count, read in the total order `(sent_at, telegram_message_id, id)` — every component immutable once stored — so re-segmenting a Chat yields identical boundaries however the messages arrived.
+
+**Deferred attributes.** `is_open` — **derived, not stored** (ADR-056). Whether a Conversation may still grow depends on how long ago it ended, which depends on *now*; a stored flag would be true when written and wrong an hour later, with no job to correct it. `Conversation.is_open_at(now, gap)` asks it against a supplied instant, and version 1.0's "at most one open per Chat" is replaced by the stronger non-overlap constraint above. `initiated_by` — recomputable from the first message's sender; nothing reads it until relationship metrics (Milestone 6). `dominant_language` — needs language detection (Milestone 6).
 
 ---
 
@@ -352,21 +361,31 @@ Synchronisation records every kind of chat but sets `sync_enabled` only for the 
 
 **Responsibility.** A durable, user-visible fact about a Contact. The system's most valuable and most safety-critical state (ADR-019).
 
-**Attributes.** `id`, `account_id`, `contact_id`, `category`, `key`, `value`, `confidence`, `importance`, `provenance`, `source_message_id`, `source_conversation_id`, `valid_from`, `valid_until`, `is_pinned`, `last_retrieved_at`, `retrieval_count`, `created_at`, `updated_at`, `deleted_at`.
+**Attributes** (as implemented, ADR-059 and ADR-060). `id`, `account_id`, `contact_id`, `category`, `key`, `value`, `confidence`, `importance`, `source`, `proposal_id`, `conversation_id`, `ai_call_id`, `created_at`, `deleted_at`, `retrieval_count`, `last_retrieved_at`.
+
+**Where the key comes from.** It is a **deterministic normalisation of the value, derived by this application**: case folded, punctuation dropped, whitespace collapsed, truncated. The model never supplies it — a key is an identity, and identity is the one thing this project refuses to let a model own (ADR-058 §2, ADR-059 §2).
+
+That makes storing the same fact twice structurally impossible. It does **not** detect a contradiction: "Lives in Lisbon" and "Lives in Porto" normalise to different keys, so both are stored, and choosing between them is *conflict detection* (§6) rather than deduplication. The limitation is deliberate and is argued in ADR-059.
 
 **Invariants.**
-- `(account_id, contact_id, category, key)` is unique among non-deleted Memories. This constraint is what makes deduplication tractable.
-- Every Memory has provenance. A Memory with `provenance ∈ {AI_APPROVED, AI_AUTO}` must reference the source Message that produced it.
-- **`provenance = USER` outranks all AI provenance** in retrieval scoring and conflict resolution.
-- A Memory is never silently overwritten. Changing a value creates a `MemoryRevision` and updates the current value in one transaction.
-- `is_pinned` Memories are always eligible for retrieval regardless of score.
-- Deletion is soft first (`deleted_at`); hard deletion additionally removes revisions and embeddings.
+- `(account_id, contact_id, category, key)` is unique among non-deleted Memories. Two partial indexes rather than one, because SQL treats NULLs as distinct and a contactless fact would otherwise escape the constraint.
+- **`proposal_id` is unique among Memories**, so "accepting a proposal creates exactly one Memory" is a constraint rather than a rule a caller has to keep.
+- **A Memory is immutable and has no edit method.** Correcting one means forgetting it and accepting a new proposal. An edit in place would keep the provenance while changing the fact, and the provenance is the only thing that makes a stored claim checkable.
+- **Provenance is complete or absent, never partial.** A Memory created from a proposal always names the proposal, the conversation and the AI call. It may lose all three at once, when the chat they belong to is deleted — the foreign keys are `SET NULL` rather than `CASCADE`, because a memory is user-approved knowledge and does not stop being known because the exchange it came from was removed.
+- **`source = USER` outranks AI sources** in retrieval scoring and conflict resolution. Nothing implements that yet; only `ai_approved` is ever written today, because accepting a proposal is the only route into this table.
+- `confidence` is kept as the model reported it. A person accepting a fact says it is worth keeping, not that the model was certain.
+- **`importance` is a person's judgement and `confidence` is a machine's**, and retrieval ranks by importance *first* for exactly that reason (ADR-060 §2). It is set when the proposal is accepted — the moment somebody is looking at the fact and can judge — and is not changed afterwards.
+- **`retrieval_count` and `last_retrieved_at` are bookkeeping about the fact, not part of it**, which is what lets them change while the Memory stays immutable. They move together: a count with no timestamp could not say when, and a timestamp with no count would make "has this ever been used" depend on which field was asked.
+- **`last_retrieved_at` is deliberately not a ranking input.** Ranking by it would make a retrieved memory rank higher and so be retrieved again — a feedback loop rather than a relevance signal. It exists so the *absence* of retrieval stays visible.
+- Deletion is soft (`deleted_at`), and it **frees the key**, so the same fact can be accepted again — the only route to a correction. Hard deletion belongs to retention (Milestone 10).
+
+**Deferred attributes.** `is_pinned`, `valid_from` / `valid_until` and `updated_at` — the first two serve *ranking policies* nothing implements (pinning is a rule about bypassing the budget; validity is a rule about expiry), and the last has nothing to write it. `source_message_id` is not stored: extraction reads a whole conversation, so `conversation_id` is the honest granularity. `MemoryRevision` is absent because revisions record edits and there are none.
 
 **Categories (initial closed set).** `identity`, `location`, `occupation`, `interest`, `preference`, `relationship`, `important_date`, `plan`, `shared_experience`, `open_question`, `constraint`, `other`.
 
-**Lifecycle.** `proposed → approved → active → superseded | archived → deleted`
+**Lifecycle, as implemented.** `proposed → accepted → active → deleted`. A Memory exists only from the moment a person accepts the proposal it came from, and the only transition it has is being forgotten. `superseded` and `archived` need supersession and archival, neither of which exists.
 
-**Decay.** `effective_importance = importance × recency_factor(last_retrieved_at, updated_at)`. Decay affects ranking only; it never deletes. Deletion is always a user action or a retention-policy action (`PRIVACY.md` §6).
+**Decay.** `effective_importance = importance × recency_factor(last_retrieved_at, updated_at)`. Decay affects ranking only; it never deletes. Deletion is always a user action or a retention-policy action (`PRIVACY.md` §6). **Not implemented, and now deliberately so**: the inputs exist, but multiplying importance by a recency factor would fold two comparable facts into one incomparable number, which is exactly the weighted score ADR-060 §2 rejects. Decay should be reconsidered when there is retrieval data to justify a shape for it.
 
 ---
 
@@ -374,15 +393,23 @@ Synchronisation records every kind of chat but sets `sync_enabled` only for the 
 
 **Responsibility.** An AI-extracted candidate fact awaiting a decision. The mechanism that keeps hallucinated or injected content out of permanent memory (ADR-019).
 
-**Attributes.** `id`, `account_id`, `contact_id`, `category`, `key`, `value`, `confidence`, `source_message_id`, `source_conversation_id`, `prompt_version`, `model_identifier`, `status` (`pending` | `approved` | `rejected` | `superseded` | `expired`), `conflicts_with_memory_id`, `rejection_reason`, `created_at`, `decided_at`.
+**Attributes** (as implemented, ADR-058). `id`, `account_id`, `conversation_id`, `ai_call_id`, `category`, `value`, `confidence`, `evidence`, `prompt` (`prompt_id` + `version`), `status` (`pending` | `accepted` | `rejected`), `created_at`.
+
+**What the model supplies, and what it does not.** The model returns exactly four things: `category`, `value`, `confidence` and `evidence`. Everything else — identifier, timestamp, which conversation, which AI call, which prompt version, and the status it starts in — is assigned by the application. A model able to name an identifier could overwrite a proposal somebody had already read; one able to set a status could approve itself. The output schema sets `additionalProperties: false`, so an attempt to supply either fails validation rather than being ignored.
 
 **Invariants.**
-- A Proposal with a non-null `conflicts_with_memory_id` **can never be auto-approved**; it always requires a user decision.
-- Approval creates or revises exactly one Memory, in the same transaction that sets `status = approved`.
-- Rejected Proposals are retained so the same fact is not re-proposed; the extractor consults rejection history.
-- Proposals expire after a configured period (default 90 days) and are then `expired`, not silently deleted.
+- **Every proposal is created `pending` and is decided exactly once.** `MemoryProposal.decided()` is the only transition it has, and it refuses every source state but `pending`; the repository's one update names `pending` in its `WHERE` clause, so two decisions racing cannot both win. **Nothing returns a proposal to pending**, so a decision cannot be undone or reopened (ADR-059 §3).
+- **`status` and `decided_at` move together.** A decided proposal records when; a pending one does not. Both directions are enforced, so "has this been decided" has one answer however it is asked.
+- **Accepting creates exactly one Memory, in the same transaction as the decision. Rejecting creates none**, and the proposal is kept so the extractor does not offer the same fact again.
+- **`evidence` is required and never null.** A proposal without a quotation is a claim with no source. The application additionally checks that the quotation *appears in the conversation the model was shown* — whitespace-insensitive, case-insensitive, and nothing more forgiving than that. A model cannot quote what nobody said (ADR-058 §8).
+- `confidence` is between 0 and 1, enforced by the schema, the value object and a check constraint. A value outside the range is not a low confidence but a model that did not answer the question asked.
+- `(account_id, conversation_id, category, value)` is unique. Re-running extraction over a conversation must cost nothing and change nothing.
+- Rejected Proposals are retained so the same fact is not re-proposed; the duplicate check consults them.
+- `conversation_id` and `ai_call_id` are each half of a **composite** foreign key including `account_id`, so a proposal cannot cite another account's conversation or audit trail (ADR-043). Both cascade.
 
-**Auto-approval rule.** A Proposal auto-approves only when *all* hold: its category is in `UserProfile.auto_approve_memory_categories`; `confidence ≥ threshold.high`; `conflicts_with_memory_id` is null; and the Chat's `ai_processing_mode` is not `disabled`. Otherwise it waits for the user.
+**Deferred attributes.** `key` (a proposal does not need one — the *Memory* it becomes derives its key from the value at acceptance, ADR-059 §2), `contact_id` (resolved from the conversation's chat when the memory is created, so the extractor need not depend on the chat graph), `conflicts_with_memory_id` (nothing detects conflicts yet), `rejection_reason` (a rejection is a decision, not an explanation), `decided_by` (every decision is a person's, so the column would record a constant), `model_identifier` (reachable through `ai_call_id`, which carries the model, the cost and the moment), and the `superseded` / `expired` statuses (both are transitions, and a proposal has exactly one). Proposals therefore **do not expire**; §5.10's ninety-day rule arrives with the milestone that implements retention.
+
+**Auto-approval rule.** A Proposal auto-approves only when *all* hold: its category is in `UserProfile.auto_approve_memory_categories`; `confidence ≥ threshold.high`; `conflicts_with_memory_id` is null; and the Chat's `ai_processing_mode` is not `disabled`. Otherwise it waits for the user. **Not implemented, and deliberately not implemented in the slice that introduced proposals**: every proposal today waits for a person, and auto-approval is a decision worth making with a queue in front of you rather than in advance (ADR-058).
 
 ---
 
@@ -495,6 +522,45 @@ Synchronisation records every kind of chat but sets `sync_enabled` only for the 
 
 ---
 
+## 5.18a Suggestion (implemented, Milestone 10b)
+
+**Responsibility.** A thing the assistant has proposed, stored so that it can be
+reviewed, and awaiting exactly one decision. The narrow, built form of §5.18:
+where Reply Suggestion is the designed aggregate with alternatives, uncertainty
+flags and a recommended action, `Suggestion` is what exists today — enough to
+make every generated draft observable and decidable, and nothing more (ADR-062).
+
+**Attributes.** `id`, `account_id`, `chat_id`, `conversation_id` (nullable),
+`ai_call_id`, `proposal_type` (`reply_draft`), `title`, `description`,
+`payload`, `status` (`pending` | `accepted` | `dismissed`), `created_at`,
+`decided_at`.
+
+**Three fields for three audiences.** `title` for a listing, `description` for
+the **person deciding** — for a reply draft, the draft itself — and `payload`
+for a **machine that does not exist yet**, as a JSON object. The split is what
+keeps review uniform as the kinds of suggestion multiply: a reviewer decides
+about a title and a description whatever `proposal_type` says, so a new kind
+needs new payload handling and no new review.
+
+**Invariants.**
+- **Accepting executes nothing** (ADR-062). It records agreement and publishes a
+  fact. The use cases are given nothing that could act — no gateway, no
+  scheduler, no executor — so this is structural rather than a rule.
+- **Exactly one transition**, `pending` to a terminal state, enforced twice: the
+  entity refuses a second decision and explains itself, and the repository's
+  conditional `WHERE status = 'pending'` write survives concurrency. No undo, no
+  reopen, no edit.
+- `decided_at` is present exactly when the status is terminal, and never earlier
+  than `created_at`.
+- **Nothing is deleted, including dismissals.** A record of only what was agreed
+  with cannot show what the generator is getting wrong.
+- Every suggestion cites the `AiCall` that produced it, and through it the model,
+  the prompt version and the cost.
+- `payload` must parse as a JSON object; nothing further is checked, because
+  nothing reads it yet.
+
+---
+
 ## 5.19 Behavior Recommendation
 
 **Responsibility.** Advice about reply timing and shape. Deterministic (ADR-029 §3).
@@ -539,15 +605,23 @@ Synchronisation records every kind of chat but sets `sync_enabled` only for the 
 
 ## 5.22 Sync Cursor
 
+*Implemented in Milestone 2.8. Corrected by ADR-050 and ADR-054.*
+
 **Responsibility.** Per-Chat synchronisation bookmark making history backfill resumable and idempotent.
 
-**Attributes.** `id`, `account_id`, `chat_id`, `oldest_synced_message_id`, `newest_synced_message_id`, `backfill_complete`, `backfill_target_date`, `last_sync_at`, `last_error`, `consecutive_failures`, `updated_at`.
+**Identity.** The **chat identifier**, not a surrogate beside it. There is exactly one cursor per chat, so a surrogate would be a second name for one row — the reasoning ADR-038 applied to `UserProfile` and `Session`. Version 1.0 listed an `id`; ADR-054 removes it.
+
+**Attributes.** `account_id`, `chat_id`, `oldest_synced_message_id`, `newest_synced_message_id`, `backfill_complete`, `backfill_horizon`, `last_sync_at`, `updated_at`.
 
 **Invariants.**
-- Exactly one Cursor per Chat.
-- Backfill resumes from `oldest_synced_message_id` and never re-requests completed ranges.
-- Interrupting a sync at any point leaves the Cursor consistent; the next run resumes without gaps or duplicates.
-- `consecutive_failures` drives exponential backoff and, past a threshold, disables sync for that Chat and raises a Notification.
+- Exactly one Cursor per Chat, which is the primary key rather than a checked rule.
+- `oldest_synced_message_id` and `newest_synced_message_id` are both set or both null, and the first is never greater than the second. A floor with no ceiling describes a range whose extent nobody can state.
+- Backfill resumes from `oldest_synced_message_id` and never re-requests completed ranges. It is a **message identifier**, because Telegram pages history by one and identifiers are unique and totally ordered within a chat, which timestamps are not (ADR-054).
+- The Cursor is written **in the same transaction as the messages it accounts for**. Interrupting a sync at any point therefore leaves messages and bookmark agreeing, with no reconciliation pass (ADR-050).
+- `backfill_complete` means complete **for `backfill_horizon`**. The two are read together, so a run configured to reach further back resumes rather than reporting success.
+- `account_id` names the same account as the Chat, enforced by a composite foreign key rather than by a check (ADR-043).
+
+**Deferred attributes.** `consecutive_failures` — drives exponential backoff and, past a threshold, disables sync for a Chat and raises a Notification. None of that exists, so it would be written and never consulted; it records nothing historical, so adding it later loses nothing. `last_error` — **dropped**, not deferred: an error string on a row is a log entry in the wrong place (ADR-050). `backfill_target_date` is renamed `backfill_horizon`.
 
 ---
 
@@ -565,17 +639,20 @@ Synchronisation records every kind of chat but sets `sync_enabled` only for the 
 
 ---
 
-## 5.24 AI Provider
+## 5.24 AI Model
 
-**Responsibility.** A configured source of model capability, with its declared capabilities, limits and data-boundary classification.
+*Implemented as a **value object**, not a stored record (ADR-057 §2). The routing table this section originally described — `capabilities`, `is_default_for`, `priority` — is deferred to the milestone that has two providers to route between. A routing table with one row has never been exercised.*
 
-**Attributes.** `id`, `provider_name`, `provider_kind` (`cloud_llm` | `local_llm` | `cloud_embedding` | `local_embedding`), `model_identifier`, `endpoint`, `api_key_ref`, `capabilities`, `context_window_tokens`, `max_output_tokens`, `cost_per_input_token`, `cost_per_output_token`, `is_enabled`, `is_default_for`, `data_boundary` (`local` | `external`), `priority`, `created_at`, `updated_at`.
+**Responsibility.** Which model answered, and what using it implied.
+
+**Attributes.** `vendor` (`anthropic` | `fake`), `identifier`, `data_boundary` (`local` | `external`), `input_cost_per_million`, `output_cost_per_million`, `currency`.
 
 **Invariants.**
-- `api_key_ref` is a `SecretStore` name, never a key value (ADR-021).
-- A provider with `data_boundary = external` may only process content from Chats whose `ai_processing_mode = cloud_allowed` (ADR-024).
-- `capabilities` is discovered and verified by `ai check`, not trusted from configuration (ADR-020).
-- Disabling every provider is valid; the application degrades to non-AI features (`PROJECT_SPEC.md` §4.2).
+- `data_boundary` is derived from the **vendor**, never read from configuration. A cloud model is external however a settings file describes it, and a boundary a user could edit would put the privacy guarantee in a file (ADR-024).
+- `cost_of(usage)` returns `None` when the model is unpriced or the tokens were unreported. Zero would be a claim that a call was free.
+- A model with `data_boundary = external` may only process content from Chats whose `ai_processing_mode = cloud_allowed`, and never content that names no Chat at all (ADR-024, ADR-057 §3).
+- `api_key_ref` lives in configuration, not on the model, and is a `SecretStore` name, never a key value (ADR-021).
+- Configuring no provider is valid; the default is a local scripted model and the application degrades to non-AI features (`PROJECT_SPEC.md` §4.2).
 
 ---
 
@@ -583,12 +660,50 @@ Synchronisation records every kind of chat but sets `sync_enabled` only for the 
 
 **Responsibility.** An instrumentation record for one model invocation. Makes cost and latency measurable from the first milestone (ADR-029 §6).
 
-**Attributes.** `id`, `account_id`, `provider_name`, `model_identifier`, `prompt_id`, `prompt_version`, `task_kind`, `input_tokens`, `output_tokens`, `estimated_cost`, `latency_ms`, `outcome` (`success` | `schema_violation` | `repaired` | `rate_limited` | `timeout` | `provider_error` | `cancelled`), `retry_count`, `related_entity_kind`, `related_entity_id`, `created_at`.
+**Attributes.** `id`, `account_id`, `chat_id`, `model` (§5.24), `prompt` (`prompt_id` + `version`), `task_kind`, `usage` (`input_tokens`, `output_tokens`), `cost`, `outcome` (`success` | `timeout` | `rate_limited` | `provider_error` | `malformed` | `cancelled` | `refused`), `finish_reason` (`stop` | `length` | `content_filter` | `other`, null unless successful), `latency_ms`, `response_digest`, `response_text`, `created_at`.
 
 **Invariants.**
-- **Never stores prompt or response content** — only metadata (`SECURITY.md` §9).
-- Written for every call including failures; success-only instrumentation hides the expensive cases.
+- **Append-only.** Nothing transitions an AiCall, and `AiCallRepository` has no `update` and no `delete`. The absence of both is what says so (ADR-057 §5).
+- **Never stores the prompt**, under any setting. It is reconstructible from `prompt` and the message rows, and storing it would duplicate message content into a table with a different retention class (`SECURITY.md` §9).
+- `response_digest` is a truncated SHA-256 of the response, which is what deterministic replay compares. `response_text` is normally null and is written only when `ai.store_responses` is on — a diagnostic the production profile refuses, arranged exactly as `logging.diagnostic_mode` is (ADR-057 §6).
+- `cost` is computed by the entity from the model's rates, never supplied, so no caller can record a number the rates do not support. It is `Decimal`, stored as text.
+- A successful call records `finish_reason`; a failed one does not. A refused call spends no tokens.
+- `chat_id` is present because the privacy gate is per chat, so a record without it could not be audited against the permission that allowed it. It is part of a composite foreign key that cascades: a record derived from a deleted chat is residue of that chat (ADR-043, ADR-057 §10).
+- Written for every call including failures **and refusals**; success-only instrumentation hides the expensive cases, and an audit without refusals cannot show that a call was blocked.
 - Subject to log retention, not conversation retention.
+- `retry_count` is deferred: nothing retries yet, and a column nobody writes is a column nobody keeps correct (ADR-057).
+
+---
+
+## 5.25a Conversation Context and Prompt Context
+
+**Responsibility.** What a model is told, and the account of how it was chosen.
+Value objects produced by `ContextAssembler`, not aggregates: they have no
+identity, no lifecycle and no table (ADR-061 §8).
+
+**`ConversationContext`.** `turns` (who, text, tokens — oldest first),
+`available` (how many messages there were before trimming), `truncated` (how
+many were shortened to the per-message limit).
+
+**`PromptContext`.** `memories` (in retrieval order), `conversation`, `trimmed`
+(what the budget removed and why), `budget`, `tokens`, and `memory_keys` — the
+keys supplied to the model, against which its reported attribution is checked.
+
+**Invariants.**
+- The order is fixed: system prompt, memories, conversation, task and output
+  format. It is not configurable: an ordering a user could change would make
+  every installation's prompt a different experiment.
+- Trimming removes the oldest messages first, then the lowest-ranked memories.
+  The most recent message is never removed — without it there is nothing to
+  respond to.
+- **Nothing is ever shortened to fit the budget.** A truncated fact is a fact
+  that was never stated. (The per-message character limit is separate, applied
+  before assembly, and marked in the text so the model can tell.)
+- Memories are neutralised but not delimited; the conversation is delimited by
+  the prompt, which owns the markers.
+- **Neither is persisted.** They are how a prompt was built, not a record of
+  it; the writes in the pipeline are the `AiCall` and, since Milestone 10b, the
+  `Suggestion` the generated draft is stored as (§5.18a).
 
 ---
 
@@ -653,7 +768,7 @@ Domain services hold logic that belongs to no single entity. They are **pure**: 
 
 | Service | Responsibility | Key operations |
 |---|---|---|
-| `ConversationSegmenter` | Divides a Chat's messages into Conversations | `segment(messages, rules) → list[Conversation]` |
+| `ConversationSegmenter` | Divides a Chat's messages into Conversations | `segment(messages, rules) → list[Segment]` — **implemented**, Milestone 3.0, as `domain/services/segmentation.py`. Returns `Segment` rather than `Conversation`: a segment is the *shape* of an episode with no identity, and giving it one is the application's work, which is where stability across re-segmentation is decided (ADR-056) |
 | `RelationshipMetricsCalculator` | Computes Relationship Profile metrics from messages | `compute(messages, conversations, now) → RelationshipProfile` |
 | `StyleProfiler` | Derives Style Profiles from observable message features | `profile(messages) → StyleProfile` |
 | `MemoryRanker` | Scores memories for retrieval relevance | `rank(memories, query_vector, context, now) → ranked list` |
@@ -674,11 +789,15 @@ Domain services hold logic that belongs to no single entity. They are **pure**: 
 
 Events are immutable facts about something that has happened. Naming is past tense. Delivery semantics are defined in `EVENTS` (`ARCHITECTURE.md` §8).
 
+**Granularity is per batch, not per message** (ADR-050). Delivery is synchronous (ADR-031), so one event per message during a fifty-thousand-message backfill would run every handler fifty thousand times inside the sync loop. `MessagesIngested` replaces version 1.0's `MessageIngested` for that reason; a live update is the degenerate case with `count = 1`, so a handler has one shape to deal with rather than two.
+
+**Events are published after the transaction commits, never inside it.** A handler observing a fact that then rolled back would be acting on something that never happened. The bus is neither durable nor transactional, so a process that dies between the commit and the publication keeps the data and loses the event — which is the right way round.
+
 | Event | Payload | Raised by |
 |---|---|---|
 | `AccountCreated` | account_id, is_active | Account creation |
 | `AccountActivated` | account_id | Account activation |
-| `MessageIngested` | message_id, chat_id, is_outgoing | Ingest use case |
+| `MessagesIngested` | account_id, chat_id, count, newest_sent_at, source | Backfill, catch-up and live sync — **implemented**, Milestone 2.9 |
 | `ConversationStarted` / `ConversationEnded` | conversation_id, chat_id | Segmenter |
 | `ConversationAnalyzed` | conversation_id, analysis_ids | Analysis use case |
 | `SummaryCreated` | summary_id, conversation_id | Summarisation |
@@ -688,8 +807,11 @@ Events are immutable facts about something that has happened. Naming is past ten
 | `GoalChanged` | goal_id, contact_id, previous_status | Goal use case |
 | `RelationshipRecomputed` | contact_id | Metrics job |
 | `PlanCreated` | plan_id, conversation_id | Planner |
-| `SuggestionGenerated` | suggestion_id, confidence, recommended_action | Reply use case |
-| `SuggestionDecided` | suggestion_id, status | User action |
+| `SuggestionsCreated` | account_id, chat_id, suggestion_ids, ai_call_id | Generation — **implemented**, Milestone 10b |
+| `SuggestionAccepted` | account_id, chat_id, suggestion_id, proposal_type | Acceptance — **implemented**, Milestone 10b. A record of agreement; **no handler acts on it** (ADR-062) |
+| `SuggestionDismissed` | account_id, chat_id, suggestion_id, proposal_type | Dismissal — **implemented**, Milestone 10b |
+| `SuggestionGenerated` | suggestion_id, confidence, recommended_action | Reply use case — designed; superseded in practice by `SuggestionsCreated` |
+| `SuggestionDecided` | suggestion_id, status | User action — designed; the two implemented events name the decision instead, so a subscriber cannot accidentally handle both |
 | `MessageSent` | message_id, chat_id, from_suggestion_id | Send use case |
 | `SyncStarted` / `SyncProgressed` / `SyncCompleted` / `SyncFailed` | chat_id, counts, error | Sync use case |
 | `AuthorizationStateChanged` | previous, current | Session |
@@ -709,6 +831,7 @@ Events are immutable facts about something that has happened. Naming is past ten
 | **Chat** | Chat | Messages, Conversations, Sync Cursor, Attachments | Message ingest updates the Chat, Conversation and Cursor atomically |
 | **Contact Knowledge** | Contact | Memories, Revisions, Proposals, Goals, Relationship Profile, Style Profile | Proposal approval creates the Memory, its Revision and the status change atomically |
 | **Suggestion** | Reply Suggestion | Plan reference, Behavior Recommendation, context snapshot | Generation persists all parts or none |
+| **Suggestion** (implemented) | Suggestion (§5.18a) | — | Generation writes the `AiCall` and the `Suggestion` in one transaction; a decision is one transaction |
 | **Plugin** | Plugin | Plugin Data | Independent |
 
 Cross-aggregate consistency is **eventual**, achieved through domain events. Relationship recomputation after ingest, for example, is triggered by `MessageIngested` and is not part of the ingest transaction.

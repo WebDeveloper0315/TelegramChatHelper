@@ -1,0 +1,31 @@
+# The prompt registry: the single source of truth for which prompts exist.
+#
+# Discovery is never by filesystem convention. A loader that globbed this
+# directory would silently lose a prompt on rename and silently gain one on a
+# stray file, and both failures surface as a model answering the wrong question
+# (ADR-026).
+#
+# Each entry gives a path and, where the prompt produces data rather than prose,
+# the schema its answer is validated against. Version, purpose and inputs are
+# NOT repeated here -- they live in the prompt file's front matter, because two
+# places recording a version is one place too many for them to agree (ADR-058).
+#
+# Every path below is resolved and read at startup. A missing file, a template
+# whose variables disagree with its declaration, or a schema using a keyword the
+# validator does not implement stops the application then, rather than while
+# somebody is waiting for a suggestion.
+
+version: 1
+
+prompts:
+  system:
+    path: system/system.md
+    schema: null
+
+  memory_extract:
+    path: memory/extract.md
+    schema: schemas/memory_proposals.schema.json
+
+  chat_suggestion:
+    path: chat/suggestion.md
+    schema: schemas/conversation_suggestion.schema.json

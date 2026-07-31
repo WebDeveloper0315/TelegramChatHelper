@@ -15,6 +15,7 @@ it.
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime
 
 from tests.fakes.pagination import paginate
 from tgassist.domain.errors import ConstraintViolationError, DomainValidationError
@@ -133,6 +134,25 @@ class InMemoryMessageRepository(MessageRepository):
         """Return a message by its identifier in its chat, or ``None``."""
         found = self._find(chat_id, telegram_message_id)
         return replace(found) if found is not None else None
+
+    async def list_since(
+        self, chat_id: ChatId, since: datetime | None = None, *, limit: int = 10_000
+    ) -> tuple[Message, ...]:
+        """Return a chat's messages from an instant onwards, oldest first.
+
+        Sorted by ``(sent_at, id)`` here rather than by insertion, exactly as the
+        SQL query is: a fake that returned insertion order would let a
+        segmentation bug pass by agreeing with the order it happened to store.
+        """
+        found = [
+            replace(message)
+            for message in self._store.messages.values()
+            if message.account_id == self._account_id
+            and message.chat_id == chat_id
+            and (since is None or message.sent_at >= since)
+        ]
+        ordered = sorted(found, key=lambda message: (message.sent_at, int(message.id)))
+        return tuple(ordered[:limit])
 
     async def list_by_chat(self, chat_id: ChatId, request: PageRequest) -> Page[Message]:
         """Return one page of a chat's messages."""

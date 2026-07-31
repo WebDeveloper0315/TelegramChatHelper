@@ -11,7 +11,9 @@ identity, which ADR-041 already rejected.
 
 This module grows one slice at a time. Chat, message and update types arrive
 with the code that reads them, so nothing here is a guess about a shape that has
-no consumer.
+no consumer. :class:`TelegramUpdate` is the one deliberate exception: a base
+with no fields and one subclass, because a stream needs a type to be typed as
+even when only one thing travels on it yet.
 """
 
 from __future__ import annotations
@@ -295,6 +297,33 @@ class HistoryPage:
         return self.oldest_message_id is None
 
 
+@dataclass(frozen=True, slots=True)
+class TelegramUpdate:
+    """Something Telegram reported without being asked.
+
+    A base with no fields, so ``updates()`` has one type to yield and a consumer
+    has one type to match on. Concrete kinds arrive with the code that consumes
+    them -- ADR-051's rule, applied to the stream's payload rather than to the
+    port's methods.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class NewMessage(TelegramUpdate):
+    """A message arrived in a chat this account can see.
+
+    The only update kind consumed today. Edits, deletions and reactions are
+    separate updates in TDLib and separate work here: each changes a stored
+    message rather than adding one, and ``MessageRepository`` has no update path
+    on purpose (ADR-046).
+
+    Attributes:
+        message: What arrived, as Telegram described it.
+    """
+
+    message: TelegramMessage
+
+
 def require_credential(value: str, *, name: str) -> str:
     """Return ``value`` stripped, refusing anything a submission cannot use.
 
@@ -326,9 +355,11 @@ def require_credential(value: str, *, name: str) -> str:
 __all__ = [
     "CodeHint",
     "HistoryPage",
+    "NewMessage",
     "PasswordHint",
     "TelegramChatInfo",
     "TelegramMessage",
+    "TelegramUpdate",
     "TelegramUser",
     "require_credential",
 ]

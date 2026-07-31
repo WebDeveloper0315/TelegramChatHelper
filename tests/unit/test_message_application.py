@@ -301,6 +301,28 @@ class TestIdempotency:
         assert report.stored == 2
         assert report.skipped == 2
 
+    async def test_one_batch_naming_a_message_twice_stores_it_once(self, harness: _Harness) -> None:
+        # Nothing is written until the batch is built, so the repository cannot
+        # answer for an identifier this batch has already claimed. Without
+        # tracking them the second copy would meet the unique index -- an error
+        # raised over exactly the case this pipeline promises to absorb.
+        report = await harness.ingest().execute(
+            int(CHAT_A),
+            [incoming(telegram_message_id=9001), incoming(telegram_message_id=9001)],
+        )
+
+        assert report.stored == 1
+        assert report.skipped == 1
+
+    async def test_a_batch_of_unidentified_messages_is_never_collapsed(
+        self, harness: _Harness
+    ) -> None:
+        # The dedup is by identifier, not by content: two identical typed
+        # messages in one batch are still two messages.
+        report = await harness.ingest().execute(int(CHAT_A), [incoming(), incoming()])
+
+        assert report.stored == 2
+
     async def test_a_repeat_commits_nothing(self, harness: _Harness) -> None:
         await harness.ingest().execute(int(CHAT_A), [incoming(telegram_message_id=9001)])
         before = len(harness.units)

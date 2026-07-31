@@ -76,7 +76,7 @@ ready in which sense?
 | M2 deliverable (`ROADMAP.md`) | Table needed | Migration plan says |
 |---|---|---|
 | "Resumable per-chat backfill with cursors" | `sync_cursors` | `0008`, Milestone 3 |
-| "Conversation segmentation on ingest" | `conversations` | `0008`, Milestone 3 |
+| "Conversation segmentation on ingest" | `conversations` | `0009`, **applied in Milestone 3.0** |
 | "Media metadata" | `attachments` | `0008`, Milestone 3 |
 
 Three of M2's stated deliverables depend on tables the migration plan assigns to
@@ -378,8 +378,12 @@ rather than left as a claim.
 `TelegramGateway` is declared **one slice at a time** (ADR-051). Slice 3
 declared lifecycle, authorization, both state axes and `get_me`; slice 4 added
 `list_chats`, `get_chat` and `fetch_history`; slice 5 added `get_contact` and
-`list_contacts`. `updates()` arrives with the update consumer (slice 7) and
-`send_message` with slice 8.
+`list_contacts`; slice 7 added `updates()`. `send_message` arrives with slice 8.
+
+`updates()` is **not** a second consumer of `TdjsonClient.receive()`. The
+dispatch loop maps message updates into a bounded queue and `updates()` drains
+it, so the single-consumer rule below is unchanged and the architectural test
+that asserts it needed no exception (ADR-055).
 
 `list_contacts` is a separate call from `list_chats` rather than a convenience
 over it: the address book and the chat list are different populations, and
@@ -443,28 +447,40 @@ ADR-038 applied to `UserProfile`, and for the same reason.
 
 ## 6.2 `SyncCursor`
 
-`DOMAIN_MODEL.md` §5.22 as written, minus two fields with no consumer:
+*Implemented in Milestone 2.8. Completed by ADR-054.*
+
+`DOMAIN_MODEL.md` §5.22 as written, minus three fields with no consumer:
 
 ```python
 @dataclass(frozen=True, slots=True)
 class SyncCursor:
-    account_id: AccountId
+    account_id: AccountId                        # carried for the composite FK
     chat_id: ChatId                              # identity: one cursor per chat
     oldest_synced_message_id: TelegramMessageId | None
     newest_synced_message_id: TelegramMessageId | None
     backfill_complete: bool
     backfill_horizon: datetime | None            # how far back we intend to go
     last_sync_at: datetime | None
-    consecutive_failures: int
     updated_at: datetime
 ```
 
 `last_error` is dropped: an error string on a row is a log entry in the wrong
-place, and the failure count is what drives behaviour. `backfill_target_date` is
-renamed `backfill_horizon` for consistency with the configuration key.
+place. `backfill_target_date` is renamed `backfill_horizon` for consistency with
+the configuration key.
+
+`consecutive_failures` is **deferred**, not dropped. It exists to drive backoff
+and notifications, neither of which exists, so it would be written and never
+consulted — and unlike the two identifiers it records nothing historical, so
+adding it later costs one migration and no lost information (ADR-054).
+
+`chat_id` is the **primary key**, not a surrogate beside a unique index: exactly
+one cursor per chat, so the invariant is the key. `account_id` is carried so the
+foreign key can be composite, which is what makes a cursor for one account's
+chat unattachable to another's (ADR-043).
 
 The cursor is written **in the same transaction as the messages it accounts
-for**. That single fact is what makes interruption safe (§8.4).
+for**. That single fact is what makes interruption safe (§8.4), and the test
+that proves it throws an exception one statement before the commit.
 
 ## 6.3 Gateway DTOs
 
@@ -554,6 +570,25 @@ Ordered, because getting the order wrong loses data or hangs:
 A `BackgroundTaskSupervisor` (§11.3) owns steps 1–2 so that no component has to
 remember the order.
 
+**As implemented (slice 7).** The supervisor owns steps 1 and 2;
+`Container.run_live_sync` sequences them against steps 3 to 5, because joining
+an infrastructure supervisor to an application use case is what a composition
+root is for and an architectural test refuses the alternative (ADR-011).
+
+Two things the list did not say, and implementation had to decide:
+
+*Queued updates are dropped at shutdown, and counted.* `disconnect()` sets a
+closing flag before cancelling anything, after which the dispatch loop drops
+rather than waits — a loop blocked on a queue nobody will drain again is a
+shutdown that hangs. What is lost is bounded by the queue and recovered by the
+next run's catch-up pass.
+
+*An event is not published for an uncommitted batch.* `MessagesIngested` is
+published after the commit, outside the transaction. A process that dies between
+the two keeps the messages and loses the event, which is the right way round:
+the bus is neither durable nor transactional, and anything that must survive is
+a database write.
+
 ## 7.3 Gateway lifetime and multi-account
 
 One `TelegramGateway` instance per Account, created and owned by the container,
@@ -624,9 +659,28 @@ stored range.
 
 Terminates on the **first** of: an empty page (chat beginning),
 `sent_at < backfill_horizon` (default 365 days, `PROJECT_SPEC.md` §4.1), or the
-per-chat cap (default 50 000). All three are configuration, all three are
-recorded on the cursor so a later horizon change is a resumption rather than a
-restart.
+per-chat cap (default 50 000).
+
+**As implemented (slice 6).** Two of the three, plus one the plan did not name.
+
+*The empty page and the horizon are implemented.* `backfill_horizon` is recorded
+on the cursor beside `backfill_complete`, and the two are read together —
+"complete" means complete *for that horizon*, so a later run configured to reach
+further back reopens the cursor and continues from the same floor rather than
+restarting (ADR-054).
+
+*The per-chat cap is not.* It needs a count of stored messages per chat, which
+needs a repository method and an index that should be chosen by the query using
+it (`DATABASE.md` §20). The horizon already bounds every run.
+
+*A caller's batch limit is.* `--max-batches` bounds a single run, which is what
+makes a long backfill interruptible on purpose rather than only by accident.
+
+**A fourth stop exists as a safety property rather than a policy.** Every batch
+must move the cursor down or end the run; a batch that leaves it where it was
+stops with `no_progress`. Unreachable against a gateway that honours
+`before_message_id`, and the reason the loop cannot spin against one that does
+not.
 
 ## 8.4 Transaction granularity — the constraint ADR-034 imposes
 
@@ -850,6 +904,16 @@ at the wrong granularity.
 Each has a real subscriber in a later milestone (relationship metrics, memory
 extraction, notifications). None is published before it has one.
 
+**As implemented (slice 7): `MessagesIngested` only.** It is published once per
+committed batch by the backfill, the catch-up and live synchronisation, and it
+carries one field this section did not name -- `source`, which says which of the
+three wrote the batch. A subscriber that treated fifty thousand back-filled rows
+like one arriving message would do fifty thousand times the work it meant to,
+and `count` alone does not distinguish them.
+
+The other six remain unpublished. Nothing subscribes to them, and an event
+shaped before its first consumer is a guess.
+
 ## 11.3 `BackgroundTaskSupervisor`
 
 Infrastructure, not a port: one implementation, and the thing it manages is
@@ -857,6 +921,22 @@ asyncio itself. It owns named long-lived tasks (the update consumer, the sync
 engine, the ingestion serialiser), restarts one that dies unexpectedly with
 backoff, and implements the shutdown ordering in §7.2 so no caller has to
 remember it.
+
+**As implemented (slice 7).** Built, and supervising one task: the live
+consumer. Two behaviours are worth stating because they are easy to get wrong in
+the other direction:
+
+- A task that **returns normally** is finished, not restarted. A consumer that
+  reached the end of its stream has done its job, and restarting it would turn a
+  closed connection into an endless reconnection loop.
+- A **cancelled** task is not restarted either. Cancellation is how shutdown is
+  expressed, and a supervisor that fought it would make shutdown impossible.
+
+The **ingestion serialiser is not built**, and slice 7 found the reason it is not
+needed yet: the two producers never run concurrently. A live run catches up and
+*then* drains, in one task; a backfill is a separate command. A single consumer
+task already serialises every write, and a queue with workers in front of one
+connection (ADR-034) would be the same guarantee with more moving parts.
 
 ---
 
@@ -934,8 +1014,8 @@ demonstrable. Sized like the M1.x slices that worked.
 | 3 | Authentication | `AuthorizationHandler`, `AuthenticateAccount`, `tgassist login` / `logout`; session survives restart | **Done, 2026-07-28** |
 | 4 | Gateway reads + fake | `TelegramGateway` port, TDLib adapter reads, `FakeTelegramGateway`, shared contract suite, `tgassist telegram chats` | **Done, 2026-07-29** |
 | 5 | Chat and contact sync | `SyncChats` / `SyncContacts`, scope configuration, operator-identity invariant (§2.6) | **Done, 2026-07-30** |
-| 6 | Backfill | `SyncCursor` + migration, `SyncEngine` backfill, batched transactions, resumption tests | 5 |
-| 7 | Live updates | Update consumer, ingestion serialiser, `MessagesIngested`, `tgassist watch` | 6 |
+| 6 | Backfill | `SyncCursor` + migration `0008`, `SyncHistory`, batched transactions, resumption tests, `tgassist sync history` | **Done, 2026-07-30** |
+| 7 | Live updates | `updates()`, dispatcher, `SyncLive` with catch-up, `BackgroundTaskSupervisor`, `MessagesIngested`, `tgassist sync live` / `status` | **Done, 2026-07-30** |
 | 8 | Send | `SendMessage`, explicit-approval path, architectural test asserting no typing method | 7 |
 
 Slices 0–3 are the risky ones and are front-loaded deliberately. If slice 0
@@ -977,6 +1057,8 @@ decisions this plan had not seen:
 | **051** | Authorization Is Driven by a Dispatch Loop over a Single Update Stream | Slice 3 — §5.1's port surface and §7.1's single consumer |
 | **052** | The Operator's Telegram Identity Is the Account's, and It Is Enforced in a Domain Service | Slice 5 — §2.6 |
 | **053** | Synchronisation Is Additive, Per-Item Transactional, and Never Overrules the Operator | Slice 5 — §8.4, §8.6 |
+| **054** | A Sync Cursor Is Keyed by Its Chat, Stores a Message Identifier, and Records the Horizon It Reached | Slice 6 — §6.2, §8.3 |
+| **055** | Live Updates Are Dispatched by the One Receive Loop, Buffered from Connect, and Consumed Serially | Slice 7 — §7.1, §7.2, §11.2, §11.3 |
 
 Documentation corrections needing no ADR: §2.3 (migration plan), §2.4 (port
 surface), §2.5 (already decided, unimplemented), §2.7 (diagram).

@@ -13,6 +13,10 @@ expressed without special cases.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+from collections.abc import AsyncGenerator
+
 from tgassist.domain.errors import (
     AuthorizationError,
     TdlibNotRunningError,
@@ -28,9 +32,11 @@ from tgassist.domain.model.session import AuthorizationState, ConnectionState
 from tgassist.domain.model.telegram import (
     CodeHint,
     HistoryPage,
+    NewMessage,
     PasswordHint,
     TelegramChatInfo,
     TelegramMessage,
+    TelegramUpdate,
     TelegramUser,
     require_credential,
 )
@@ -38,6 +44,7 @@ from tgassist.domain.ports.telegram_gateway import (
     DEFAULT_CHAT_LIMIT,
     DEFAULT_CONTACT_LIMIT,
     DEFAULT_HISTORY_LIMIT,
+    DEFAULT_UPDATE_QUEUE_SIZE,
     AuthorizationHandler,
     RetryDecision,
     TelegramGateway,
@@ -71,6 +78,9 @@ class FakeTelegramGateway(TelegramGateway):
         contact_calls: How many users were resolved individually, so a sync that
             looks somebody up once per run rather than once per chat is
             measurable.
+        dropped_updates: How many pushes arrived after shutdown began. Counted
+            for the same reason the real gateway counts them: a run that lost
+            updates while stopping should be able to say so.
         submitted: Which credential kinds were asked for, in order. Deliberately
             **not** what was submitted: a fake that recorded codes and passwords
             would be a test fixture that stores credentials, which is the thing
@@ -82,18 +92,23 @@ class FakeTelegramGateway(TelegramGateway):
         "_authorized",
         "_book",
         "_chats",
+        "_closing",
         "_code",
         "_connected",
         "_connection",
         "_history",
         "_password",
+        "_queue_size",
         "_requires_password",
         "_starts_authorized",
+        "_streaming",
+        "_updates",
         "_user",
         "_users",
         "connect_calls",
         "contact_calls",
         "disconnect_calls",
+        "dropped_updates",
         "list_calls",
         "logout_calls",
         "submitted",
@@ -108,6 +123,7 @@ class FakeTelegramGateway(TelegramGateway):
         requires_password: bool = False,
         code: str = ACCEPTED_CODE,
         password: str = ACCEPTED_PASSWORD,
+        update_queue_size: int = DEFAULT_UPDATE_QUEUE_SIZE,
     ) -> None:
         """Build a gateway for one account.
 
@@ -120,6 +136,8 @@ class FakeTelegramGateway(TelegramGateway):
             code: The code that will be accepted. Anything else is rejected the
                 way Telegram rejects one.
             password: The password that will be accepted.
+            update_queue_size: How many updates to hold before a push is
+                dropped. Small values let a test describe a slow consumer.
         """
         self._account_id = account_id
         self._user = user
@@ -127,7 +145,12 @@ class FakeTelegramGateway(TelegramGateway):
         self._requires_password = requires_password
         self._code = code
         self._password = password
+        self._queue_size = update_queue_size
 
+        self._updates: asyncio.Queue[TelegramUpdate | None] | None = None
+        self._closing = False
+        self._streaming = False
+        self.dropped_updates = 0
         self._connected = False
         self._authorized = AuthorizationState.UNAUTHORIZED
         self._connection = ConnectionState.OFFLINE
@@ -155,10 +178,17 @@ class FakeTelegramGateway(TelegramGateway):
     # -- Lifecycle --------------------------------------------------------
 
     async def connect(self) -> None:
-        """Start the fake client. Idempotent, like the real one."""
+        """Start the fake client. Idempotent, like the real one.
+
+        The queue exists before anything can arrive, exactly as the real
+        gateway's does: an update offered before a consumer asks is held, not
+        lost.
+        """
         self.connect_calls += 1
         if self._connected:
             return
+        self._updates = asyncio.Queue(maxsize=self._queue_size)
+        self._closing = False
         self._connected = True
         self._connection = ConnectionState.READY
         self._authorized = (
@@ -168,8 +198,15 @@ class FakeTelegramGateway(TelegramGateway):
         )
 
     async def disconnect(self) -> None:
-        """Stop the fake client. Idempotent."""
+        """Stop the fake client. Idempotent.
+
+        Ends the update stream the way the real gateway does: anything still
+        queued is abandoned, and a consumer waiting on it returns rather than
+        hanging.
+        """
         self.disconnect_calls += 1
+        self._closing = True
+        self._end_stream()
         self._connected = False
         self._connection = ConnectionState.OFFLINE
 
@@ -304,6 +341,55 @@ class FakeTelegramGateway(TelegramGateway):
         page = tuple(stored[:limit])
         oldest = min((m.id for m in page), default=None)
         return HistoryPage(messages=page, oldest_message_id=oldest)
+
+    # -- The update stream -------------------------------------------------
+
+    async def updates(self) -> AsyncGenerator[TelegramUpdate]:
+        """Yield scripted updates in arrival order, until disconnected."""
+        queue = self._updates
+        if not self._connected or queue is None:
+            msg = "updates requires a connected gateway"
+            raise TdlibNotRunningError(msg, user_message="Not connected to Telegram.")
+        if self._streaming:
+            msg = "The update stream already has a consumer"
+            raise TdlibNotRunningError(
+                msg, user_message="Something is already reading Telegram updates."
+            )
+
+        self._streaming = True
+        try:
+            while True:
+                update = await queue.get()
+                if update is None:
+                    return
+                yield update
+        finally:
+            self._streaming = False
+
+    def push_update(self, update: TelegramUpdate) -> None:
+        """Make Telegram report something. The test's stand-in for the network.
+
+        Offered without waiting, exactly as the dispatch loop offers one: a
+        script that overran the queue would be describing backpressure, which is
+        the gateway's business and not a test's.
+        """
+        queue = self._updates
+        if queue is None or self._closing:
+            self.dropped_updates += 1
+            return
+        queue.put_nowait(update)
+
+    def push_message(self, message: TelegramMessage) -> None:
+        """Make Telegram report an arriving message."""
+        self.push_update(NewMessage(message=message))
+
+    def _end_stream(self) -> None:
+        """Wake a consumer waiting on a queue that will receive nothing more."""
+        queue = self._updates
+        if queue is None:
+            return
+        with contextlib.suppress(asyncio.QueueFull):
+            queue.put_nowait(None)
 
     def script_chats(self, *chats: TelegramChatInfo) -> None:
         """Replace the chats this gateway will report."""

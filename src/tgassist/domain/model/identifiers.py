@@ -49,6 +49,53 @@ ChatId = NewType("ChatId", int)
 MessageId = NewType("MessageId", int)
 """Local identifier for a :class:`~tgassist.domain.model.message.Message`."""
 
+ConversationId = NewType("ConversationId", int)
+"""Identifier of a bounded episode of interaction within a Chat.
+
+Locally generated, like every identifier here (ADR-041) -- but for a reason the
+others do not have: a Conversation is **derived** from messages rather than
+reported by anybody, so there is no external identifier it could take even if
+one were wanted. What makes it *stable* across re-segmentation is not the
+generator but the matching rule in ADR-056.
+"""
+
+MemoryId = NewType("MemoryId", int)
+"""Identifier of a fact a person has approved for long-term retention.
+
+Locally generated, and assigned when a proposal is **accepted** rather than when
+it was extracted. A memory and the proposal it came from are different things
+with different lifetimes -- the proposal records what a model said, the memory
+records what a person decided -- and giving them one identifier would make the
+first indistinguishable from the second in every later reference (ADR-059).
+"""
+
+MemoryProposalId = NewType("MemoryProposalId", int)
+"""Identifier of one candidate fact awaiting a decision.
+
+Locally generated, and **assigned by the application rather than by the model
+that proposed the fact**. That is not a detail of where identifiers come from:
+a model able to name an identifier could name one already in use, and so
+overwrite a proposal a person had already read (ADR-058).
+"""
+
+SuggestionId = NewType("SuggestionId", int)
+"""Identifier of something a model proposed doing, awaiting a decision.
+
+Locally generated, and assigned when the suggestion is *stored* rather than when
+it was generated. Slice 9e produced suggestions that existed for the length of
+one command; giving one an identifier is what makes it reviewable later, which
+is the whole of ADR-062.
+"""
+
+AiCallId = NewType("AiCallId", int)
+"""Identifier of one recorded model invocation.
+
+Locally generated. An AI call has no external identity worth keeping: a provider
+returns a request identifier, but it is theirs, it is per-provider, and it means
+nothing once the provider is replaced -- which is the whole point of the port
+this identifier sits behind (ADR-057).
+"""
+
 TelegramMessageId = NewType("TelegramMessageId", int)
 """Identifier assigned by Telegram to a message, unique only within its chat.
 

@@ -314,7 +314,7 @@ Default 14 days, configurable. Rotation by size and age. Logs are excluded from 
 3. Database files created with owner-only permissions; verified at startup.
 4. **Never stored in the database:** passwords, API keys, authentication codes, session tokens, encryption keys.
 5. Phone numbers stored as salted hashes only.
-6. `ai_calls` stores metadata only — never prompt or response content.
+6. `ai_calls` stores metadata only — **never prompt content, under any setting**. The response is stored as a truncated SHA-256 digest, which is what deterministic replay compares without the answer being readable. The text itself is written only when `ai.store_responses` is enabled, which the **production profile rejects at startup** — the same arrangement `logging.diagnostic_mode` has, and the only setting in the application that can put model output on disk (ADR-057 §6).
 7. `audit_log` is append-only, enforced both by the absence of mutation methods on `AuditRepository` and by database triggers.
 8. Every migration is preceded by an automatic backup and is reversible (`DATABASE.md` §7).
 9. `PRAGMA integrity_check` runs after any crash and after every restore.
@@ -341,9 +341,11 @@ Per ADR-024.
 
 Conversation content is untrusted input that enters model prompts. The full analysis is in `AI_MODELS.md` §12; the security-relevant controls are:
 
-1. **Structural delimiting.** Untrusted content occupies clearly marked slots. The system prompt states that content within them is data, never instructions.
-2. **Delimiter neutralisation.** Content is scanned and escaped so it cannot forge a slot boundary.
-3. **Schema validation on every response.** An injection producing prose instead of the required structure fails validation and never reaches the user.
+1. **Structural delimiting.** Untrusted content occupies clearly marked slots. The system prompt states that content within them is data, never instructions. *Implemented:* a `Prompt` declares which inputs are untrusted and `render()` wraps them — the template cannot forget to (ADR-058 §4).
+2. **Delimiter neutralisation.** Content is scanned and escaped so it cannot forge a slot boundary. *Implemented as* collapsing any run of three or more angle brackets to two. Visible rather than hidden, and it can never lengthen the text. **Model output derived from conversation content — such as previously-stored proposal values — is treated as untrusted for the same reason.**
+3. **Schema validation on every response.** An injection producing prose instead of the required structure fails validation and never reaches the user. *Implemented*, with exactly one repair attempt and no partial results.
+3a. **Nothing a model returns becomes believed state.** An injection that survived every control above produces a `MemoryProposal`, which sits in a queue until a person reads it and its quotation. This is the control the others exist to support: no known technique makes a model reliably immune to injection, so the architectural answer is that a successful one reaches nothing valuable (ADR-019, ADR-058).
+3b. **Even acceptance grants nothing but storage.** A `Memory` is a row a person approved; it cannot execute, cannot send, and cannot change itself. Its *identity* is derived by the application rather than taken from the model, so an injection cannot claim the key of an existing memory or block a true fact from being stored by colliding with it (ADR-059 §2). What is accepted can be forgotten, and forgetting frees the fact to be proposed again.
 4. **No capabilities in generation.** Generation prompts have no tools, no send path, no database access. There is nothing for an injection to invoke.
 5. **Memory writes are proposals.** An injection attempting to plant a false memory produces a reviewable proposal, not a stored fact.
 6. **Length caps** on individual messages entering a prompt, bounding payload space.

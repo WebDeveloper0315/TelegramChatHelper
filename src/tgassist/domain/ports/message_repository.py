@@ -13,15 +13,24 @@ synchronisation. Adding an update path now would settle by accident a question
 that belongs to the code performing the edit -- whether an edited message mutates
 its row or supersedes it.
 
-Four operations, each traceable to a caller that exists:
+Five operations, each traceable to a caller that exists:
 
 * :meth:`add` -- ingestion.
 * :meth:`get` -- ``message show``.
 * :meth:`get_by_telegram_id` -- **the idempotency check**. This is what makes the
   pipeline re-runnable: an ingestion that has already happened is recognised
   rather than rejected by a constraint.
-* :meth:`list_by_chat` -- the conversation history, and the only query anything
-  reads messages in bulk through.
+* :meth:`list_by_chat` -- the conversation history, newest first.
+* :meth:`list_since` -- what conversation segmentation reads: one chat's
+  messages from an instant onwards, **oldest first**. A separate method rather
+  than an option on the one above, because it answers a different question and
+  a boolean that reversed a query's meaning would be the kind of parameter every
+  caller has to look up.
+
+Still no ``update`` and no ``delete``. Segmentation might have been expected to
+need one -- to write a ``conversation_id`` onto each message -- and does not:
+membership is the conversation's time range, so nothing about a stored message
+changes when it is segmented (ADR-056).
 
 There is no ``search``: it is dialect-specific and belongs to
 ``MessageSearchPort`` (ADR-016 section 4). There is no ``list_by_account``
@@ -31,6 +40,7 @@ arrive with the feature that needs it so its index can be measured.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from tgassist.domain.model.identifiers import (
@@ -88,5 +98,28 @@ class MessageRepository(Protocol):
         Ordered by ``sent_at`` rather than by ingestion order, because a
         backfill inserts old messages after new ones and history read in
         insertion order would be nonsense.
+        """
+        ...
+
+    async def list_since(
+        self, chat_id: ChatId, since: datetime | None = None, *, limit: int = 10_000
+    ) -> tuple[Message, ...]:
+        """Return a chat's messages from an instant onwards, oldest first.
+
+        The read a segmentation pass begins with. Ordered ascending because that
+        is the order boundaries are computed in, and returned whole rather than
+        paged because the pass needs the window at once -- a boundary depends on
+        the message before it, so a page split would need the caller to carry
+        the previous page's tail.
+
+        Args:
+            chat_id: The chat to read.
+            since: Include messages sent at or after this instant. ``None``
+                reads the chat from its beginning, which is what a full rebuild
+                asks for.
+            limit: A ceiling on how many to return, so one call cannot load an
+                unbounded chat into memory. A caller that hits it has asked for
+                a window too wide to segment in one pass, and the count it gets
+                back is what tells it so.
         """
         ...

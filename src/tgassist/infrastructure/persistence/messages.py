@@ -149,6 +149,25 @@ class SqlMessageRepository(Repository[Message], MessageRepository):
             operation="list_messages",
         )
 
+    async def list_since(
+        self, chat_id: ChatId, since: datetime | None = None, *, limit: int = 10_000
+    ) -> tuple[Message, ...]:
+        """Return a chat's messages from an instant onwards, oldest first.
+
+        Served by ``ix_messages_account_id_chat_id_sent_at``, which already
+        exists for the history listing: the same index reads either direction,
+        so segmentation needed none of its own.
+        """
+        statement = self._scoped().where(messages.c.chat_id == int(chat_id))
+        if since is not None:
+            statement = statement.where(messages.c.sent_at >= since)
+
+        rows = await self.fetch_all(
+            statement.order_by(messages.c.sent_at.asc(), messages.c.id.asc()).limit(limit),
+            operation="list_messages_since",
+        )
+        return tuple(self._mapper.to_domain(row) for row in rows)
+
     def _require_own(self, message: Message, *, operation: str) -> None:
         """Refuse a message belonging to a different account.
 

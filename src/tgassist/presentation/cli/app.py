@@ -28,8 +28,11 @@ import typer
 from tgassist import __version__
 from tgassist.application.container import Container
 from tgassist.application.use_cases.account import CreateAccountRequest
+from tgassist.application.use_cases.backfill import BackfillReport, BackfillStop
 from tgassist.application.use_cases.contact import ContactTransition
+from tgassist.application.use_cases.live import LiveOutcome
 from tgassist.application.use_cases.message import IncomingMessage
+from tgassist.application.use_cases.suggestion import GeneratedSuggestion
 from tgassist.application.use_cases.sync import SyncReport
 from tgassist.application.use_cases.user_profile import ProfileChanges
 from tgassist.domain.errors import (
@@ -38,8 +41,10 @@ from tgassist.domain.errors import (
     DomainValidationError,
     RecordNotFoundError,
 )
+from tgassist.domain.model.ai import AiCall, PromptVersion
 from tgassist.domain.model.chat import AiProcessingMode, Chat, ChatType
 from tgassist.domain.model.identifiers import AccountId, TelegramChatId
+from tgassist.domain.model.memory import IMPORTANCE_LEVELS, Importance
 from tgassist.domain.model.message import MessageType, SenderKind
 from tgassist.domain.model.query import PageRequest
 from tgassist.domain.model.tdlib import (
@@ -106,6 +111,23 @@ app.add_typer(telegram_app, name="telegram")
 # something against their own account.
 sync_app = typer.Typer(help="Copy Telegram state into the local database.", no_args_is_help=True)
 app.add_typer(sync_app, name="sync")
+# Conversations are derived from stored messages, so these commands reach
+# Telegram not at all -- `rebuild` recomputes, it does not fetch.
+conversation_app = typer.Typer(help="Inspect and recompute conversations.", no_args_is_help=True)
+app.add_typer(conversation_app, name="conversation")
+# The AI boundary. `run` is the only command in this application that can send
+# content to a third party, and only when a chat has allowed it.
+ai_app = typer.Typer(help="Run and inspect AI calls.", no_args_is_help=True)
+app.add_typer(ai_app, name="ai")
+
+memory_app = typer.Typer(help="Extract and review candidate memories.", no_args_is_help=True)
+app.add_typer(memory_app, name="memory")
+
+# The review queue. Accepting a suggestion records agreement and does
+# nothing else: there is no executor anywhere in this application, and
+# these commands are given nothing that could send a message (ADR-062).
+suggestion_app = typer.Typer(help="Review what the assistant has suggested.", no_args_is_help=True)
+app.add_typer(suggestion_app, name="suggestion")
 
 ProfileOption = Annotated[
     str | None,
@@ -1676,6 +1698,1165 @@ def sync_chats(
         _report(report, "chat")
 
     _run_async(container, run())
+
+
+@sync_app.command("history")
+def sync_history(  # noqa: PLR0913, PLR0917 - one parameter per command-line option
+    chat: Annotated[
+        int | None,
+        typer.Argument(help="Local chat id, from `tgassist chat list`. Omit for every chat."),
+    ] = None,
+    resume: Annotated[
+        bool,
+        typer.Option(
+            "--resume",
+            help="Continue where the last run stopped. The default; state it to be explicit.",
+        ),
+    ] = False,
+    reset: Annotated[
+        bool,
+        typer.Option("--reset", help="Discard the bookmark and start again from the newest."),
+    ] = False,
+    max_batches: Annotated[
+        int | None,
+        typer.Option("--max-batches", min=1, help="Stop after this many batches, per chat."),
+    ] = None,
+    account: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Store a chat's history, oldest-ward, one batch at a time.
+
+    Interrupt it whenever you like. Every batch commits its messages and its
+    bookmark together, so the next run continues from exactly where this one
+    stopped -- it never re-reads what it stored, and never skips what it did not.
+
+    `--reset` starts again from the newest message. It deletes nothing: the
+    messages already stored are recognised and skipped, so a reset costs network
+    traffic and nothing else.
+    """
+    if resume and reset:
+        typer.echo("--resume and --reset ask for opposite things. Choose one.", err=True)
+        raise typer.Exit(code=EXIT_ERROR)
+
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        target = account_id or await _active_account_id(container)
+        backfill = container.sync_history()
+        async with container.telegram_for(target) as gateway:
+            await gateway.connect()
+            if chat is None:
+                reports = await backfill.execute_all(
+                    gateway, target, reset=reset, max_batches=max_batches
+                )
+            else:
+                reports = (
+                    await backfill.execute(
+                        gateway, chat, target, reset=reset, max_batches=max_batches
+                    ),
+                )
+        _backfill_report(reports)
+
+    _run_async(container, run())
+
+
+@sync_app.command("live")
+def sync_live(
+    account: AccountOption = None,
+    catch_up: Annotated[
+        bool,
+        typer.Option(
+            "--catch-up/--no-catch-up",
+            help="Recover what arrived while nothing was running, before following.",
+        ),
+    ] = True,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Follow Telegram, storing messages as they arrive. Press Ctrl+C to stop.
+
+    Runs until interrupted. Each update is stored in a transaction of its own,
+    so stopping at any moment leaves the database consistent -- and the next run
+    recovers whatever arrived while this one was not listening.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        target = account_id or await _active_account_id(container)
+        typer.echo("Following Telegram. Press Ctrl+C to stop.")
+
+        async with container.telegram_for(target) as gateway:
+            await gateway.connect()
+            outcome = await container.run_live_sync(gateway, target, catch_up=catch_up)
+
+        _live_report(outcome)
+
+    _run_async(container, run())
+
+
+def _live_report(outcome: LiveOutcome) -> None:
+    """Print what a live run did, and why it stopped."""
+    report = outcome.report
+    typer.echo("")
+    typer.echo(
+        f"{report.caught_up} caught up, {report.stored} new, "
+        f"{report.skipped} already stored, {report.ignored} ignored."
+    )
+    typer.echo(f"{report.updates_seen} update(s) seen, {report.events} event(s) published.")
+
+    if report.failed:
+        typer.echo(f"{report.failed} update(s) could not be stored:", err=True)
+        for failure in report.failures:
+            typer.echo(f"  {failure}", err=True)
+    if outcome.restarts:
+        typer.echo(f"Synchronisation restarted {outcome.restarts} time(s).", err=True)
+    if outcome.failure is not None:
+        typer.echo(f"Synchronisation stopped: {outcome.failure}", err=True)
+
+
+@sync_app.command("status")
+def sync_status(
+    account: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Show how much of this account's history is stored.
+
+    Reads the database only. It opens no connection to Telegram, so it reports
+    what the last run achieved rather than what is true in Telegram right now.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        report = await container.sync_status().execute(account_id)
+
+        authorization = report.authorization_state
+        typer.echo(
+            f"Account {int(report.account_id)}: "
+            f"{authorization.value if authorization is not None else 'no session'}"
+        )
+        typer.echo("")
+        if not report.chats:
+            typer.echo("No chats. Run `tgassist sync chats` first.")
+            return
+
+        for chat in report.chats:
+            span = (
+                f"{int(chat.oldest_synced_message_id or 0)}"
+                f"-{int(chat.newest_synced_message_id or 0)}"
+                if chat.has_synced
+                else "-"
+            )
+            typer.echo(f"{int(chat.chat_id):>8}  {chat.state:<9} {span:<18} {chat.title}")
+
+        typer.echo("")
+        typer.echo(
+            f"{report.synchronised} chat(s) fully stored, {report.pending} with more to fetch."
+        )
+        if not report.is_current:
+            typer.echo("Run `tgassist sync history` to continue.")
+
+    _run_async(container, run())
+
+
+@conversation_app.command("rebuild")
+def conversation_rebuild(
+    chat: Annotated[int, typer.Argument(help="Local chat id, from `tgassist chat list`.")],
+    account: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Recompute a chat's conversations from its stored messages.
+
+    Deterministic and safe to repeat: the same messages always produce the same
+    boundaries, so a rebuild that changes nothing reports everything unchanged.
+    Run it after changing the gap or the message cap, or after a bulk import
+    with segmentation switched off.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        report = await container.segment_conversations().execute(chat, account_id)
+
+        typer.echo(f"{report.messages} message(s) in {report.conversations} conversation(s).")
+        typer.echo(
+            f"{report.created} new, {report.updated} changed, "
+            f"{report.unchanged} unchanged, {report.deleted} removed."
+        )
+        if not report.changed:
+            typer.echo("Nothing changed. The boundaries were already correct.")
+
+    _run_async(container, run())
+
+
+@conversation_app.command("list")
+def conversation_list(
+    chat: Annotated[int, typer.Argument(help="Local chat id, from `tgassist chat list`.")],
+    limit: Annotated[
+        int, typer.Option("--limit", "-n", min=1, help="Conversations per page.")
+    ] = 20,
+    account: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """List a chat's conversations, newest first."""
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        page = await container.list_conversations().execute(
+            chat, PageRequest(limit=limit), account_id=account_id
+        )
+
+        if not page.items:
+            typer.echo("No conversations. Run `tgassist conversation rebuild` first.")
+            return
+
+        for conversation in page:
+            typer.echo(
+                f"{int(conversation.id):>8}  "
+                f"{conversation.started_at:%Y-%m-%d %H:%M} - "
+                f"{conversation.ended_at:%H:%M}  "
+                f"{conversation.message_count:>4} message(s)"
+            )
+        typer.echo("")
+        typer.echo(f"{len(page.items)} conversation(s).")
+        if page.has_more:
+            typer.echo("More available; raise --limit to see them.")
+
+    _run_async(container, run())
+
+
+@conversation_app.command("show")
+def conversation_show(
+    conversation: Annotated[int, typer.Argument(help="Conversation id, from `conversation list`.")],
+    account: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Show one conversation and the messages it covers.
+
+    The messages are found by time range rather than by a stored link: a message
+    belongs to the conversation whose span contains it, and conversations do not
+    overlap.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        found = await container.get_conversation().execute(conversation, account_id=account_id)
+        if found is None:
+            typer.echo("That conversation was not found.", err=True)
+            raise typer.Exit(code=EXIT_ERROR)
+
+        episode, messages = found
+        typer.echo(
+            f"Conversation {int(episode.id)} in chat {int(episode.chat_id)}: "
+            f"{episode.started_at:%Y-%m-%d %H:%M} to {episode.ended_at:%Y-%m-%d %H:%M}"
+        )
+        typer.echo(f"{episode.message_count} message(s), lasting {episode.duration}.")
+        typer.echo("")
+        for message in messages:
+            who = "you" if message.is_outgoing else "them"
+            body = message.text if message.text is not None else f"({message.message_type.value})"
+            typer.echo(f"{message.sent_at:%Y-%m-%d %H:%M}  {who:<5} {body}")
+
+    _run_async(container, run())
+
+
+@ai_app.command("run")
+def ai_run(  # noqa: PLR0913, PLR0917 - Typer reads the options from the signature
+    content: Annotated[str, typer.Argument(help="What to give the model.")],
+    instructions: Annotated[
+        str | None,
+        typer.Option("--instructions", "-i", help="The system prompt, if the task has one."),
+    ] = None,
+    task: Annotated[
+        str, typer.Option("--task", help="What this call is for. Recorded on it.")
+    ] = "manual",
+    prompt_id: Annotated[
+        str, typer.Option("--prompt", help="Which prompt this is. Recorded on the call.")
+    ] = "manual",
+    prompt_version: Annotated[
+        str, typer.Option("--prompt-version", help="Which revision of it.")
+    ] = "1",
+    chat: Annotated[
+        int | None,
+        typer.Option(
+            "--chat",
+            help=(
+                "The chat this content belongs to. Naming it is what grants "
+                "permission for a cloud model."
+            ),
+        ),
+    ] = None,
+    account: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Run one AI task and record it.
+
+    The whole boundary, end to end: the privacy gate, the timeout, the token
+    accounting and the audit record. What the model is asked is exactly the
+    content given -- there is no prompt template yet, and no parsing of what
+    comes back. Both arrive with the first real task.
+
+    A cloud model refuses content that names no chat: content with no chat has
+    no permission attached, and in a local-first application the absence of a
+    permission is not a permission.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        task_runner = await container.execute_ai_task()
+        result = await task_runner.execute(
+            content=content,
+            instructions=instructions,
+            prompt=PromptVersion(prompt_id=prompt_id, version=prompt_version),
+            task_kind=task,
+            chat_id=chat,
+            account_id=account_id,
+        )
+
+        typer.echo(result.text or "")
+        typer.echo("")
+        _call_summary(result.call)
+
+    _run_async(container, run())
+
+
+@ai_app.command("show")
+def ai_show(
+    call: Annotated[int, typer.Argument(help="Call id, from `tgassist ai list`.")],
+    account: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Show one recorded call in full.
+
+    Metadata only. The prompt is never stored, and the response is stored only
+    when `ai.store_responses` is on -- which the production profile refuses.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        found = await container.get_ai_call().execute(call, account_id=account_id)
+        if found is None:
+            typer.echo("That AI call was not found.", err=True)
+            raise typer.Exit(code=EXIT_ERROR)
+
+        typer.echo(f"Call {int(found.id)}  {found.created_at:%Y-%m-%d %H:%M:%S}")
+        typer.echo(f"  model       {found.model}  ({found.model.data_boundary.value})")
+        typer.echo(f"  prompt      {found.prompt}")
+        typer.echo(f"  task        {found.task_kind}")
+        typer.echo(f"  chat        {int(found.chat_id) if found.chat_id else '-'}")
+        typer.echo(f"  outcome     {found.outcome.value}")
+        if found.finish_reason is not None:
+            typer.echo(f"  finished    {found.finish_reason.value}")
+        typer.echo(f"  latency     {found.latency_seconds:.3f}s")
+        typer.echo(
+            f"  tokens      "
+            f"{found.usage.input_tokens if found.usage.input_tokens is not None else '?'} in, "
+            f"{found.usage.output_tokens if found.usage.output_tokens is not None else '?'} out"
+        )
+        typer.echo(f"  cost        {found.cost if found.cost is not None else 'unknown'}")
+        typer.echo(f"  digest      {found.response_digest or '-'}")
+        if found.response_text is not None:
+            typer.echo("")
+            typer.echo(found.response_text)
+
+    _run_async(container, run())
+
+
+@ai_app.command("list")
+def ai_list(
+    limit: Annotated[int, typer.Option("--limit", "-n", min=1, help="Calls per page.")] = 20,
+    account: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """List recorded AI calls, newest first.
+
+    Includes the failures. Success-only instrumentation hides exactly the
+    expensive cases.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        page = await container.list_ai_calls().execute(
+            PageRequest(limit=limit), account_id=account_id
+        )
+
+        if not page.items:
+            typer.echo("No AI calls recorded.")
+            return
+
+        for record in page:
+            typer.echo(
+                f"{int(record.id):>8}  {record.created_at:%Y-%m-%d %H:%M}  "
+                f"{record.outcome.value:<14} {record.latency_ms:>6}ms  "
+                f"{record.task_kind:<16} {record.model}"
+            )
+        typer.echo("")
+        typer.echo(f"{len(page.items)} call(s).")
+        if page.has_more:
+            typer.echo("More available; raise --limit to see them.")
+
+    _run_async(container, run())
+
+
+@memory_app.command("extract")
+def memory_extract(
+    conversation: Annotated[int, typer.Argument(help="Conversation id, from `conversation list`.")],
+    account: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Ask a model what is worth remembering from one conversation.
+
+    Nothing is remembered. Everything this produces is a *proposal* waiting for
+    you to accept or reject it, and this milestone has no way to accept one --
+    the model proposes, you decide (ADR-019, ADR-058).
+
+    Running it twice on the same conversation is free: what has already been
+    proposed is not proposed again, including anything you have rejected.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        extractor = await container.extract_memories()
+        report = await extractor.execute(conversation, account_id=account_id)
+
+        if not report.returned:
+            typer.echo("The model proposed nothing. Most conversations contain nothing worth")
+            typer.echo("remembering, so this is a common and correct answer.")
+        else:
+            typer.echo(f"{report.returned} candidate(s) returned, {report.stored} stored.")
+
+        for proposal in report.proposed:
+            typer.echo(
+                f"  {int(proposal.id):>8}  {proposal.confidence}  "
+                f"{proposal.category.value:<18} {proposal.value}"
+            )
+
+        if report.discarded:
+            typer.echo("")
+            typer.echo(f"{report.discarded} discarded:")
+            for label, count in (
+                ("quoted text that is not in the conversation", report.ungrounded),
+                ("confidence below the threshold", report.low_confidence),
+                ("already proposed", report.duplicates),
+                ("beyond this run's cap", report.over_cap),
+            ):
+                if count:
+                    typer.echo(f"  {count:>3}  {label}")
+
+        if report.repaired:
+            typer.echo("")
+            typer.echo("The first answer did not match the schema and was corrected once.")
+        typer.echo("")
+        typer.echo(f"Recorded as AI call {int(report.ai_call_id)}.")
+
+    _run_async(container, run())
+
+
+@memory_app.command("proposals")
+def memory_proposals(
+    limit: Annotated[int, typer.Option("--limit", "-n", min=1, help="Proposals per page.")] = 20,
+    account: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """List candidate memories awaiting a decision, newest first."""
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        page = await container.list_memory_proposals().execute(
+            PageRequest(limit=limit), account_id=account_id
+        )
+
+        if not page.items:
+            typer.echo("No proposals. Run `tgassist memory extract <conversation>`.")
+            return
+
+        for proposal in page:
+            typer.echo(
+                f"{int(proposal.id):>8}  {proposal.created_at:%Y-%m-%d %H:%M}  "
+                f"{proposal.status.value:<9} {proposal.confidence}  "
+                f"{proposal.category.value:<18} {proposal.value}"
+            )
+        typer.echo("")
+        typer.echo(f"{len(page.items)} proposal(s).")
+        if page.has_more:
+            typer.echo("More available; raise --limit to see them.")
+
+    _run_async(container, run())
+
+
+@memory_app.command("proposal")
+def memory_proposal(
+    proposal: Annotated[int, typer.Argument(help="Proposal id, from `memory proposals`.")],
+    account: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Show one proposal, with the text it was read from.
+
+    The evidence is the point of this command. A proposal you cannot check is a
+    proposal you can only guess about, and the quotation is what makes accepting
+    one a decision rather than a leap.
+
+    Named ``proposal`` rather than ``show`` since Slice 9c: ``memory show`` now
+    shows a *memory*, and one name for two different things is a name that
+    will be typed wrongly.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        found = await container.get_memory_proposal().execute(proposal, account_id=account_id)
+        if found is None:
+            typer.echo("That proposal was not found.", err=True)
+            raise typer.Exit(code=EXIT_ERROR)
+
+        typer.echo(f"Proposal {int(found.id)}  {found.created_at:%Y-%m-%d %H:%M:%S}")
+        typer.echo(f"  status       {found.status.value}")
+        typer.echo(f"  category     {found.category.value}")
+        typer.echo(f"  confidence   {found.confidence}")
+        typer.echo(f"  conversation {int(found.conversation_id)}")
+        typer.echo(f"  prompt       {found.prompt}")
+        typer.echo(f"  ai call      {int(found.ai_call_id)}")
+        typer.echo("")
+        typer.echo(f"  {found.value}")
+        typer.echo("")
+        typer.echo("Read from:")
+        typer.echo(f"  {found.evidence.quote}")
+
+    _run_async(container, run())
+
+
+@memory_app.command("accept")
+def memory_accept(
+    proposal: Annotated[int, typer.Argument(help="Proposal id, from `memory proposals`.")],
+    importance: Annotated[
+        str,
+        typer.Option(
+            "--importance",
+            "-i",
+            help=(
+                "How much this matters: low, normal, high or critical. Ranked "
+                "above the model's confidence when a context is assembled, "
+                "because your judgement of what is worth knowing outranks a "
+                "machine's estimate of what is true."
+            ),
+        ),
+    ] = "normal",
+    account: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Keep a proposed fact, permanently.
+
+    This is the only way anything enters long-term memory. The proposal becomes
+    accepted, exactly one memory is created, and both happen in one transaction
+    -- an acceptance you could not find afterwards would be worse than none.
+
+    **There is no undo.** A decision is made once (ADR-059). If you change your
+    mind, `memory forget` removes the memory, which also frees the fact to be
+    proposed again.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    weight = IMPORTANCE_LEVELS.get(importance.strip().lower())
+    if weight is None:
+        typer.echo(
+            f"Unknown importance {importance!r}. One of: {', '.join(IMPORTANCE_LEVELS)}.",
+            err=True,
+        )
+        raise typer.Exit(code=EXIT_ERROR)
+
+    async def run() -> None:
+        await container.start()
+        result = await container.accept_memory_proposal().execute(
+            proposal, account_id=account_id, importance=Importance(weight)
+        )
+
+        typer.echo(f"Remembered as memory {int(result.memory.id)}.")
+        typer.echo(f"  {result.memory.category.value}: {result.memory.value}")
+        typer.echo(f"  key        {result.memory.key}")
+        typer.echo(f"  importance {result.memory.importance.label}")
+        if result.memory.contact_id is not None:
+            typer.echo(f"  about contact {int(result.memory.contact_id)}")
+
+    _run_async(container, run())
+
+
+@memory_app.command("reject")
+def memory_reject(
+    proposal: Annotated[int, typer.Argument(help="Proposal id, from `memory proposals`.")],
+    account: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Decline a proposed fact, permanently.
+
+    Nothing is created and nothing is deleted: the proposal is kept as rejected,
+    so extraction does not offer the same fact again. A decision is made once,
+    and there is no undo.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        rejected = await container.reject_memory_proposal().execute(proposal, account_id=account_id)
+
+        typer.echo(f"Rejected proposal {int(rejected.id)}. Nothing was remembered.")
+        typer.echo(f"  {rejected.category.value}: {rejected.value}")
+
+    _run_async(container, run())
+
+
+@memory_app.command("list")
+def memory_list(
+    limit: Annotated[int, typer.Option("--limit", "-n", min=1, help="Memories per page.")] = 20,
+    account: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """List what this account remembers, newest first.
+
+    Approved facts only. Everything here was accepted by a person; nothing a
+    model produced reaches this list on its own.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        page = await container.list_memories().execute(
+            PageRequest(limit=limit), account_id=account_id
+        )
+
+        if not page.items:
+            typer.echo("Nothing remembered yet. Accept a proposal from `memory proposals`.")
+            return
+
+        for memory in page:
+            about = int(memory.contact_id) if memory.contact_id is not None else "-"
+            typer.echo(
+                f"{int(memory.id):>8}  {memory.created_at:%Y-%m-%d %H:%M}  "
+                f"{about!s:>8}  {memory.category.value:<18} {memory.value}"
+            )
+        typer.echo("")
+        typer.echo(f"{len(page.items)} memory/memories.")
+        if page.has_more:
+            typer.echo("More available; raise --limit to see them.")
+
+    _run_async(container, run())
+
+
+@memory_app.command("show")
+def memory_show_one(
+    memory: Annotated[int, typer.Argument(help="Memory id, from `memory list`.")],
+    account: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Show one memory and where it came from.
+
+    The provenance is the point: through it a memory leads back to the proposal
+    a person accepted, the conversation it was read from and the model call that
+    produced it.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        found = await container.get_memory().execute(memory, account_id=account_id)
+        if found is None:
+            typer.echo("That memory was not found.", err=True)
+            raise typer.Exit(code=EXIT_ERROR)
+
+        state = "remembered" if found.is_active else "forgotten"
+        typer.echo(f"Memory {int(found.id)}  {found.created_at:%Y-%m-%d %H:%M:%S}  ({state})")
+        typer.echo(f"  category     {found.category.value}")
+        typer.echo(f"  key          {found.key}")
+        typer.echo(f"  importance   {found.importance.label}")
+        typer.echo(f"  confidence   {found.confidence}")
+        typer.echo(
+            f"  retrieved    {found.retrieval_count} time(s)"
+            + (
+                f", last {found.last_retrieved_at:%Y-%m-%d %H:%M}"
+                if found.last_retrieved_at is not None
+                else ""
+            )
+        )
+        typer.echo(f"  source       {found.source.value}")
+        typer.echo(
+            f"  about        "
+            f"{int(found.contact_id) if found.contact_id is not None else 'no one in particular'}"
+        )
+        typer.echo(f"  proposal     {int(found.proposal_id) if found.proposal_id else '(deleted)'}")
+        typer.echo(
+            f"  conversation {int(found.conversation_id) if found.conversation_id else '(deleted)'}"
+        )
+        typer.echo(f"  ai call      {int(found.ai_call_id) if found.ai_call_id else '(deleted)'}")
+        if found.deleted_at is not None:
+            typer.echo(f"  forgotten    {found.deleted_at:%Y-%m-%d %H:%M:%S}")
+        typer.echo("")
+        typer.echo(f"  {found.value}")
+
+    _run_async(container, run())
+
+
+@memory_app.command("forget")
+def memory_forget(
+    memory: Annotated[int, typer.Argument(help="Memory id, from `memory list`.")],
+    account: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Forget one memory.
+
+    Soft: the row is kept with a timestamp, so retention can ask what was
+    deleted and when, and `memory show` can still answer for it. It stops being
+    listed, stops being retrievable, and frees its key -- so the same fact can
+    be accepted again if it is proposed. That is the only route to a correction,
+    because nothing edits a memory (ADR-059).
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        forgotten = await container.delete_memory().execute(memory, account_id=account_id)
+
+        if forgotten:
+            typer.echo(f"Forgot memory {memory}.")
+        else:
+            typer.echo(f"Memory {memory} had already been forgotten.")
+
+    _run_async(container, run())
+
+
+@memory_app.command("context")
+def memory_context(
+    chat: Annotated[int, typer.Argument(help="Chat id, from `chat list`.")],
+    record: Annotated[
+        bool,
+        typer.Option(
+            "--record",
+            help=(
+                "Count this retrieval against the memories it selects, as a "
+                "real one would. Off by default: looking is not using."
+            ),
+        ),
+    ] = False,
+    account: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Show what a model would be told about the person in a chat.
+
+    The whole of retrieval, before anything sends it anywhere. Deterministic:
+    the same memories and the same budget produce the same context every time,
+    and every line explains why it placed where it did (ADR-060).
+
+    Nothing here reaches a model. Retrieval is inspectable on its own so that
+    the first time a memory reaches a prompt, the selection that put it there
+    has already been read by a person.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        builder = container.build_memory_context() if record else container.get_memory_context()
+        context = await builder.execute(chat, account_id=account_id)
+
+        about = (
+            f"contact {int(context.contact_id)}"
+            if context.contact_id is not None
+            else "nobody in particular (this chat has no single counterpart)"
+        )
+        typer.echo(f"Context for chat {int(context.chat_id)}, about {about}.")
+        typer.echo(
+            f"{context.selection.candidates} candidate(s), "
+            f"{len(context.memories)} selected, "
+            f"{context.tokens}/{context.selection.budget} tokens."
+        )
+        if context.truncated:
+            typer.echo(
+                "Candidates were capped, so ranking did not see everything known.",
+                err=True,
+            )
+        typer.echo("")
+
+        if context.is_empty:
+            typer.echo("Nothing to tell a model about this chat yet.")
+        for position, memory in enumerate(context.memories, start=1):
+            typer.echo(f"{position:>3}. {memory.category.value}: {memory.value}")
+            typer.echo(f"     {context.why(memory)}")
+
+        if context.omitted:
+            typer.echo("")
+            typer.echo(f"{len(context.omitted)} omitted:")
+            for item in context.omitted:
+                typer.echo(f"{item.rank:>3}. {item.memory.category.value}: {item.memory.value}")
+                typer.echo(f"     {item.reason.value}")
+
+        if context.recorded:
+            typer.echo("")
+            typer.echo("Recorded as a retrieval against every memory selected.")
+
+    _run_async(container, run())
+
+
+@chat_app.command("suggest")
+def chat_suggest(
+    chat: Annotated[int, typer.Argument(help="Chat id, from `chat list`.")],
+    show_prompt: Annotated[
+        bool,
+        typer.Option("--show-prompt", help="Print the exact text that was sent."),
+    ] = False,
+    account: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Draft a reply for a chat, using what is known about the person.
+
+    **Nothing is sent.** This produces a draft for you to read, edit and decide
+    about; no code path leads from here to Telegram (ADR-061).
+
+    What it prints is the whole chain: which memories were retrieved and which
+    were left out, how much of the conversation was included, which prompt
+    version asked, what it cost, and which memories the model says it used.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        generator = await container.generate_suggestion()
+        suggestion = await generator.execute(chat, account_id=account_id)
+        assembled = suggestion.prompt
+        context = assembled.context
+
+        typer.echo(f"Suggestion for chat {int(assembled.chat_id)}")
+        typer.echo("")
+
+        _suggestion_memories(suggestion)
+        _suggestion_omissions(suggestion)
+        typer.echo("")
+        typer.echo(
+            f"Conversation: {len(context.conversation.turns)} of "
+            f"{context.conversation.available} recent message(s)"
+            + (
+                f", {context.conversation.truncated} truncated"
+                if context.conversation.truncated
+                else ""
+            )
+        )
+        for turn in context.conversation.turns:
+            typer.echo(f"    {turn.who}: {turn.text}")
+
+        typer.echo("")
+        typer.echo(f"Prompt:  {assembled.version}")
+        typer.echo(f"Tokens:  {context.tokens}/{context.budget} estimated")
+        typer.echo(f"AI call: {int(suggestion.ai_call_id)}")
+        if suggestion.repaired:
+            typer.echo("The first answer did not match the schema and was corrected once.")
+        if not suggestion.is_grounded:
+            typer.echo(
+                "The model cited memories that were never supplied: "
+                f"{', '.join(suggestion.fabricated_keys)}. Treat this suggestion "
+                "with suspicion.",
+                err=True,
+            )
+
+        typer.echo("")
+        typer.echo(f"Suggested reply (confidence {suggestion.confidence}):")
+        typer.echo("")
+        typer.echo(suggestion.text)
+        typer.echo("")
+        if suggestion.suggestion_id is not None:
+            typer.echo(
+                f"Saved for review as suggestion {int(suggestion.suggestion_id)}: "
+                f"`tgassist suggestion accept` or `dismiss`."
+            )
+        typer.echo("Nothing has been sent. This is a draft.")
+
+        if show_prompt:
+            typer.echo("")
+            typer.echo("--- system prompt ---")
+            typer.echo(assembled.instructions)
+            typer.echo("--- task prompt ---")
+            typer.echo(assembled.text)
+
+    _run_async(container, run())
+
+
+def _suggestion_memories(suggestion: GeneratedSuggestion) -> None:
+    """Print the memories that reached the model, marking the reported ones."""
+    memories = suggestion.prompt.context.memories
+    typer.echo(f"Memories supplied ({len(memories)}):")
+    if not memories:
+        typer.echo("  (nothing is known about this person yet)")
+    used = {int(memory.id) for memory in suggestion.used_memories}
+    for memory in memories:
+        mark = "*" if int(memory.id) in used else " "
+        typer.echo(f"  {mark} [{memory.key}] {memory.category.value}: {memory.value}")
+    if used:
+        typer.echo("  (* the model reports using these)")
+
+
+def _suggestion_omissions(suggestion: GeneratedSuggestion) -> None:
+    """Print what retrieval left out and what the prompt budget then trimmed.
+
+    Two lists rather than one: a memory retrieval never selected and one the
+    assembler dropped were excluded by different budgets, and only a report that
+    distinguishes them says which is too small (ADR-061).
+    """
+    omitted = list(suggestion.prompt.retrieval.omitted)
+    if omitted:
+        typer.echo("")
+        typer.echo(f"Memories not retrieved ({len(omitted)}):")
+        for item in omitted:
+            typer.echo(f"    {item.memory.value}  --  {item.reason.value}")
+
+    trimmed = suggestion.prompt.context.trimmed
+    if trimmed:
+        typer.echo("")
+        typer.echo(f"Trimmed to fit the prompt budget ({len(trimmed)}):")
+        for item_trimmed in trimmed:
+            typer.echo(f"    {item_trimmed.what}  --  {item_trimmed.reason.value}")
+
+
+@suggestion_app.command("list")
+def suggestion_list(
+    chat: Annotated[
+        int | None,
+        typer.Option(
+            "--chat",
+            help=(
+                "Show one chat's suggestions, decided ones included. Without "
+                "it, the queue: everything still awaiting a decision."
+            ),
+        ),
+    ] = None,
+    limit: Annotated[int, typer.Option("--limit", "-n", min=1, help="Per page.")] = 20,
+    account: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """List suggestions awaiting a decision, newest first.
+
+    With ``--chat``, lists that conversation's suggestions including the ones
+    already decided -- reviewing a conversation means seeing what was dismissed
+    as well as what was kept.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        page = await container.list_suggestions().execute(
+            PageRequest(limit=limit), chat_id=chat, account_id=account_id
+        )
+
+        if not page.items:
+            typer.echo("Nothing to review." if chat is None else "No suggestions for that chat.")
+            return
+
+        for suggestion in page:
+            typer.echo(
+                f"{int(suggestion.id):>8}  {suggestion.created_at:%Y-%m-%d %H:%M}  "
+                f"{suggestion.status.value:<9} chat {int(suggestion.chat_id):<10} "
+                f"{suggestion.title}"
+            )
+        typer.echo("")
+        typer.echo(f"{len(page.items)} suggestion(s).")
+        if page.has_more:
+            typer.echo("More available; raise --limit to see them.")
+
+    _run_async(container, run())
+
+
+@suggestion_app.command("show")
+def suggestion_show(
+    suggestion: Annotated[int, typer.Argument(help="Suggestion id, from `suggestion list`.")],
+    account: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Show one suggestion and where it came from.
+
+    The provenance is the point: through it a suggestion leads back to the
+    conversation it is about and the model call that produced it, so a decision
+    is made on evidence rather than on how well the draft reads.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        found = await container.get_suggestion().execute(suggestion, account_id=account_id)
+        if found is None:
+            typer.echo("That suggestion was not found.", err=True)
+            raise typer.Exit(code=EXIT_ERROR)
+
+        typer.echo(f"Suggestion {int(found.id)}  {found.created_at:%Y-%m-%d %H:%M:%S}")
+        typer.echo(f"  status       {found.status.value}")
+        typer.echo(f"  type         {found.proposal_type.value}")
+        typer.echo(f"  chat         {int(found.chat_id)}")
+        typer.echo(
+            f"  conversation "
+            f"{int(found.conversation_id) if found.conversation_id else '(not recorded)'}"
+        )
+        typer.echo(f"  ai call      {int(found.ai_call_id)}")
+        if found.decided_at is not None:
+            typer.echo(f"  decided      {found.decided_at:%Y-%m-%d %H:%M:%S}")
+        typer.echo("")
+        typer.echo(found.description)
+        typer.echo("")
+        details = found.details()
+        for key in sorted(details):
+            typer.echo(f"  {key:<24} {details[key]}")
+        typer.echo("")
+        typer.echo("Nothing has been sent. Deciding about this sends nothing either.")
+
+    _run_async(container, run())
+
+
+@suggestion_app.command("accept")
+def suggestion_accept(
+    suggestion: Annotated[int, typer.Argument(help="Suggestion id, from `suggestion list`.")],
+    account: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Record that you agree with a suggestion.
+
+    **This sends nothing and does nothing else.** Accepting marks the suggestion
+    as agreed with; acting on it is yours to do. Nothing in this application
+    executes a suggestion, and nothing will until you switch on something that
+    does (ADR-062).
+
+    A decision is made once. There is no undo.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        decided = await container.accept_suggestion().execute(suggestion, account_id=account_id)
+
+        typer.echo(f"Accepted suggestion {int(decided.id)}.")
+        typer.echo("")
+        typer.echo(decided.description)
+        typer.echo("")
+        typer.echo("Nothing was sent. Acting on this is yours to do.")
+
+    _run_async(container, run())
+
+
+@suggestion_app.command("dismiss")
+def suggestion_dismiss(
+    suggestion: Annotated[int, typer.Argument(help="Suggestion id, from `suggestion list`.")],
+    account: AccountOption = None,
+    profile: ProfileOption = None,
+    config_dir: ConfigDirOption = None,
+) -> None:
+    """Record that you do not want a suggestion.
+
+    Nothing is created and nothing is deleted: the suggestion is kept as
+    dismissed, because a record of only what was agreed with cannot show what
+    the generator is getting wrong.
+
+    A decision is made once. There is no undo.
+    """
+    container = _open(profile, config_dir)
+    account_id = AccountId(account) if account is not None else None
+
+    async def run() -> None:
+        await container.start()
+        decided = await container.dismiss_suggestion().execute(suggestion, account_id=account_id)
+
+        typer.echo(f"Dismissed suggestion {int(decided.id)}. Nothing was done with it.")
+
+    _run_async(container, run())
+
+
+def _call_summary(record: AiCall) -> None:
+    """Print the one-line account of a call that just ran."""
+    tokens = record.usage.total
+    typer.echo(
+        f"call {int(record.id)}: {record.outcome.value}, "
+        f"{record.latency_ms}ms, "
+        f"{tokens if tokens is not None else 'unmeasured'} token(s), "
+        f"{record.cost if record.cost is not None else 'cost unknown'}"
+    )
+
+
+def _backfill_report(reports: tuple[BackfillReport, ...]) -> None:
+    """Print what a backfill did, and what is left.
+
+    Says where each chat stopped rather than only what it stored. "0 new" after
+    a completed backfill and "0 new" after a batch limit are the same number
+    with opposite meanings, and only the reason distinguishes them.
+    """
+    if not reports:
+        typer.echo("No chats have synchronisation switched on.")
+        return
+
+    for report in reports:
+        typer.echo(
+            f"chat {int(report.chat_id):>6}  "
+            f"{report.stored} new, {report.skipped} already stored  "
+            f"({report.batches} batch(es), {_STOP_REASONS[report.stop_reason]})"
+        )
+
+    stored = sum(report.stored for report in reports)
+    unfinished = [report for report in reports if not report.is_complete]
+    typer.echo("")
+    typer.echo(f"{stored} message(s) stored across {len(reports)} chat(s).")
+    if unfinished:
+        typer.echo(f"{len(unfinished)} chat(s) have more history. Run this again to continue.")
+
+
+#: What each stop reason means, in the words a person reading a terminal wants.
+_STOP_REASONS: dict[str, str] = {
+    BackfillStop.BEGINNING: "reached the beginning",
+    BackfillStop.HORIZON: "reached the history horizon",
+    BackfillStop.ALREADY_COMPLETE: "already complete",
+    BackfillStop.BATCH_LIMIT: "stopped at the batch limit",
+    BackfillStop.NO_PROGRESS: "stopped: Telegram returned no further history",
+}
 
 
 def _report(report: SyncReport, noun: str) -> None:

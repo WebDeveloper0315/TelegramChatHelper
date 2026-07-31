@@ -10,6 +10,8 @@ No test here needs a Telegram account, a network or a real native library.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -37,7 +39,12 @@ from tgassist.domain.model.identifiers import (
 )
 from tgassist.domain.model.secret import SecretValue
 from tgassist.domain.model.session import AuthorizationState, ConnectionState
-from tgassist.domain.model.telegram import TelegramChatInfo, TelegramMessage, TelegramUser
+from tgassist.domain.model.telegram import (
+    NewMessage,
+    TelegramChatInfo,
+    TelegramMessage,
+    TelegramUser,
+)
 from tgassist.domain.ports.telegram_gateway import TelegramGateway
 from tgassist.infrastructure.telegram.client import TdjsonClient
 from tgassist.infrastructure.telegram.gateway import GatewaySettings, TdlibGateway
@@ -546,6 +553,180 @@ class TestGettingOneContact:
         assert await readable.get_contact(TelegramUserId(999_999)) is None
 
 
+# ---------------------------------------------------------------------------
+# The update stream
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(params=["fake", "tdlib"])
+async def streaming(
+    request: pytest.FixtureRequest, tmp_path: Path
+) -> AsyncIterator[tuple[TelegramGateway, object]]:
+    """An authorized gateway, plus the means to make Telegram report something.
+
+    The second element is a callable taking a :class:`TelegramMessage`. For the
+    fake it pushes onto its queue; for the adapter it renders an
+    ``updateNewMessage`` frame that the real mapper then reads. Both go through
+    the same code a real arriving message would.
+    """
+    if request.param == "fake":
+        fake = FakeTelegramGateway(ACCOUNT, starts_authorized=True)
+        await fake.connect()
+        try:
+            yield fake, fake.push_message
+        finally:
+            await fake.disconnect()
+        return
+
+    library = AuthorizingTdjson(starts_authorized=True)
+    real = TdlibGateway(
+        ACCOUNT,
+        TdjsonClient(library),
+        _settings(tmp_path),
+        state_timeout=TIMEOUT,
+        startup_timeout=TIMEOUT,
+    )
+    await real.connect()
+    try:
+        yield real, library.announce_message
+    finally:
+        await real.disconnect()
+
+
+def arriving(number: int) -> TelegramMessage:
+    """Build a message that could arrive in CHAT_A."""
+    return TelegramMessage(
+        id=TelegramMessageId(1000 + number),
+        chat_id=CHAT_A.id,
+        sender_id=TelegramUserId(2002),
+        sent_at=SENT_AT + timedelta(minutes=number),
+        text=f"arriving {number}",
+    )
+
+
+async def take(gateway: TelegramGateway, count: int) -> list[TelegramMessage]:
+    """Take a fixed number of messages off a gateway's update stream."""
+    taken: list[TelegramMessage] = []
+    stream = gateway.updates()
+    try:
+        for _ in range(count):
+            update = await asyncio.wait_for(anext(stream), TIMEOUT)
+            assert isinstance(update, NewMessage)
+            taken.append(update.message)
+    finally:
+        await stream.aclose()
+    return taken
+
+
+class TestTheUpdateStream:
+    """Obligations both implementations must satisfy."""
+
+    async def test_an_arriving_message_reaches_the_consumer(
+        self, streaming: tuple[TelegramGateway, object]
+    ) -> None:
+        gateway, report = streaming
+        report(arriving(1))  # type: ignore[operator]
+
+        assert await take(gateway, 1) == [arriving(1)]
+
+    async def test_arrival_order_is_preserved(
+        self, streaming: tuple[TelegramGateway, object]
+    ) -> None:
+        # Telegram's order is the only order there is; nothing re-sorts.
+        gateway, report = streaming
+        for number in (3, 1, 2):
+            report(arriving(number))  # type: ignore[operator]
+
+        taken = await take(gateway, 3)
+
+        assert [int(m.id) for m in taken] == [1003, 1001, 1002]
+
+    async def test_updates_are_held_until_somebody_asks(
+        self, streaming: tuple[TelegramGateway, object]
+    ) -> None:
+        # The whole of why a run cannot lose an update to its own start-up: the
+        # stream fills from connect, whether or not anything is draining it.
+        gateway, report = streaming
+        for number in (1, 2, 3):
+            report(arriving(number))  # type: ignore[operator]
+        await asyncio.sleep(0.05)
+
+        assert len(await take(gateway, 3)) == 3
+
+    async def test_the_message_survives_the_round_trip(
+        self, streaming: tuple[TelegramGateway, object]
+    ) -> None:
+        gateway, report = streaming
+        report(arriving(1))  # type: ignore[operator]
+
+        (received,) = await take(gateway, 1)
+
+        assert received.text == "arriving 1"
+        assert received.chat_id == CHAT_A.id
+        assert received.sender_id == TelegramUserId(2002)
+
+    async def test_a_second_consumer_is_refused(
+        self, streaming: tuple[TelegramGateway, object]
+    ) -> None:
+        # The queue holds one item per update, so two consumers would take turns
+        # and each would silently miss what the other took.
+        gateway, report = streaming
+        report(arriving(1))  # type: ignore[operator]
+        first = gateway.updates()
+        await asyncio.wait_for(anext(first), TIMEOUT)
+
+        with pytest.raises(TdlibNotRunningError, match="already has a consumer"):
+            async for _ in gateway.updates():
+                pass
+
+        await first.aclose()
+
+    async def test_disconnecting_ends_the_stream(
+        self, streaming: tuple[TelegramGateway, object]
+    ) -> None:
+        gateway, _report = streaming
+        taken: list[object] = []
+
+        async def drain() -> None:
+            async for update in gateway.updates():
+                taken.append(update)
+
+        task = asyncio.create_task(drain())
+        await asyncio.sleep(0.05)
+        await gateway.disconnect()
+
+        await asyncio.wait_for(task, TIMEOUT)
+        assert taken == []
+
+
+class TestBothImplementationsStreamIdentically:
+    async def test_the_same_updates_arrive_identically(self, tmp_path: Path) -> None:
+        sent = [arriving(number) for number in (1, 2, 3)]
+
+        fake = FakeTelegramGateway(ACCOUNT, starts_authorized=True)
+        await fake.connect()
+        for item in sent:
+            fake.push_message(item)
+        from_fake = await take(fake, 3)
+        await fake.disconnect()
+
+        library = AuthorizingTdjson(starts_authorized=True)
+        real = TdlibGateway(
+            ACCOUNT,
+            TdjsonClient(library),
+            _settings(tmp_path),
+            state_timeout=TIMEOUT,
+            startup_timeout=TIMEOUT,
+        )
+        await real.connect()
+        for item in sent:
+            library.announce_message(item)
+        from_adapter = await take(real, 3)
+        await real.disconnect()
+
+        assert from_fake == from_adapter == sent
+
+
 class TestFetchingHistory:
     async def test_the_newest_page_comes_first(self, readable: TelegramGateway) -> None:
         page = await readable.fetch_history(CHAT_A.id, limit=10)
@@ -650,6 +831,15 @@ class TestReadsRequireAuthorization:
     async def test_getting_a_contact(self, unauthorized: TelegramGateway) -> None:
         with pytest.raises(AuthorizationError):
             await unauthorized.get_contact(ADA.id)
+
+    async def test_the_update_stream_does_not(self, unauthorized: TelegramGateway) -> None:
+        # Deliberately different from the reads: updates are what *tell* a
+        # gateway it has become authorized, so a stream that refused before
+        # authorization could never deliver the news.
+        stream = unauthorized.updates()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(anext(stream), 0.05)
+        await stream.aclose()
 
 
 class TestReadsRequireAConnection:

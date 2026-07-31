@@ -309,6 +309,20 @@ class AuthorizingTdjson(FakeTdjson):
         """Push an ``updateConnectionState``."""
         self.push({"@type": "updateConnectionState", "state": {"@type": state_type}})
 
+    def announce_message(self, message: TelegramMessage) -> None:
+        """Push an ``updateNewMessage``, as Telegram does when one arrives.
+
+        Rendered through the same frame builder the history reply uses, so the
+        adapter maps a live message with exactly the code that maps a stored one
+        -- which is what makes "live and backfill agree" a fact rather than a
+        hope.
+        """
+        self.push({"@type": "updateNewMessage", "message": message_frame(message)})
+
+    def announce_unknown(self, kind: str = "updateChatReadInbox") -> None:
+        """Push an update this application has no consumer for."""
+        self.push({"@type": kind, "chat_id": 1})
+
     def send(self, client_id: int, request: str) -> None:
         """Answer a request, then push whatever TDLib would push next."""
         document = json.loads(request)
